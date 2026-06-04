@@ -228,6 +228,8 @@ impl FfmpegEncoder {
             ("h264_amf", HwAccelType::Amf, VideoCodec::H264),
             #[cfg(target_os = "windows")]
             ("h264_qsv", HwAccelType::Qsv, VideoCodec::H264),
+            #[cfg(target_os = "windows")]
+            ("h264_mf", HwAccelType::Software, VideoCodec::H264),
             #[cfg(target_os = "macos")]
             ("h264_videotoolbox", HwAccelType::VideoToolbox, VideoCodec::H264),
             ("libx264", HwAccelType::Software, VideoCodec::H264),
@@ -245,6 +247,8 @@ impl FfmpegEncoder {
             ("hevc_amf", HwAccelType::Amf, VideoCodec::H265),
             #[cfg(target_os = "windows")]
             ("hevc_qsv", HwAccelType::Qsv, VideoCodec::H265),
+            #[cfg(target_os = "windows")]
+            ("hevc_mf", HwAccelType::Software, VideoCodec::H265),
             #[cfg(target_os = "macos")]
             ("hevc_videotoolbox", HwAccelType::VideoToolbox, VideoCodec::H265),
             ("libx265", HwAccelType::Software, VideoCodec::H265),
@@ -309,6 +313,8 @@ impl FfmpegEncoder {
                 ("h264_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("h264_qsv", HwAccelType::Qsv),
+                #[cfg(target_os = "windows")]
+                ("h264_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("h264_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx264", HwAccelType::Software),
@@ -326,6 +332,8 @@ impl FfmpegEncoder {
                 ("hevc_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("hevc_qsv", HwAccelType::Qsv),
+                #[cfg(target_os = "windows")]
+                ("hevc_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("hevc_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx265", HwAccelType::Software),
@@ -409,6 +417,8 @@ impl FfmpegEncoder {
                 ("h264_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("h264_qsv", HwAccelType::Qsv),
+                #[cfg(target_os = "windows")]
+                ("h264_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("h264_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx264", HwAccelType::Software),
@@ -426,6 +436,8 @@ impl FfmpegEncoder {
                 ("hevc_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("hevc_qsv", HwAccelType::Qsv),
+                #[cfg(target_os = "windows")]
+                ("hevc_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("hevc_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx265", HwAccelType::Software),
