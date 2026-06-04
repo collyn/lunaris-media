@@ -1,0 +1,136 @@
+//! Screen capture subsystem.
+//!
+//! This module defines the [`ScreenCapture`] trait — the primary abstraction for
+//! capturing screen content into GPU-resident buffers — and provides a factory
+//! function [`create_screen_capture`] that selects the best backend for the
+//! current platform.
+//!
+//! ## Platform Backends
+//!
+//! | Platform | Primary              | Fallback 1          | Fallback 2 |
+//! |----------|----------------------|---------------------|------------|
+//! | Linux    | DRM/KMS (zero-copy)  | PipeWire (Wayland)  | X11        |
+//! | Windows  | DXGI Desktop Dup     | —                   | —          |
+//! | macOS    | ScreenCaptureKit     | —                   | —          |
+
+pub mod gpu_buffer;
+
+#[cfg(target_os = "linux")]
+pub mod linux_drm;
+#[cfg(target_os = "linux")]
+pub mod linux_wayland;
+#[cfg(target_os = "linux")]
+pub mod linux_x11;
+#[cfg(target_os = "linux")]
+pub mod linux_nvfbc;
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+use crate::error::MediaError;
+use crate::types::*;
+use gpu_buffer::GpuBuffer;
+
+/// A frame captured from the screen, containing a GPU-resident buffer.
+///
+/// The [`GpuBuffer`] inside this struct can be handed directly to a hardware
+/// encoder, avoiding any GPU→CPU→GPU copy.
+#[derive(Debug)]
+pub struct CapturedFrame {
+    /// GPU-resident (or CPU-fallback) buffer holding the raw frame pixels.
+    pub buffer: GpuBuffer,
+    /// Capture timestamp in microseconds (monotonic clock).
+    pub timestamp_us: u64,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Pixel format of the captured data.
+    pub format: PixelFormat,
+    /// Whether this frame is a new frame (e.g. from change detection).
+    pub is_new_frame: bool,
+}
+
+/// Trait for screen capture backends.
+///
+/// Implementations are expected to be used from a single async task. The trait
+/// is `Send` so that the owning task can be moved between executor threads.
+#[async_trait::async_trait]
+pub trait ScreenCapture: Send {
+    /// Enumerate all available displays/monitors.
+    async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError>;
+
+    /// Start capturing the given display at the requested configuration.
+    ///
+    /// Returns [`MediaError::CaptureAlreadyStarted`] if capture is already running.
+    async fn start(&mut self, display_id: &str, config: &StreamConfig) -> Result<(), MediaError>;
+
+    /// Wait for and return the next captured frame.
+    ///
+    /// This method blocks (asynchronously) until a new frame is available or an
+    /// error occurs. Returns [`MediaError::CaptureNotStarted`] if capture has
+    /// not been started.
+    async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError>;
+
+    /// Stop the running capture session and release resources.
+    async fn stop(&mut self) -> Result<(), MediaError>;
+
+    /// Returns `true` if capture is currently active.
+    fn is_capturing(&self) -> bool;
+}
+
+/// Create a [`ScreenCapture`] backend appropriate for the current platform.
+///
+/// On Linux this tries PipeWire first (for Wayland compositors), falling back
+/// to X11 if PipeWire is unavailable. On other platforms the native API is used
+/// directly.
+pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
+    #[cfg(target_os = "linux")]
+    {
+        // Priority: NvFBC (NVIDIA GPU direct) > DRM/KMS (zero-copy GPU) > PipeWire (Wayland) > X11
+        match linux_nvfbc::NvfbcCapture::new() {
+            Ok(nvfbc) => {
+                log::info!("Using NVIDIA NvFBC screen capture (GPU accelerated)");
+                return Ok(Box::new(nvfbc));
+            }
+            Err(e) => {
+                log::warn!("NvFBC capture not available: {}, trying DRM/KMS", e);
+            }
+        }
+        match linux_drm::DrmCapture::new() {
+            Ok(drm) => {
+                log::info!("Using DRM/KMS screen capture (zero-copy GPU)");
+                return Ok(Box::new(drm));
+            }
+            Err(e) => {
+                log::warn!("DRM capture not available: {}, trying PipeWire", e);
+            }
+        }
+        match linux_wayland::PipeWireCapture::new() {
+            Ok(pw) => {
+                log::info!("Using PipeWire screen capture (Wayland)");
+                return Ok(Box::new(pw));
+            }
+            Err(e) => {
+                log::warn!("PipeWire not available: {}, falling back to X11", e);
+            }
+        }
+        let x11 = linux_x11::X11Capture::new()?;
+        log::info!("Using X11 screen capture");
+        return Ok(Box::new(x11));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Box::new(windows::DxgiCapture::new()?));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(Box::new(macos::ScreenCaptureKitCapture::new()?));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    Err(MediaError::PlatformNotSupported("Unsupported OS".into()))
+}

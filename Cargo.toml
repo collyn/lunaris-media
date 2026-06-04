@@ -1,0 +1,53 @@
+[package]
+name = "lunaris-media"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy GPU screen capture and hardware-accelerated encoding library"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "rt-multi-thread"] }
+async-trait = "0.1"
+opus = "0.3"
+cpal = "0.15"
+libc = "0.2"
+
+# FFmpeg raw FFI for hardware contexts
+ffmpeg-next = "8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.8"
+ashpd = { version = "0.9", default-features = false, features = ["tokio", "pipewire"] }
+enumflags2 = "0.7"
+nix = { version = "0.29", features = ["mman", "fs"] }
+drm-fourcc = "2.2"
+x11 = { version = "2.21", features = ["xlib", "xtest", "xfixes", "dpms"] }
+nvfbc = "0.2"
+nvfbc-sys = "0.2"
+evdev = "0.11"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+rustacuda = "0.1"
+image = "0.24"
+
