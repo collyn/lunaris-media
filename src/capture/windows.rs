@@ -34,6 +34,7 @@ pub struct DxgiCapture {
     capturing: bool,
     start_time: Option<Instant>,
     frame_count: u64,
+    last_frame_data: Option<(Vec<u8>, u32)>, // (data, stride) — cached for timeout reuse
 }
 
 impl DxgiCapture {
@@ -48,6 +49,7 @@ impl DxgiCapture {
             capturing: false,
             start_time: None,
             frame_count: 0,
+            last_frame_data: None,
         })
     }
 
@@ -239,10 +241,15 @@ impl ScreenCapture for DxgiCapture {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 let timestamp =
                     self.start_time.as_ref().map_or(0, |t| t.elapsed().as_micros() as u64);
+                // Reuse the last captured frame data if available
+                let (data, stride) = match &self.last_frame_data {
+                    Some((d, s)) => (d.clone(), *s),
+                    None => (Vec::new(), 0),
+                };
                 return Ok(CapturedFrame {
                     buffer: GpuBuffer::CpuBuffer {
-                        data: Vec::new(),
-                        stride: 0,
+                        data,
+                        stride,
                         format: PixelFormat::BGRA,
                         width: self.width,
                         height: self.height,
@@ -298,6 +305,9 @@ impl ScreenCapture for DxgiCapture {
             .as_ref()
             .map_or(0, |t| t.elapsed().as_micros() as u64);
         self.frame_count += 1;
+
+        // Cache this frame for reuse during DXGI timeouts
+        self.last_frame_data = Some((data.clone(), stride));
 
         Ok(CapturedFrame {
             buffer: GpuBuffer::CpuBuffer {

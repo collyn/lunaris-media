@@ -124,6 +124,8 @@ fn hw_pix_fmt(hw_type: HwAccelType) -> ffi::AVPixelFormat {
     match hw_type {
         HwAccelType::Vaapi => ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
         HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+        HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+        HwAccelType::Qsv => ffi::AVPixelFormat::AV_PIX_FMT_QSV,
         _ => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
     }
 }
@@ -714,6 +716,10 @@ impl FfmpegEncoder {
                     ),
                     HwAccelType::Qsv => (
                         ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
+                        None,
+                    ),
+                    HwAccelType::Amf => (
+                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
                         None,
                     ),
                     _ => (
