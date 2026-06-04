@@ -1159,7 +1159,7 @@ impl VideoEncoder for FfmpegEncoder {
                                         ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                                         w, h,
                                         sw_format,
-                                        ffi::SWS_FAST_BILINEAR,
+                                        1, // SWS_FAST_BILINEAR,
                                         ptr::null_mut(),
                                         ptr::null_mut(),
                                         ptr::null(),
@@ -1283,7 +1283,10 @@ impl VideoEncoder for FfmpegEncoder {
             unsafe {
                 (*send_frame).pict_type =
                     ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                (*send_frame).key_frame = 1;
+                #[cfg(not(target_os = "windows"))]
+                {
+                    (*send_frame).key_frame = 1;
+                }
                 (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY;
             }
             log::debug!("Forcing keyframe at frame #{}", self.frame_count);
@@ -1291,7 +1294,10 @@ impl VideoEncoder for FfmpegEncoder {
             unsafe {
                 (*send_frame).pict_type =
                     ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
-                (*send_frame).key_frame = 0;
+                #[cfg(not(target_os = "windows"))]
+                {
+                    (*send_frame).key_frame = 0;
+                }
             }
         }
 

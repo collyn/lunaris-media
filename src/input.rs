@@ -405,7 +405,7 @@ impl InputInjector {
                     mi: MOUSEINPUT {
                         dx: 0,
                         dy: 0,
-                        mouseData: mouse_data,
+                        mouseData: mouse_data as u32,
                         dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,

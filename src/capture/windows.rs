@@ -128,9 +128,9 @@ impl DxgiCapture {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_STAGING,
-            BindFlags: D3D11_BIND_FLAG(0),
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-            MiscFlags: D3D11_RESOURCE_MISC_FLAG(0),
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0,
+            MiscFlags: 0,
         };
 
         let mut texture = None;
