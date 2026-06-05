@@ -683,10 +683,25 @@ impl FfmpegEncoder {
             // 2. Without inline SPS/PPS, the browser's H264 decoder fails on every IDR
             //    and continuously sends PLI requests, preventing video from displaying.
             let final_data = if is_key {
+                // Diagnostic: log first 16 bytes of raw encoder output to confirm Annex-B vs AVCC.
+                // Annex-B: starts with 00 00 00 01 or 00 00 01 (start code)
+                // AVCC: starts with 4-byte big-endian NAL length
+                let raw_prefix: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+                log::info!(
+                    "IDR frame from encoder: {} bytes, first 16 bytes: [{}] ({})",
+                    data.len(),
+                    raw_prefix.join(" "),
+                    if data.len() >= 4 && data[0] == 0 && data[1] == 0 && ((data[2] == 0 && data[3] == 1) || data[2] == 1) {
+                        "Annex-B ✓"
+                    } else {
+                        "NOT Annex-B! (AVCC?)"
+                    }
+                );
                 if let Some(headers) = sps_pps_cache {
                     let mut combined = Vec::with_capacity(headers.len() + data.len());
                     combined.extend_from_slice(headers);
                     combined.extend_from_slice(&data);
+                    log::info!("IDR combined with SPS/PPS: {} bytes total", combined.len());
                     combined
                 } else {
                     data
