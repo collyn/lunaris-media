@@ -1249,7 +1249,7 @@ impl VideoEncoder for FfmpegEncoder {
                                         w,
                                         h,
                                         sw_format,
-                                        ffi::SWS_FAST_BILINEAR,
+                                        ffi::SWS_FAST_BILINEAR as libc::c_int,
                                         ptr::null_mut(),
                                         ptr::null_mut(),
                                         ptr::null(),
@@ -1350,14 +1350,13 @@ impl VideoEncoder for FfmpegEncoder {
         if self.force_keyframe {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                (*send_frame).key_frame = 1;
-                (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY;
+                (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
             }
             log::debug!("Forcing keyframe at frame #{}", self.frame_count);
         } else {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
-                (*send_frame).key_frame = 0;
+                (*send_frame).flags &= !(ffi::AV_FRAME_FLAG_KEY as libc::c_int);
             }
         }
 
