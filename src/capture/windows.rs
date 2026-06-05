@@ -31,6 +31,8 @@ pub struct DxgiCapture {
     staging_texture: Option<ID3D11Texture2D>,
     width: u32,
     height: u32,
+    x_offset: i32,
+    y_offset: i32,
     capturing: bool,
     start_time: Option<Instant>,
     frame_count: u64,
@@ -46,6 +48,8 @@ impl DxgiCapture {
             staging_texture: None,
             width: 0,
             height: 0,
+            x_offset: 0,
+            y_offset: 0,
             capturing: false,
             start_time: None,
             frame_count: 0,
@@ -213,6 +217,8 @@ impl ScreenCapture for DxgiCapture {
         self.context = Some(context);
         self.duplication = Some(duplication);
         self.staging_texture = Some(staging);
+        self.x_offset = rect.left;
+        self.y_offset = rect.top;
         self.capturing = true;
         self.start_time = Some(Instant::now());
         self.frame_count = 0;
@@ -292,12 +298,26 @@ impl ScreenCapture for DxgiCapture {
 
         let stride = mapped.RowPitch;
         let data_size = (stride * self.height) as usize;
-        let data = unsafe {
+        let mut data = unsafe {
             std::slice::from_raw_parts(mapped.pData as *const u8, data_size).to_vec()
         };
 
         unsafe {
             context.Unmap(staging, 0);
+        }
+
+        // Overlay Windows cursor directly on the captured staging texture
+        if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
+            unsafe {
+                draw_cursor_onto_buffer(
+                    &mut data,
+                    self.width,
+                    self.height,
+                    stride,
+                    self.x_offset,
+                    self.y_offset,
+                );
+            }
         }
 
         let timestamp = self
@@ -340,5 +360,207 @@ impl ScreenCapture for DxgiCapture {
 
     fn is_capturing(&self) -> bool {
         self.capturing
+    }
+}
+
+unsafe fn draw_cursor_onto_buffer(
+    frame_buffer: &mut [u8],
+    frame_width: u32,
+    frame_height: u32,
+    frame_stride: u32,
+    x_offset: i32,
+    y_offset: i32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, ICONINFO,
+    };
+    use windows::Win32::Graphics::Gdi::{
+        GetDIBits, GetDC, ReleaseDC, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
+        DIB_RGB_COLORS, HGDIOBJ, BITMAP, GetObjectW, BI_RGB,
+    };
+
+    let mut cursor_info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+
+    if GetCursorInfo(&mut cursor_info).is_ok() {
+        if (cursor_info.flags.0 & CURSOR_SHOWING.0) != 0 {
+            let h_cursor = cursor_info.hCursor;
+            let mut icon_info = ICONINFO::default();
+            if GetIconInfo(h_cursor, &mut icon_info).is_ok() {
+                let x_hotspot = icon_info.xHotspot as i32;
+                let y_hotspot = icon_info.yHotspot as i32;
+                let mut has_color = false;
+
+                let h_bmp = if !icon_info.hbmColor.is_invalid() {
+                    has_color = true;
+                    icon_info.hbmColor
+                } else {
+                    icon_info.hbmMask
+                };
+
+                let mut bmp = BITMAP::default();
+                let hgdiobj = HGDIOBJ(h_bmp.0);
+                let get_obj_res = GetObjectW(
+                    hgdiobj,
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some(&mut bmp as *mut BITMAP as *mut _),
+                );
+
+                if get_obj_res > 0 {
+                    let width = bmp.bmWidth;
+                    let height = if has_color { bmp.bmHeight } else { bmp.bmHeight / 2 };
+
+                    let mut color_buffer = vec![0u8; (width * height * 4) as usize];
+                    let mut mask_buffer = vec![0u8; (width * height * 2 * 4) as usize];
+
+                    let hdc = GetDC(None);
+                    let mut bmi = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: width,
+                            biHeight: if has_color { -height } else { -height * 2 },
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+
+                    if has_color {
+                        let _ = GetDIBits(
+                            hdc,
+                            icon_info.hbmColor,
+                            0,
+                            height as u32,
+                            Some(color_buffer.as_mut_ptr() as *mut _),
+                            &mut bmi,
+                            DIB_RGB_COLORS,
+                        );
+
+                        let mut has_alpha = false;
+                        for i in 0..color_buffer.len() / 4 {
+                            if color_buffer[i * 4 + 3] != 0 {
+                                has_alpha = true;
+                                break;
+                            }
+                        }
+
+                        if !has_alpha && !icon_info.hbmMask.is_invalid() {
+                            let mut bmi_mask = BITMAPINFO {
+                                bmiHeader: BITMAPINFOHEADER {
+                                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                    biWidth: width,
+                                    biHeight: -height * 2,
+                                    biPlanes: 1,
+                                    biBitCount: 32,
+                                    biCompression: BI_RGB.0,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            };
+                            let _ = GetDIBits(
+                                hdc,
+                                icon_info.hbmMask,
+                                0,
+                                (height * 2) as u32,
+                                Some(mask_buffer.as_mut_ptr() as *mut _),
+                                &mut bmi_mask,
+                                DIB_RGB_COLORS,
+                            );
+
+                            for i in 0..(width * height) as usize {
+                                let mask_val = mask_buffer[i * 4];
+                                color_buffer[i * 4 + 3] = if mask_val == 0 { 255 } else { 0 };
+                            }
+                        }
+                    } else {
+                        let _ = GetDIBits(
+                            hdc,
+                            icon_info.hbmMask,
+                            0,
+                            (height * 2) as u32,
+                            Some(mask_buffer.as_mut_ptr() as *mut _),
+                            &mut bmi,
+                            DIB_RGB_COLORS,
+                        );
+
+                        for i in 0..(width * height) as usize {
+                            let and_val = mask_buffer[i * 4];
+                            let xor_val = mask_buffer[(i + (width * height) as usize) * 4];
+
+                            if and_val == 0 {
+                                color_buffer[i * 4] = xor_val;
+                                color_buffer[i * 4 + 1] = xor_val;
+                                color_buffer[i * 4 + 2] = xor_val;
+                                color_buffer[i * 4 + 3] = 255;
+                            } else {
+                                color_buffer[i * 4 + 3] = 0;
+                            }
+                        }
+                    }
+
+                    let _ = ReleaseDC(None, hdc);
+
+                    // Draw onto frame_buffer
+                    let cursor_x = cursor_info.ptScreenPos.x - x_offset;
+                    let cursor_y = cursor_info.ptScreenPos.y - y_offset;
+
+                    let x_start = cursor_x - x_hotspot;
+                    let y_start = cursor_y - y_hotspot;
+
+                    let cursor_stride = width as usize * 4;
+                    for cy in 0..height as usize {
+                        let sy = y_start + cy as i32;
+                        if sy < 0 || sy >= frame_height as i32 {
+                            continue;
+                        }
+
+                        for cx in 0..width as usize {
+                            let sx = x_start + cx as i32;
+                            if sx < 0 || sx >= frame_width as i32 {
+                                continue;
+                            }
+
+                            let c_idx = cy * cursor_stride + cx * 4;
+                            let alpha = color_buffer[c_idx + 3];
+                            if alpha == 0 {
+                                continue;
+                            }
+
+                            let blue = color_buffer[c_idx];
+                            let green = color_buffer[c_idx + 1];
+                            let red = color_buffer[c_idx + 2];
+
+                            let bgra_idx = sy as usize * frame_stride as usize + sx as usize * 4;
+                            if bgra_idx + 3 < frame_buffer.len() {
+                                if alpha == 255 {
+                                    frame_buffer[bgra_idx] = blue;
+                                    frame_buffer[bgra_idx + 1] = green;
+                                    frame_buffer[bgra_idx + 2] = red;
+                                } else {
+                                    let dst_b = frame_buffer[bgra_idx] as u32;
+                                    let dst_g = frame_buffer[bgra_idx + 1] as u32;
+                                    let dst_r = frame_buffer[bgra_idx + 2] as u32;
+
+                                    frame_buffer[bgra_idx] = ((blue as u32 * alpha as u32 + dst_b * (255 - alpha as u32)) / 255) as u8;
+                                    frame_buffer[bgra_idx + 1] = ((green as u32 * alpha as u32 + dst_g * (255 - alpha as u32)) / 255) as u8;
+                                    frame_buffer[bgra_idx + 2] = ((red as u32 * alpha as u32 + dst_r * (255 - alpha as u32)) / 255) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !icon_info.hbmMask.is_invalid() {
+                    let _ = DeleteObject(icon_info.hbmMask);
+                }
+                if !icon_info.hbmColor.is_invalid() {
+                    let _ = DeleteObject(icon_info.hbmColor);
+                }
+            }
+        }
     }
 }
