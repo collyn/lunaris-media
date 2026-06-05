@@ -185,6 +185,10 @@ pub struct FfmpegEncoder {
     info: Option<EncoderInfo>,
     /// Whether the encoder has been initialized.
     initialized: bool,
+    /// Cached SPS/PPS extradata in Annex-B format, extracted from codec_ctx after init.
+    /// Prepended to every IDR keyframe to guarantee the browser has codec parameters,
+    /// regardless of whether the encoder supports the `repeat-headers` option.
+    sps_pps_cache: Option<Vec<u8>>,
 }
 
 // SAFETY: The FFmpeg codec context is only accessed through `&mut self` methods,
@@ -212,6 +216,7 @@ impl FfmpegEncoder {
             config: None,
             info: None,
             initialized: false,
+            sps_pps_cache: None,
         })
     }
 
@@ -617,12 +622,16 @@ impl FfmpegEncoder {
     }
 
     /// Receive all available packets from the encoder and convert them to
-    /// [`EncodedVideoFrame`]s.
+    /// [`EncodedVideoFrame`]s. If `sps_pps_cache` is provided, it will be
+    /// prepended to every IDR keyframe to ensure the browser always has the
+    /// codec parameters it needs to decode, even if the encoder doesn't
+    /// support the `repeat-headers` option (e.g. AMF on Windows).
     fn drain_packets(
         codec_ctx: *mut ffi::AVCodecContext,
         packet: *mut ffi::AVPacket,
         codec: VideoCodec,
         fps: u32,
+        sps_pps_cache: Option<&[u8]>,
     ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
         let mut frames = Vec::new();
         let duration_us = if fps > 0 {
@@ -663,10 +672,28 @@ impl FfmpegEncoder {
                 FrameType::Inter
             };
 
+            // Prepend SPS/PPS (extradata) to every IDR keyframe.
+            // This is required for WebRTC because:
+            // 1. The `repeat-headers` AVOption fails silently for some encoders (AMF on Windows).
+            // 2. Without inline SPS/PPS, the browser's H264 decoder fails on every IDR
+            //    and continuously sends PLI requests, preventing video from displaying.
+            let final_data = if is_key {
+                if let Some(headers) = sps_pps_cache {
+                    let mut combined = Vec::with_capacity(headers.len() + data.len());
+                    combined.extend_from_slice(headers);
+                    combined.extend_from_slice(&data);
+                    combined
+                } else {
+                    data
+                }
+            } else {
+                data
+            };
+
             let pts = unsafe { (*packet).pts as u64 };
 
             frames.push(EncodedVideoFrame {
-                data,
+                data: final_data,
                 frame_type,
                 pts,
                 duration: duration_us,
@@ -942,6 +969,30 @@ impl FfmpegEncoder {
             }
         }
 
+        // Extract SPS/PPS extradata from the codec context and cache it in Annex-B format.
+        // Prepended to every IDR keyframe so the browser always has codec parameters,
+        // regardless of whether the encoder supports `repeat-headers` (AMF does not).
+        self.sps_pps_cache = unsafe {
+            let ctx = &*codec_ctx;
+            if !ctx.extradata.is_null() && ctx.extradata_size > 0 {
+                let extra = std::slice::from_raw_parts(ctx.extradata, ctx.extradata_size as usize);
+                let annexb = avcc_extradata_to_annexb(extra);
+                if !annexb.is_empty() {
+                    log::info!(
+                        "Cached SPS/PPS extradata: {} bytes (Annex-B) will be prepended to IDR frames",
+                        annexb.len()
+                    );
+                    Some(annexb)
+                } else {
+                    log::warn!("extradata present but AVCC→Annex-B conversion produced empty output");
+                    None
+                }
+            } else {
+                log::warn!("No extradata in codec context after init; IDR frames may lack SPS/PPS");
+                None
+            }
+        };
+
         log::info!(
             "FFmpeg encoder fully initialized: {} {}x{} @{}fps {}kbps",
             encoder_name,
@@ -953,6 +1004,69 @@ impl FfmpegEncoder {
 
         Ok(())
     }
+}
+
+/// Convert AVCC-format extradata (from `AVCodecContext.extradata`) to Annex-B format.
+///
+/// AVCC stores SPS/PPS as length-prefixed NAL units. Annex-B uses 4-byte start codes
+/// (0x00 0x00 0x00 0x01) before each NAL unit, which is the format used in raw H264
+/// bitstreams and by the FFmpeg H264 packetizer.
+///
+/// AVCC structure:
+///   [1] configurationVersion
+///   [1] AVCProfileIndication  
+///   [1] profile_compatibility
+///   [1] AVCLevelIndication
+///   [1] lengthSizeMinusOne | 0xFC
+///   [1] numSPS | 0xE0
+///   [2] spsLength (big-endian)
+///   [spsLength] SPS NAL data
+///   [1] numPPS
+///   [2] ppsLength (big-endian)
+///   [ppsLength] PPS NAL data
+fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
+    // Minimum AVCC header is 7 bytes
+    if extra.len() < 7 {
+        return Vec::new();
+    }
+    // Validate configurationVersion
+    if extra[0] != 1 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let annexb_start_code = &[0u8, 0, 0, 1];
+
+    let mut pos = 5; // skip version, profile, compat, level, lengthSizeMinusOne
+
+    // SPS NAL units
+    let num_sps = (extra[pos] & 0x1F) as usize;
+    pos += 1;
+    for _ in 0..num_sps {
+        if pos + 2 > extra.len() { break; }
+        let len = u16::from_be_bytes([extra[pos], extra[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > extra.len() { break; }
+        out.extend_from_slice(annexb_start_code);
+        out.extend_from_slice(&extra[pos..pos + len]);
+        pos += len;
+    }
+
+    // PPS NAL units
+    if pos >= extra.len() { return out; }
+    let num_pps = (extra[pos] & 0xFF) as usize;
+    pos += 1;
+    for _ in 0..num_pps {
+        if pos + 2 > extra.len() { break; }
+        let len = u16::from_be_bytes([extra[pos], extra[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > extra.len() { break; }
+        out.extend_from_slice(annexb_start_code);
+        out.extend_from_slice(&extra[pos..pos + len]);
+        pos += len;
+    }
+
+    out
 }
 
 impl VideoEncoder for FfmpegEncoder {
@@ -1389,8 +1503,8 @@ impl VideoEncoder for FfmpegEncoder {
             return Err(ff_err(ret));
         }
 
-        // Drain output packets.
-        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps);
+        // Drain output packets, prepending SPS/PPS to any IDR keyframes.
+        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps, self.sps_pps_cache.as_deref());
 
         // Clean up frame state for this iteration.
         unsafe {
@@ -1468,8 +1582,8 @@ impl VideoEncoder for FfmpegEncoder {
             // Some encoders return AVERROR_EOF if already flushed; not fatal.
         }
 
-        // Drain all remaining packets.
-        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps);
+        // Drain all remaining packets (flush does not need SPS/PPS prepend).
+        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps, None);
 
         log::debug!(
             "Flush complete: {} packets drained",
