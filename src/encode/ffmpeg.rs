@@ -742,8 +742,13 @@ impl FfmpegEncoder {
             (*codec_ctx).max_b_frames = 0;
             (*codec_ctx).thread_count = 1;
 
+            let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
             if is_hw_encoder(hw_type) {
-                (*codec_ctx).pix_fmt = hw_pix_fmt(hw_type);
+                if has_hw_frames {
+                    (*codec_ctx).pix_fmt = hw_pix_fmt(hw_type);
+                } else {
+                    (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+                }
             } else {
                 (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
             }
