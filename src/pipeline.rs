@@ -326,6 +326,9 @@ impl MediaPipeline {
         let mut frame_ticker = tokio::time::interval(target_interval);
         frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut last_sent_time = Instant::now() - Duration::from_secs(5);
+        let mut keyframe_requested = true; // Force first frame immediately
+
         loop {
             tokio::select! {
                 // Video: capture → encode → send
@@ -349,6 +352,17 @@ impl MediaPipeline {
                             if matches!(&captured.buffer, crate::capture::gpu_buffer::GpuBuffer::CpuBuffer { data, .. } if data.is_empty()) {
                                 continue;
                             }
+
+                            let should_encode = captured.is_new_frame
+                                || keyframe_requested
+                                || last_sent_time.elapsed() >= Duration::from_millis(500);
+
+                            if !should_encode {
+                                continue;
+                            }
+
+                            keyframe_requested = false;
+                            last_sent_time = Instant::now();
 
                             let pts = captured.timestamp_us;
                             match encoder.encode(&captured.buffer, pts) {
@@ -381,12 +395,14 @@ impl MediaPipeline {
                         PipelineCommand::RequestKeyframe => {
                             log::debug!("Keyframe requested");
                             encoder.request_keyframe();
+                            keyframe_requested = true;
                         }
                         PipelineCommand::SetBitrate(kbps) => {
                             log::debug!("Setting bitrate to {} kbps", kbps);
                             if let Err(e) = encoder.set_bitrate(kbps) {
                                 log::warn!("Failed to set bitrate: {}", e);
                             }
+                            keyframe_requested = true;
                         }
                         PipelineCommand::SetFps(new_fps) => {
                             let new_fps = new_fps.clamp(1, 240);
@@ -395,6 +411,7 @@ impl MediaPipeline {
                             target_interval = Duration::from_nanos(1_000_000_000 / new_fps as u64);
                             frame_ticker = tokio::time::interval(target_interval);
                             frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            keyframe_requested = true;
                         }
                         PipelineCommand::Stop => {
                             log::info!("Stop command received");

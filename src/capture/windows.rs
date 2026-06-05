@@ -37,6 +37,7 @@ pub struct DxgiCapture {
     start_time: Option<Instant>,
     frame_count: u64,
     last_frame_data: Option<(Vec<u8>, u32)>, // (data, stride) — cached for timeout reuse
+    last_returned_time: Option<Instant>,
 }
 
 impl DxgiCapture {
@@ -54,6 +55,7 @@ impl DxgiCapture {
             start_time: None,
             frame_count: 0,
             last_frame_data: None,
+            last_returned_time: None,
         })
     }
 
@@ -222,6 +224,7 @@ impl ScreenCapture for DxgiCapture {
         self.capturing = true;
         self.start_time = Some(Instant::now());
         self.frame_count = 0;
+        self.last_returned_time = None;
 
         log::info!("DXGI Desktop Duplication capture started");
         Ok(())
@@ -239,7 +242,7 @@ impl ScreenCapture for DxgiCapture {
         let mut desktop_resource = None;
 
         let result = unsafe {
-            duplication.AcquireNextFrame(100, &mut frame_info, &mut desktop_resource)
+            duplication.AcquireNextFrame(5, &mut frame_info, &mut desktop_resource)
         };
 
         match result {
@@ -247,11 +250,21 @@ impl ScreenCapture for DxgiCapture {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 let timestamp =
                     self.start_time.as_ref().map_or(0, |t| t.elapsed().as_micros() as u64);
-                // Reuse the last captured frame data if available
-                let (data, stride) = match &self.last_frame_data {
-                    Some((d, s)) => (d.clone(), *s),
-                    None => (Vec::new(), 0),
+                
+                // Return a keepalive frame at most once every 500ms when screen is static
+                let need_keepalive = self.last_returned_time.map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(500));
+
+                let (data, stride) = if need_keepalive {
+                    if let Some((d, s)) = &self.last_frame_data {
+                        self.last_returned_time = Some(std::time::Instant::now());
+                        (d.clone(), *s)
+                    } else {
+                        (Vec::new(), 0)
+                    }
+                } else {
+                    (Vec::new(), 0)
                 };
+
                 return Ok(CapturedFrame {
                     buffer: GpuBuffer::CpuBuffer {
                         data,
@@ -328,6 +341,7 @@ impl ScreenCapture for DxgiCapture {
 
         // Cache this frame for reuse during DXGI timeouts
         self.last_frame_data = Some((data.clone(), stride));
+        self.last_returned_time = Some(std::time::Instant::now());
 
         Ok(CapturedFrame {
             buffer: GpuBuffer::CpuBuffer {
