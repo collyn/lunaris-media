@@ -25,15 +25,14 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use lunaris_media::pipeline::{MediaEvent, MediaPipeline, PipelineCommand};
-use lunaris_media::types::{FrameType, StreamConfig, VideoCodec, PixelFormat};
+use lunaris_media::types::{FrameType, PixelFormat, StreamConfig, VideoCodec};
 
 /// How long to capture for.
 const CAPTURE_DURATION: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // ── Parse simple CLI args ───────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
@@ -51,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitrate_kbps: 10_000,
         pixel_format: PixelFormat::NV12,
         preferred_encoder: None,
+        virtual_display: false,
     };
 
     println!("╔══════════════════════════════════════════════════╗");
@@ -60,7 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  FPS:         {:<36}║", config.fps);
     println!("║  Codec:       {:<36}║", config.codec);
     println!("║  Bitrate:     {} kbps{:<25}║", config.bitrate_kbps, "");
-    println!("║  Duration:    {} seconds{:<24}║", CAPTURE_DURATION.as_secs(), "");
+    println!(
+        "║  Duration:    {} seconds{:<24}║",
+        CAPTURE_DURATION.as_secs(),
+        ""
+    );
     if let Some(ref path) = output_path {
         println!("║  Output:      {:<36}║", path);
     }
@@ -85,12 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keyframe_count: u64 = 0;
     let mut error_count: u64 = 0;
 
-    let mut output_file = output_path
-        .as_ref()
-        .map(|p| {
-            std::fs::File::create(p)
-                .unwrap_or_else(|e| panic!("Failed to create output file '{p}': {e}"))
-        });
+    let mut output_file = output_path.as_ref().map(|p| {
+        std::fs::File::create(p)
+            .unwrap_or_else(|e| panic!("Failed to create output file '{p}': {e}"))
+    });
 
     let start = Instant::now();
 
@@ -130,8 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if video_frame_count % 60 == 0 {
                     let elapsed = start.elapsed().as_secs_f64();
                     let fps = video_frame_count as f64 / elapsed;
-                    let mbps =
-                        (total_video_bytes as f64 * 8.0) / (elapsed * 1_000_000.0);
+                    let mbps = (total_video_bytes as f64 * 8.0) / (elapsed * 1_000_000.0);
                     log::info!(
                         "Progress: {} frames, {:.1} fps, {:.2} Mbps",
                         video_frame_count,
@@ -156,7 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             MediaEvent::Started => {
-                println!("✓ Pipeline started — capturing for {} seconds...", CAPTURE_DURATION.as_secs());
+                println!(
+                    "✓ Pipeline started — capturing for {} seconds...",
+                    CAPTURE_DURATION.as_secs()
+                );
             }
 
             MediaEvent::Stopped => {
@@ -191,15 +195,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╔══════════════════════════════════════════════════╗");
     println!("║                 Capture Results                  ║");
     println!("╠══════════════════════════════════════════════════╣");
-    println!("║  Duration:        {:.2}s{:<28}║", elapsed.as_secs_f64(), "");
+    println!(
+        "║  Duration:        {:.2}s{:<28}║",
+        elapsed.as_secs_f64(),
+        ""
+    );
     println!("║  Video frames:    {:<32}║", video_frame_count);
     println!("║  Keyframes:       {:<32}║", keyframe_count);
     println!("║  Average FPS:     {:.1}{:<30}║", avg_fps, "");
-    println!("║  Video bytes:     {:<32}║", format_bytes(total_video_bytes));
-    println!("║  Avg frame size:  {} bytes{:<20}║", avg_video_frame_size, "");
-    println!("║  Video bitrate:   {:.2} Mbps{:<22}║", video_bitrate_mbps, "");
+    println!(
+        "║  Video bytes:     {:<32}║",
+        format_bytes(total_video_bytes)
+    );
+    println!(
+        "║  Avg frame size:  {} bytes{:<20}║",
+        avg_video_frame_size, ""
+    );
+    println!(
+        "║  Video bitrate:   {:.2} Mbps{:<22}║",
+        video_bitrate_mbps, ""
+    );
     println!("║  Audio frames:    {:<32}║", audio_frame_count);
-    println!("║  Audio bytes:     {:<32}║", format_bytes(total_audio_bytes));
+    println!(
+        "║  Audio bytes:     {:<32}║",
+        format_bytes(total_audio_bytes)
+    );
     println!("║  Cursor updates:  {:<32}║", cursor_update_count);
     println!("║  Errors:          {:<32}║", error_count);
     if let Some(ref path) = output_path {

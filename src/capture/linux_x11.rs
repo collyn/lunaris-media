@@ -15,8 +15,8 @@ use std::ptr;
 use x11::xlib;
 use x11::xshm;
 
-use crate::capture::{CapturedFrame, ScreenCapture};
 use crate::capture::gpu_buffer::GpuBuffer;
+use crate::capture::{CapturedFrame, ScreenCapture};
 use crate::error::MediaError;
 use crate::types::*;
 
@@ -27,6 +27,8 @@ pub struct X11Capture {
     width: u32,
     height: u32,
     fps: u32,
+    capture_x: i32,
+    capture_y: i32,
     capturing: bool,
     last_frame_time: std::time::Instant,
     /// XShm shared memory segment info (persistent across frames).
@@ -65,7 +67,11 @@ impl X11Capture {
         let width = unsafe { xlib::XDisplayWidth(display, screen) } as u32;
         let height = unsafe { xlib::XDisplayHeight(display, screen) } as u32;
 
-        log::info!("Initialized X11 capture on root window ({}x{})", width, height);
+        log::info!(
+            "Initialized X11 capture on root window ({}x{})",
+            width,
+            height
+        );
 
         Ok(Self {
             display,
@@ -73,6 +79,8 @@ impl X11Capture {
             width,
             height,
             fps: 60,
+            capture_x: 0,
+            capture_y: 0,
             capturing: false,
             last_frame_time: std::time::Instant::now(),
             shm_info: unsafe { std::mem::zeroed() },
@@ -130,7 +138,9 @@ impl X11Capture {
 
         if shmid < 0 {
             log::warn!("shmget failed: {}", std::io::Error::last_os_error());
-            unsafe { xlib::XDestroyImage(image); }
+            unsafe {
+                xlib::XDestroyImage(image);
+            }
             return false;
         }
 
@@ -176,7 +186,9 @@ impl X11Capture {
 
         log::info!(
             "XShm initialized: {}x{} depth={} shm_size={}MB",
-            self.width, self.height, depth,
+            self.width,
+            self.height,
+            depth,
             image_size / (1024 * 1024)
         );
 
@@ -222,28 +234,31 @@ impl X11Capture {
                     self.display,
                     self.root,
                     self.shm_image,
-                    0,
-                    0,
+                    self.capture_x,
+                    self.capture_y,
                     xlib::XAllPlanes() as u32,
                 )
             };
 
             if result == 0 {
-                return Err(MediaError::CaptureError(
-                    "XShmGetImage failed".into(),
-                ));
+                return Err(MediaError::CaptureError("XShmGetImage failed".into()));
             }
 
             // Draw cursor directly onto the shared memory buffer
             let bgra_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.shm_info.shmaddr as *mut u8,
-                    data_len,
-                )
+                std::slice::from_raw_parts_mut(self.shm_info.shmaddr as *mut u8, data_len)
             };
             if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
                 unsafe {
-                    draw_cursor(self.display, self.root, bgra_slice, self.width, self.height);
+                    draw_cursor(
+                        self.display,
+                        self.root,
+                        bgra_slice,
+                        self.width,
+                        self.height,
+                        self.capture_x,
+                        self.capture_y,
+                    );
                 }
             }
         }
@@ -292,8 +307,10 @@ impl X11Capture {
                 xlib::XGetImage(
                     self.display,
                     self.root,
-                    0, 0,
-                    self.width, self.height,
+                    self.capture_x,
+                    self.capture_y,
+                    self.width,
+                    self.height,
                     xlib::XAllPlanes(),
                     xlib::ZPixmap,
                 )
@@ -301,12 +318,19 @@ impl X11Capture {
 
             if !img.is_null() {
                 let data_len = (self.width * self.height * 4) as usize;
-                let bgra_slice = unsafe {
-                    std::slice::from_raw_parts_mut((*img).data as *mut u8, data_len)
-                };
+                let bgra_slice =
+                    unsafe { std::slice::from_raw_parts_mut((*img).data as *mut u8, data_len) };
                 if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
                     unsafe {
-                        draw_cursor(self.display, self.root, bgra_slice, self.width, self.height);
+                        draw_cursor(
+                            self.display,
+                            self.root,
+                            bgra_slice,
+                            self.width,
+                            self.height,
+                            self.capture_x,
+                            self.capture_y,
+                        );
                     }
                 }
             }
@@ -314,9 +338,7 @@ impl X11Capture {
         };
 
         if image.is_null() {
-            return Err(MediaError::CaptureError(
-                "XGetImage returned NULL".into(),
-            ));
+            return Err(MediaError::CaptureError("XGetImage returned NULL".into()));
         }
 
         let data_len = (self.width * self.height * 4) as usize;
@@ -356,44 +378,46 @@ impl X11Capture {
     /// Parses `xrandr --query` output to enumerate connected displays.
     #[allow(dead_code)]
     fn parse_xrandr_output(output: &str) -> Vec<DisplayInfo> {
+        Self::parse_xrandr_output_with_offsets(output)
+            .into_iter()
+            .map(|(display, _, _)| display)
+            .collect()
+    }
+
+    fn parse_xrandr_output_with_offsets(output: &str) -> Vec<(DisplayInfo, i32, i32)> {
         let mut displays = Vec::new();
 
         for line in output.lines() {
             if !line.starts_with(' ') && line.contains(" connected") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 3 {
+                if parts.len() < 2 {
                     continue;
                 }
 
                 let id = parts[0].to_string();
                 let is_primary = parts.contains(&"primary");
+                let (width, height, x, y) =
+                    Self::extract_xrandr_geometry(&parts).unwrap_or((0, 0, 0, 0));
 
-                let (width, height) = parts
-                    .iter()
-                    .find_map(|&part| {
-                        let resolution_part = part.split('+').next()?;
-                        let mut dims = resolution_part.split('x');
-                        let w: u32 = dims.next()?.parse().ok()?;
-                        let h: u32 = dims.next()?.parse().ok()?;
-                        Some((w, h))
-                    })
-                    .unwrap_or((0, 0));
-
-                displays.push(DisplayInfo {
-                    id: id.clone(),
-                    name: id,
-                    width,
-                    height,
-                    refresh_rate: 0.0,
-                    is_primary,
-                });
+                displays.push((
+                    DisplayInfo {
+                        id: id.clone(),
+                        name: id,
+                        width,
+                        height,
+                        refresh_rate: 0.0,
+                        is_primary,
+                    },
+                    x,
+                    y,
+                ));
             }
 
             if line.starts_with("   ") && !displays.is_empty() {
                 let trimmed = line.trim();
                 if trimmed.contains('*') {
                     if let Some(hz) = Self::extract_active_refresh_rate(trimmed) {
-                        if let Some(last) = displays.last_mut() {
+                        if let Some((last, _, _)) = displays.last_mut() {
                             if last.refresh_rate == 0.0 {
                                 last.refresh_rate = hz;
                             }
@@ -404,6 +428,41 @@ impl X11Capture {
         }
 
         displays
+    }
+
+    fn extract_xrandr_geometry(parts: &[&str]) -> Option<(u32, u32, i32, i32)> {
+        for part in parts {
+            if !part.contains('x') || !part.contains('+') {
+                continue;
+            }
+
+            let mut geometry = part.split('+');
+            let resolution = geometry.next()?;
+            let x = geometry.next()?.parse::<i32>().ok()?;
+            let y = geometry.next()?.parse::<i32>().ok()?;
+            let mut dims = resolution.split('x');
+            let width = dims.next()?.parse::<u32>().ok()?;
+            let height = dims.next()?.parse::<u32>().ok()?;
+            return Some((width, height, x, y));
+        }
+        None
+    }
+
+    fn query_xrandr_displays() -> Result<Vec<(DisplayInfo, i32, i32)>, MediaError> {
+        let output = std::process::Command::new("xrandr")
+            .arg("--query")
+            .output()
+            .map_err(|e| MediaError::CaptureError(format!("xrandr failed: {}", e)))?;
+
+        if !output.status.success() {
+            return Err(MediaError::CaptureError(format!(
+                "xrandr --query failed with status {}",
+                output.status
+            )));
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(Self::parse_xrandr_output_with_offsets(&text))
     }
 
     /// Extracts the active refresh rate from an xrandr mode line.
@@ -439,22 +498,49 @@ impl Drop for X11Capture {
 impl ScreenCapture for X11Capture {
     /// Lists available displays.
     async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError> {
-        Ok(vec![DisplayInfo {
-            id: "default".to_string(),
-            name: "Default X11 Display".to_string(),
-            width: self.width,
-            height: self.height,
-            refresh_rate: 60.0,
-            is_primary: true,
-        }])
+        match Self::query_xrandr_displays() {
+            Ok(displays) if !displays.is_empty() => Ok(displays
+                .into_iter()
+                .map(|(display, _, _)| display)
+                .collect()),
+            Ok(_) | Err(_) => Ok(vec![DisplayInfo {
+                id: "default".to_string(),
+                name: "Default X11 Display".to_string(),
+                width: self.width,
+                height: self.height,
+                refresh_rate: 60.0,
+                is_primary: true,
+            }]),
+        }
     }
 
     /// Starts screen capture, initializing XShm if available.
-    async fn start(&mut self, _display_id: &str, config: &StreamConfig) -> Result<(), MediaError> {
+    async fn start(&mut self, display_id: &str, config: &StreamConfig) -> Result<(), MediaError> {
         self.width = config.width;
         self.height = config.height;
         self.fps = config.fps;
+        self.capture_x = 0;
+        self.capture_y = 0;
         self.last_frame_time = std::time::Instant::now();
+
+        if let Ok(displays) = Self::query_xrandr_displays() {
+            if let Some((display, x, y)) = displays
+                .iter()
+                .find(|(display, _, _)| display.id == display_id)
+                .or_else(|| displays.iter().find(|(display, _, _)| display.is_primary))
+            {
+                self.capture_x = *x;
+                self.capture_y = *y;
+                log::info!(
+                    "X11 capture selected display '{}' at {}x{}+{}+{}",
+                    display.id,
+                    display.width,
+                    display.height,
+                    self.capture_x,
+                    self.capture_y
+                );
+            }
+        }
 
         // Try to initialize XShm for fast capture
         if !self.shm_active {
@@ -464,8 +550,18 @@ impl ScreenCapture for X11Capture {
         }
 
         self.capturing = true;
-        let mode = if self.shm_active { "XShm" } else { "XGetImage (fallback)" };
-        log::info!("Started X11 capture at {}x{} {}fps via {}", self.width, self.height, self.fps, mode);
+        let mode = if self.shm_active {
+            "XShm"
+        } else {
+            "XGetImage (fallback)"
+        };
+        log::info!(
+            "Started X11 capture at {}x{} {}fps via {}",
+            self.width,
+            self.height,
+            self.fps,
+            mode
+        );
         Ok(())
     }
 
@@ -475,15 +571,8 @@ impl ScreenCapture for X11Capture {
             return Err(MediaError::CaptureNotStarted);
         }
 
-        // Frame rate pacing
-        let target_interval = std::time::Duration::from_nanos(1_000_000_000 / self.fps as u64);
-        let elapsed = self.last_frame_time.elapsed();
-        if elapsed < target_interval {
-            tokio::time::sleep(target_interval - elapsed).await;
-        } else {
-            tokio::task::yield_now().await;
-        }
         self.last_frame_time = std::time::Instant::now();
+        tokio::task::yield_now().await;
 
         // Use XShm fast path if available, otherwise fall back to XGetImage
         if self.shm_active {
@@ -513,12 +602,14 @@ unsafe fn draw_cursor(
     bgra_slice: &mut [u8],
     width: u32,
     height: u32,
+    capture_x: i32,
+    capture_y: i32,
 ) {
     let cursor_img = x11::xfixes::XFixesGetCursorImage(display);
     if !cursor_img.is_null() {
         let img = &*cursor_img;
-        let x_start = img.x as i32;
-        let y_start = img.y as i32;
+        let x_start = img.x as i32 - capture_x;
+        let y_start = img.y as i32 - capture_y;
         let c_width = img.width as i32;
         let c_height = img.height as i32;
 
@@ -559,8 +650,10 @@ unsafe fn draw_cursor(
                         let dst_r = bgra_slice[bgra_idx + 2] as u32;
 
                         bgra_slice[bgra_idx] = ((blue * alpha + dst_b * (255 - alpha)) / 255) as u8;
-                        bgra_slice[bgra_idx + 1] = ((green * alpha + dst_g * (255 - alpha)) / 255) as u8;
-                        bgra_slice[bgra_idx + 2] = ((red * alpha + dst_r * (255 - alpha)) / 255) as u8;
+                        bgra_slice[bgra_idx + 1] =
+                            ((green * alpha + dst_g * (255 - alpha)) / 255) as u8;
+                        bgra_slice[bgra_idx + 2] =
+                            ((red * alpha + dst_r * (255 - alpha)) / 255) as u8;
                     }
                 }
             }

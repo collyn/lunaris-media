@@ -23,6 +23,8 @@ pub mod linux_wayland;
 pub mod linux_x11;
 #[cfg(target_os = "linux")]
 pub mod linux_nvfbc;
+#[cfg(target_os = "linux")]
+pub mod virtual_display;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "macos")]

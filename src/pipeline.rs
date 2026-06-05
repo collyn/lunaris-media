@@ -42,6 +42,9 @@ use crate::encode::EncoderConfig;
 use crate::error::MediaError;
 use crate::types::*;
 
+#[cfg(target_os = "linux")]
+use crate::capture::virtual_display::VirtualDisplay;
+
 /// Events emitted by the running media pipeline.
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
@@ -119,7 +122,11 @@ impl MediaPipeline {
     /// receiver.
     pub fn new(
         config: StreamConfig,
-    ) -> (Self, mpsc::Receiver<MediaEvent>, mpsc::Sender<PipelineCommand>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<MediaEvent>,
+        mpsc::Sender<PipelineCommand>,
+    ) {
         let (event_tx, event_rx) = mpsc::channel(64);
         let (command_tx, command_rx) = mpsc::channel(16);
         let audio_shutdown = Arc::new(AtomicBool::new(false));
@@ -176,14 +183,59 @@ impl MediaPipeline {
             low_latency: true,
             keyframe_interval: 0,
             preferred_hw: StreamConfig::parse_encoder_preference(
-                self.config.preferred_encoder.as_deref().unwrap_or("auto")
+                self.config.preferred_encoder.as_deref().unwrap_or("auto"),
             ),
         })?;
         log::info!("Encoder initialized: {}", encoder.encoder_info().name);
 
         // 3. Start capture
-        capture.start(display_id, &self.config).await?;
-        log::info!("Screen capture started");
+        let mut capture_display_id = display_id.to_string();
+
+        #[cfg(target_os = "linux")]
+        let _virtual_display = if self.config.virtual_display {
+            match VirtualDisplay::create(self.config.width, self.config.height, self.config.fps) {
+                Ok(vd) => {
+                    capture_display_id = vd.output_name().to_string();
+                    log::info!("Created virtual display: {}", capture_display_id);
+                    Some(vd)
+                }
+                Err(e) => {
+                    log::warn!("Failed to create virtual display: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        if self.config.virtual_display {
+            log::warn!("Virtual display is not supported on this platform yet");
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.config.fps > 60 {
+            if let Ok(displays) = capture.list_displays().await {
+                if let Some(display) = displays
+                    .iter()
+                    .find(|display| display.id == capture_display_id)
+                    .or_else(|| displays.iter().find(|display| display.is_primary))
+                {
+                    if (display.refresh_rate as u32) < self.config.fps {
+                        log::info!(
+                            "Target FPS {} > display refresh rate {}, attempting to change display '{}'",
+                            self.config.fps,
+                            display.refresh_rate,
+                            display.id
+                        );
+                        Self::try_set_refresh_rate(&display.id, self.config.fps);
+                    }
+                }
+            }
+        }
+
+        capture.start(&capture_display_id, &self.config).await?;
+        log::info!("Screen capture started on '{}'", capture_display_id);
 
         // 4. Start audio on a separate blocking task (cpal is !Send for Stream)
         let mut audio_config = AudioCaptureConfig::default();
@@ -213,13 +265,19 @@ impl MediaPipeline {
                                 audio_drop_count += 1;
                                 // Rate-limit warning to prevent log spam from freezing the agent
                                 if audio_drop_count == 1 || audio_drop_count % 100 == 0 {
-                                    log::warn!("Audio event channel full, dropped {} audio frames total", audio_drop_count);
+                                    log::warn!(
+                                        "Audio event channel full, dropped {} audio frames total",
+                                        audio_drop_count
+                                    );
                                 }
                             }
                         } else {
                             // Reset counter on successful send
                             if audio_drop_count > 0 {
-                                log::info!("Audio channel recovered after dropping {} frames", audio_drop_count);
+                                log::info!(
+                                    "Audio channel recovered after dropping {} frames",
+                                    audio_drop_count
+                                );
                                 audio_drop_count = 0;
                             }
                         }
@@ -264,14 +322,15 @@ impl MediaPipeline {
         let mut skipped_frames: u64 = 0;
         let start_time = Instant::now();
         let event_capacity = 64usize; // must match mpsc::channel capacity above
-        let mut last_sent_time = Instant::now();
         let mut target_interval = Duration::from_nanos(1_000_000_000 / self.config.fps as u64);
-        let mut force_next_frame = true;
+        let mut frame_ticker = tokio::time::interval(target_interval);
+        frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 // Video: capture → encode → send
-                frame_result = capture.next_frame() => {
+                _ = frame_ticker.tick() => {
+                    let frame_result = capture.next_frame().await;
                     // Backpressure: skip encode if downstream is congested.
                     // This prevents unbounded queue growth and keeps latency low.
                     let queue_len = event_capacity - self.event_tx.capacity();
@@ -287,27 +346,10 @@ impl MediaPipeline {
 
                     match frame_result {
                         Ok(captured) => {
-                            let now = Instant::now();
-                            let elapsed = last_sent_time.elapsed();
-
-                            // Duplicate frame discarding (bypassed if keyframe is forced)
-                            if !force_next_frame {
-                                if !captured.is_new_frame {
-                                    if elapsed < Duration::from_millis(33) {
-                                        // 33ms = 30fps minimum floor for static/duplicate frames
-                                        continue;
-                                    }
-                                } else {
-                                    // Frame rate pacing (e.g. game running faster than target FPS)
-                                    // Allow 50% margin to prevent timing jitters from causing dropped frames.
-                                    if elapsed < (target_interval * 5 / 10) {
-                                        continue;
-                                    }
-                                }
+                            if matches!(&captured.buffer, crate::capture::gpu_buffer::GpuBuffer::CpuBuffer { data, .. } if data.is_empty()) {
+                                continue;
                             }
 
-                            force_next_frame = false;
-                            last_sent_time = now;
                             let pts = captured.timestamp_us;
                             match encoder.encode(&captured.buffer, pts) {
                                 Ok(encoded_frames) => {
@@ -339,7 +381,6 @@ impl MediaPipeline {
                         PipelineCommand::RequestKeyframe => {
                             log::debug!("Keyframe requested");
                             encoder.request_keyframe();
-                            force_next_frame = true;
                         }
                         PipelineCommand::SetBitrate(kbps) => {
                             log::debug!("Setting bitrate to {} kbps", kbps);
@@ -352,7 +393,8 @@ impl MediaPipeline {
                             log::info!("Changing target FPS from {} to {}", self.config.fps, new_fps);
                             self.config.fps = new_fps;
                             target_interval = Duration::from_nanos(1_000_000_000 / new_fps as u64);
-                            force_next_frame = true;
+                            frame_ticker = tokio::time::interval(target_interval);
+                            frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         }
                         PipelineCommand::Stop => {
                             log::info!("Stop command received");
@@ -384,7 +426,9 @@ impl MediaPipeline {
         // Give the audio task up to 500ms to notice the flag and exit cleanly.
         match tokio::time::timeout(Duration::from_millis(500), audio_handle).await {
             Ok(_) => log::info!("Audio task stopped cleanly"),
-            Err(_) => log::warn!("Audio task did not stop within 500ms (will be cleaned up on drop)"),
+            Err(_) => {
+                log::warn!("Audio task did not stop within 500ms (will be cleaned up on drop)")
+            }
         }
         cursor_handle.abort();
 
@@ -401,6 +445,39 @@ impl MediaPipeline {
 
         let _ = self.event_tx.send(MediaEvent::Stopped).await;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_set_refresh_rate(display_id: &str, target_fps: u32) {
+        let target = target_fps.to_string();
+        match std::process::Command::new("xrandr")
+            .args(["--output", display_id, "--rate", target.as_str()])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                log::info!(
+                    "Changed display {} refresh rate to {}Hz",
+                    display_id,
+                    target_fps
+                );
+            }
+            Ok(output) => {
+                log::warn!(
+                    "Failed to change refresh rate to {}Hz for display {}: {}",
+                    target_fps,
+                    display_id,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to run xrandr for {}Hz refresh-rate change on display {}: {}",
+                    target_fps,
+                    display_id,
+                    e
+                );
+            }
+        }
     }
 }
 

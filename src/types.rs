@@ -67,6 +67,8 @@ pub struct StreamConfig {
     pub pixel_format: PixelFormat,
     /// Optional encoder preference (e.g. "nvenc", "vaapi", "software").
     pub preferred_encoder: Option<String>,
+    /// Create and capture a temporary virtual display when supported.
+    pub virtual_display: bool,
 }
 
 impl Default for StreamConfig {
@@ -79,6 +81,7 @@ impl Default for StreamConfig {
             bitrate_kbps: 10_000,
             pixel_format: PixelFormat::NV12,
             preferred_encoder: None,
+            virtual_display: false,
         }
     }
 }

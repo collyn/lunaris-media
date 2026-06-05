@@ -19,7 +19,7 @@
 //! - DRM-capable GPU driver (Intel i915, AMD amdgpu, NVIDIA with DRM support)
 
 use std::os::unix::io::RawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::capture::gpu_buffer::GpuBuffer;
 use crate::capture::{CapturedFrame, ScreenCapture};
@@ -47,26 +47,41 @@ const fn iow(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
 const DRM_IOCTL_TYPE: u32 = b'd' as u32;
 
 // drm_mode_card_res: 8*4 (u64 ptrs) + 8*4 (u32 counts) + 4*4 (min/max) = 32 + 32 + 16 = 80
-const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong =
-    iowr(DRM_IOCTL_TYPE, 0xA0, std::mem::size_of::<DrmModeCardRes>() as u32);
+const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = iowr(
+    DRM_IOCTL_TYPE,
+    0xA0,
+    std::mem::size_of::<DrmModeCardRes>() as u32,
+);
 
 // drm_mode_crtc: 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + sizeof(drm_mode_modeinfo) = 32 + 68 = 100
 // Actually we compute from struct definition below.
-const DRM_IOCTL_MODE_GETCRTC: libc::c_ulong =
-    iowr(DRM_IOCTL_TYPE, 0xA1, std::mem::size_of::<DrmModeCrtc>() as u32);
+const DRM_IOCTL_MODE_GETCRTC: libc::c_ulong = iowr(
+    DRM_IOCTL_TYPE,
+    0xA1,
+    std::mem::size_of::<DrmModeCrtc>() as u32,
+);
 
 // drm_mode_fb_cmd2: 4+4+4+4+4 + 4*4 + 4*4 + 4*4 + 8*4 = 20 + 16 + 16 + 16 + 32 = 100
 // But the actual kernel struct size may differ; we compute from our definition.
-const DRM_IOCTL_MODE_GETFB2: libc::c_ulong =
-    iowr(DRM_IOCTL_TYPE, 0xCE, std::mem::size_of::<DrmModeFbCmd2>() as u32);
+const DRM_IOCTL_MODE_GETFB2: libc::c_ulong = iowr(
+    DRM_IOCTL_TYPE,
+    0xCE,
+    std::mem::size_of::<DrmModeFbCmd2>() as u32,
+);
 
 // drm_prime_handle: 4 + 4 + 4 = 12
-const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_ulong =
-    iowr(DRM_IOCTL_TYPE, 0x2D, std::mem::size_of::<DrmPrimeHandle>() as u32);
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_ulong = iowr(
+    DRM_IOCTL_TYPE,
+    0x2D,
+    std::mem::size_of::<DrmPrimeHandle>() as u32,
+);
 
 // drm_gem_close: 4 + 4 = 8
-const DRM_IOCTL_GEM_CLOSE: libc::c_ulong =
-    iow(DRM_IOCTL_TYPE, 0x09, std::mem::size_of::<DrmGemClose>() as u32);
+const DRM_IOCTL_GEM_CLOSE: libc::c_ulong = iow(
+    DRM_IOCTL_TYPE,
+    0x09,
+    std::mem::size_of::<DrmGemClose>() as u32,
+);
 
 /// DRM_CLOEXEC flag for prime handle export.
 const DRM_CLOEXEC: u32 = 0x02;
@@ -212,7 +227,9 @@ impl DrmCapture {
             Ok(info) => info,
             Err(e) => {
                 // SAFETY: drm_fd is a valid file descriptor we just opened.
-                unsafe { libc::close(drm_fd); }
+                unsafe {
+                    libc::close(drm_fd);
+                }
                 return Err(e);
             }
         };
@@ -220,13 +237,18 @@ impl DrmCapture {
         // Verify GETFB2 works (this is the ioctl that requires CAP_SYS_ADMIN).
         if let Err(e) = Self::verify_getfb2(drm_fd, crtc_id) {
             // SAFETY: drm_fd is a valid file descriptor we just opened.
-            unsafe { libc::close(drm_fd); }
+            unsafe {
+                libc::close(drm_fd);
+            }
             return Err(e);
         }
 
         log::info!(
             "DRM capture initialized: CRTC {} active at {}x{} @{}Hz",
-            crtc_id, width, height, refresh_rate
+            crtc_id,
+            width,
+            height,
+            refresh_rate
         );
 
         Ok(Self {
@@ -281,7 +303,8 @@ impl DrmCapture {
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_MODE_GETRESOURCES (count) failed: {}", err
+                "DRM_IOCTL_MODE_GETRESOURCES (count) failed: {}",
+                err
             )));
         }
 
@@ -291,7 +314,10 @@ impl DrmCapture {
 
         log::info!(
             "DRM resources: {} CRTCs, {} connectors, {} encoders, {} FBs",
-            res.count_crtcs, res.count_connectors, res.count_encoders, res.count_fbs
+            res.count_crtcs,
+            res.count_connectors,
+            res.count_encoders,
+            res.count_fbs
         );
 
         // --- Second call: fetch CRTC IDs ---
@@ -314,7 +340,8 @@ impl DrmCapture {
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_MODE_GETRESOURCES (fetch) failed: {}", err
+                "DRM_IOCTL_MODE_GETRESOURCES (fetch) failed: {}",
+                err
             )));
         }
 
@@ -333,14 +360,22 @@ impl DrmCapture {
             let ret = unsafe { libc::ioctl(drm_fd, DRM_IOCTL_MODE_GETCRTC, &mut crtc) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
-                log::warn!("DRM_IOCTL_MODE_GETCRTC for CRTC {} failed: {}", crtc_id, err);
+                log::warn!(
+                    "DRM_IOCTL_MODE_GETCRTC for CRTC {} failed: {}",
+                    crtc_id,
+                    err
+                );
                 continue;
             }
 
             log::info!(
                 "CRTC {}: fb_id={} mode_valid={} {}x{} @{}Hz",
-                crtc_id, crtc.fb_id, crtc.mode_valid,
-                crtc.mode.hdisplay, crtc.mode.vdisplay, crtc.mode.vrefresh
+                crtc_id,
+                crtc.fb_id,
+                crtc.mode_valid,
+                crtc.mode.hdisplay,
+                crtc.mode.vdisplay,
+                crtc.mode.vrefresh
             );
 
             if crtc.fb_id != 0 && crtc.mode_valid != 0 {
@@ -391,13 +426,18 @@ impl DrmCapture {
                 ));
             }
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_MODE_GETFB2 failed: {}", err
+                "DRM_IOCTL_MODE_GETFB2 failed: {}",
+                err
             )));
         }
 
         log::info!(
             "GETFB2 verified: fb_id={} {}x{} fourcc=0x{:08X} modifier=0x{:016X}",
-            fb2.fb_id, fb2.width, fb2.height, fb2.pixel_format, fb2.modifier[0]
+            fb2.fb_id,
+            fb2.width,
+            fb2.height,
+            fb2.pixel_format,
+            fb2.modifier[0]
         );
 
         // Close the GEM handle from the verification probe — we don't need it.
@@ -407,7 +447,9 @@ impl DrmCapture {
                 pad: 0,
             };
             // SAFETY: Closing a GEM handle we just received. drm_fd is valid.
-            unsafe { libc::ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &mut close); }
+            unsafe {
+                libc::ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &mut close);
+            }
         }
 
         Ok(())
@@ -426,7 +468,8 @@ impl DrmCapture {
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_MODE_GETCRTC failed during capture: {}", err
+                "DRM_IOCTL_MODE_GETCRTC failed during capture: {}",
+                err
             )));
         }
 
@@ -445,7 +488,8 @@ impl DrmCapture {
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_MODE_GETFB2 failed: {}", err
+                "DRM_IOCTL_MODE_GETFB2 failed: {}",
+                err
             )));
         }
 
@@ -470,7 +514,8 @@ impl DrmCapture {
             // Clean up the GEM handle even on failure.
             Self::close_gem_handle(self.drm_fd, fb2.handles[0]);
             return Err(MediaError::CaptureError(format!(
-                "DRM_IOCTL_PRIME_HANDLE_TO_FD failed: {}", err
+                "DRM_IOCTL_PRIME_HANDLE_TO_FD failed: {}",
+                err
             )));
         }
 
@@ -530,7 +575,9 @@ impl Drop for DrmCapture {
         if self.drm_fd >= 0 {
             // SAFETY: self.drm_fd is a valid file descriptor opened by us.
             // Closing it releases all DRM resources associated with this fd.
-            unsafe { libc::close(self.drm_fd); }
+            unsafe {
+                libc::close(self.drm_fd);
+            }
             log::info!("Closed DRM device fd={}", self.drm_fd);
         }
     }
@@ -562,27 +609,23 @@ impl ScreenCapture for DrmCapture {
 
         log::info!(
             "Started DRM capture: CRTC {} at {}x{} @{}fps (display @{}Hz)",
-            self.crtc_id, self.width, self.height, self.fps, self.refresh_rate
+            self.crtc_id,
+            self.width,
+            self.height,
+            self.fps,
+            self.refresh_rate
         );
 
         Ok(())
     }
 
-    /// Capture the next frame with frame pacing.
+    /// Capture the next frame. Frame pacing is handled by the pipeline timer.
     async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
         if !self.capturing {
             return Err(MediaError::CaptureNotStarted);
         }
 
-        // Frame-rate pacing: wait until the next frame interval.
-        let target_interval = Duration::from_nanos(1_000_000_000 / self.fps as u64);
-        let elapsed = self.last_frame_time.elapsed();
-        if elapsed < target_interval {
-            tokio::time::sleep(target_interval - elapsed).await;
-        } else {
-            // Yield to avoid starving other tasks even when we're behind.
-            tokio::task::yield_now().await;
-        }
+        tokio::task::yield_now().await;
         self.last_frame_time = Instant::now();
 
         self.capture_dmabuf()
@@ -619,10 +662,7 @@ fn fourcc_to_pixel_format(fourcc: u32) -> PixelFormat {
         Ok(DrmFourcc::Nv12) => PixelFormat::NV12,
         Ok(DrmFourcc::P010) => PixelFormat::P010,
         _ => {
-            log::warn!(
-                "Unknown DRM fourcc 0x{:08X}, assuming BGRA layout",
-                fourcc
-            );
+            log::warn!("Unknown DRM fourcc 0x{:08X}, assuming BGRA layout", fourcc);
             PixelFormat::BGRA
         }
     }

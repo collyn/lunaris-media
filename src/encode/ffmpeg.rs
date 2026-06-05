@@ -29,8 +29,8 @@
 #[allow(non_upper_case_globals)]
 use std::ffi::CString;
 use std::ptr;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 use ffmpeg_next::sys as ffi;
 
@@ -57,18 +57,26 @@ static CUDA_COPIER: std::sync::OnceLock<Option<CudaCopier>> = std::sync::OnceLoc
 
 #[cfg(target_os = "linux")]
 fn get_cuda_copier() -> Option<&'static CudaCopier> {
-    CUDA_COPIER.get_or_init(|| {
-        unsafe {
-            let mut lib = libc::dlopen(b"libcuda.so.1\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY);
+    CUDA_COPIER
+        .get_or_init(|| unsafe {
+            let mut lib = libc::dlopen(
+                b"libcuda.so.1\0".as_ptr() as *const libc::c_char,
+                libc::RTLD_LAZY,
+            );
             if lib.is_null() {
-                lib = libc::dlopen(b"libcuda.so\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY);
+                lib = libc::dlopen(
+                    b"libcuda.so\0".as_ptr() as *const libc::c_char,
+                    libc::RTLD_LAZY,
+                );
             }
             if lib.is_null() {
                 return None;
             }
             let sym_memcpy = libc::dlsym(lib, b"cuMemcpyDtoD_v2\0".as_ptr() as *const libc::c_char);
-            let sym_set_cur = libc::dlsym(lib, b"cuCtxSetCurrent\0".as_ptr() as *const libc::c_char);
-            let sym_get_cur = libc::dlsym(lib, b"cuCtxGetCurrent\0".as_ptr() as *const libc::c_char);
+            let sym_set_cur =
+                libc::dlsym(lib, b"cuCtxSetCurrent\0".as_ptr() as *const libc::c_char);
+            let sym_get_cur =
+                libc::dlsym(lib, b"cuCtxGetCurrent\0".as_ptr() as *const libc::c_char);
             if sym_memcpy.is_null() || sym_set_cur.is_null() || sym_get_cur.is_null() {
                 libc::dlclose(lib);
                 return None;
@@ -79,8 +87,8 @@ fn get_cuda_copier() -> Option<&'static CudaCopier> {
                 cu_ctx_get_current: std::mem::transmute(sym_get_cur),
                 _lib: lib,
             })
-        }
-    }).as_ref()
+        })
+        .as_ref()
 }
 
 // ---------------------------------------------------------------------------
@@ -113,10 +121,7 @@ fn ff_err(code: i32) -> MediaError {
     let msg = String::from_utf8_lossy(&buf)
         .trim_end_matches('\0')
         .to_string();
-    MediaError::FfmpegError {
-        code,
-        message: msg,
-    }
+    MediaError::FfmpegError { code, message: msg }
 }
 
 /// Return the hardware pixel format corresponding to a [`HwAccelType`].
@@ -124,8 +129,6 @@ fn hw_pix_fmt(hw_type: HwAccelType) -> ffi::AVPixelFormat {
     match hw_type {
         HwAccelType::Vaapi => ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
         HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
-        HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
-        HwAccelType::Qsv => ffi::AVPixelFormat::AV_PIX_FMT_QSV,
         _ => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
     }
 }
@@ -228,12 +231,13 @@ impl FfmpegEncoder {
             ("h264_amf", HwAccelType::Amf, VideoCodec::H264),
             #[cfg(target_os = "windows")]
             ("h264_qsv", HwAccelType::Qsv, VideoCodec::H264),
-            #[cfg(target_os = "windows")]
-            ("h264_mf", HwAccelType::Software, VideoCodec::H264),
             #[cfg(target_os = "macos")]
-            ("h264_videotoolbox", HwAccelType::VideoToolbox, VideoCodec::H264),
+            (
+                "h264_videotoolbox",
+                HwAccelType::VideoToolbox,
+                VideoCodec::H264,
+            ),
             ("libx264", HwAccelType::Software, VideoCodec::H264),
-
             // H.265 / HEVC Candidates
             #[cfg(target_os = "linux")]
             ("hevc_nvenc", HwAccelType::Nvenc, VideoCodec::H265),
@@ -247,12 +251,13 @@ impl FfmpegEncoder {
             ("hevc_amf", HwAccelType::Amf, VideoCodec::H265),
             #[cfg(target_os = "windows")]
             ("hevc_qsv", HwAccelType::Qsv, VideoCodec::H265),
-            #[cfg(target_os = "windows")]
-            ("hevc_mf", HwAccelType::Software, VideoCodec::H265),
             #[cfg(target_os = "macos")]
-            ("hevc_videotoolbox", HwAccelType::VideoToolbox, VideoCodec::H265),
+            (
+                "hevc_videotoolbox",
+                HwAccelType::VideoToolbox,
+                VideoCodec::H265,
+            ),
             ("libx265", HwAccelType::Software, VideoCodec::H265),
-
             // AV1 Candidates
             #[cfg(target_os = "linux")]
             ("av1_nvenc", HwAccelType::Nvenc, VideoCodec::AV1),
@@ -267,14 +272,23 @@ impl FfmpegEncoder {
             #[cfg(target_os = "windows")]
             ("av1_qsv", HwAccelType::Qsv, VideoCodec::AV1),
             #[cfg(target_os = "macos")]
-            ("av1_videotoolbox", HwAccelType::VideoToolbox, VideoCodec::AV1),
+            (
+                "av1_videotoolbox",
+                HwAccelType::VideoToolbox,
+                VideoCodec::AV1,
+            ),
             ("libsvtav1", HwAccelType::Software, VideoCodec::AV1),
             ("libaom-av1", HwAccelType::Software, VideoCodec::AV1),
         ];
 
         for &(name, hw_type, codec) in candidates {
             if ffmpeg_next::encoder::find_by_name(name).is_some() {
-                log::info!("Found encoder: {} ({:?}) for codec {}", name, hw_type, codec);
+                log::info!(
+                    "Found encoder: {} ({:?}) for codec {}",
+                    name,
+                    hw_type,
+                    codec
+                );
                 available.push(EncoderInfo {
                     name: name.to_string(),
                     hw_type,
@@ -313,8 +327,6 @@ impl FfmpegEncoder {
                 ("h264_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("h264_qsv", HwAccelType::Qsv),
-                #[cfg(target_os = "windows")]
-                ("h264_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("h264_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx264", HwAccelType::Software),
@@ -332,8 +344,6 @@ impl FfmpegEncoder {
                 ("hevc_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("hevc_qsv", HwAccelType::Qsv),
-                #[cfg(target_os = "windows")]
-                ("hevc_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("hevc_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx265", HwAccelType::Software),
@@ -364,14 +374,9 @@ impl FfmpegEncoder {
                 if hw_type == preferred {
                     let cname = CString::new(name).unwrap();
                     // SAFETY: FFmpeg is initialized; the C string is valid.
-                    let codec_ptr =
-                        unsafe { ffi::avcodec_find_encoder_by_name(cname.as_ptr()) };
+                    let codec_ptr = unsafe { ffi::avcodec_find_encoder_by_name(cname.as_ptr()) };
                     if !codec_ptr.is_null() {
-                        log::info!(
-                            "Selected preferred encoder: {} ({})",
-                            name,
-                            hw_type
-                        );
+                        log::info!("Selected preferred encoder: {} ({})", name, hw_type);
                         return Ok((name, hw_type));
                     }
                 }
@@ -386,8 +391,7 @@ impl FfmpegEncoder {
         for &(name, hw_type) in candidates {
             let cname = CString::new(name).unwrap();
             // SAFETY: FFmpeg is initialized; the C string is valid.
-            let codec_ptr =
-                unsafe { ffi::avcodec_find_encoder_by_name(cname.as_ptr()) };
+            let codec_ptr = unsafe { ffi::avcodec_find_encoder_by_name(cname.as_ptr()) };
             if !codec_ptr.is_null() {
                 log::info!("Auto-selected encoder: {} ({})", name, hw_type);
                 return Ok((name, hw_type));
@@ -417,8 +421,6 @@ impl FfmpegEncoder {
                 ("h264_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("h264_qsv", HwAccelType::Qsv),
-                #[cfg(target_os = "windows")]
-                ("h264_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("h264_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx264", HwAccelType::Software),
@@ -436,8 +438,6 @@ impl FfmpegEncoder {
                 ("hevc_amf", HwAccelType::Amf),
                 #[cfg(target_os = "windows")]
                 ("hevc_qsv", HwAccelType::Qsv),
-                #[cfg(target_os = "windows")]
-                ("hevc_mf", HwAccelType::Software),
                 #[cfg(target_os = "macos")]
                 ("hevc_videotoolbox", HwAccelType::VideoToolbox),
                 ("libx265", HwAccelType::Software),
@@ -489,7 +489,13 @@ impl FfmpegEncoder {
             }
         }
 
-        log::info!("Encoder candidates: {:?}", result.iter().map(|(n, h)| format!("{} ({:?})", n, h)).collect::<Vec<_>>());
+        log::info!(
+            "Encoder candidates: {:?}",
+            result
+                .iter()
+                .map(|(n, h)| format!("{} ({:?})", n, h))
+                .collect::<Vec<_>>()
+        );
         result
     }
 
@@ -508,25 +514,21 @@ impl FfmpegEncoder {
             let cval = CString::new(value).unwrap();
             // SAFETY: codec_ctx is valid and opened; av_opt_set on priv_data
             // is the standard way to pass encoder-specific options.
-            let ret = unsafe {
-                ffi::av_opt_set(
-                    (*codec_ctx).priv_data,
-                    ckey.as_ptr(),
-                    cval.as_ptr(),
-                    0,
-                )
-            };
+            let ret =
+                unsafe { ffi::av_opt_set((*codec_ctx).priv_data, ckey.as_ptr(), cval.as_ptr(), 0) };
             if ret < 0 {
-                log::warn!(
-                    "av_opt_set({}, {}) failed: {} (non-fatal)",
-                    key,
-                    value,
-                    ret
-                );
+                log::warn!("av_opt_set({}, {}) failed: {} (non-fatal)", key, value, ret);
             } else {
                 log::debug!("av_opt_set({}, {})", key, value);
             }
         };
+
+        if codec == VideoCodec::H264 || codec == VideoCodec::H265 {
+            opt_set("repeat-headers", "1");
+        }
+        if codec == VideoCodec::H265 {
+            opt_set("annexb", "1");
+        }
 
         match hw_type {
             HwAccelType::Nvenc => {
@@ -539,11 +541,19 @@ impl FfmpegEncoder {
                     opt_set("profile", "high"); // Changed from baseline to high (enables CABAC)
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
+                    opt_set("repeat_vps_sps_pps", "1");
                 }
-                log::info!("Applied NVENC low-latency options (forced-idr=1 preset=p3)");
+                log::info!(
+                    "Applied NVENC low-latency options (forced-idr=1 preset=p3 repeat headers)"
+                );
             }
             HwAccelType::Vaapi => {
                 opt_set("rc_mode", "CBR");
+                if codec == VideoCodec::H264 {
+                    opt_set("profile", "high");
+                } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                }
                 if low_latency {
                     opt_set("async_depth", "1");
                 }
@@ -551,10 +561,37 @@ impl FfmpegEncoder {
             }
             HwAccelType::Qsv => {
                 opt_set("preset", "veryfast");
+                opt_set("forced_idr", "1");
+                opt_set("repeat_pps", "1");
+                if codec == VideoCodec::H264 {
+                    opt_set("profile", "high");
+                } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                }
                 if low_latency {
                     opt_set("async_depth", "1");
                 }
                 log::info!("Applied QSV encoder options");
+            }
+            HwAccelType::Amf => {
+                opt_set("usage", "ultralowlatency");
+                opt_set("rc", "cbr");
+                opt_set("header_insertion_mode", "idr");
+                if codec == VideoCodec::H264 {
+                    opt_set("profile", "high");
+                } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                }
+                log::info!("Applied AMF encoder options");
+            }
+            HwAccelType::VideoToolbox => {
+                opt_set("realtime", "1");
+                if codec == VideoCodec::H264 {
+                    opt_set("profile", "high");
+                } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                }
+                log::info!("Applied VideoToolbox encoder options");
             }
             HwAccelType::Software => {
                 opt_set("preset", "ultrafast");
@@ -563,18 +600,10 @@ impl FfmpegEncoder {
                 }
                 if codec == VideoCodec::H264 {
                     opt_set("profile", "high"); // Changed from baseline to high (enables CABAC)
-                    opt_set("repeat-headers", "1");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
-                    opt_set("repeat-headers", "1");
                 }
                 log::info!("Applied software encoder options");
-            }
-            _ => {
-                log::debug!(
-                    "No specific options for hw_type={:?}",
-                    hw_type
-                );
             }
         }
     }
@@ -588,7 +617,11 @@ impl FfmpegEncoder {
         fps: u32,
     ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
         let mut frames = Vec::new();
-        let duration_us = if fps > 0 { 1_000_000u64 / fps as u64 } else { 0 };
+        let duration_us = if fps > 0 {
+            1_000_000u64 / fps as u64
+        } else {
+            0
+        };
 
         loop {
             // SAFETY: codec_ctx and packet are valid, non-null pointers
@@ -716,29 +749,15 @@ impl FfmpegEncoder {
         let mut hw_frames_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
 
         if is_hw_encoder(hw_type) {
-            let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) =
-                match hw_type {
-                    HwAccelType::Vaapi => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                        Some(CString::new("/dev/dri/renderD128").unwrap()),
-                    ),
-                    HwAccelType::Nvenc => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
-                        None,
-                    ),
-                    HwAccelType::Qsv => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
-                        None,
-                    ),
-                    HwAccelType::Amf => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-                        None,
-                    ),
-                    _ => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
-                        None,
-                    ),
-                };
+            let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) = match hw_type {
+                HwAccelType::Vaapi => (
+                    ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                    Some(CString::new("/dev/dri/renderD128").unwrap()),
+                ),
+                HwAccelType::Nvenc => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, None),
+                HwAccelType::Qsv => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV, None),
+                _ => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None),
+            };
 
             let device_ptr = device_path
                 .as_ref()
@@ -759,7 +778,11 @@ impl FfmpegEncoder {
                 unsafe {
                     ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
                 }
-                log::error!("Failed to create HW device context for {:?}: {}", hw_type, ret);
+                log::error!(
+                    "Failed to create HW device context for {:?}: {}",
+                    hw_type,
+                    ret
+                );
                 return Err(ff_err(ret));
             }
 
@@ -823,16 +846,28 @@ impl FfmpegEncoder {
 
         let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, ptr::null_mut()) };
         if ret < 0 {
-            log::error!("avcodec_open2 failed for '{}': {} (e.g. NVENC session limit)", encoder_name, ret);
+            log::error!(
+                "avcodec_open2 failed for '{}': {} (e.g. NVENC session limit)",
+                encoder_name,
+                ret
+            );
             unsafe {
-                if !hw_frames_ctx.is_null() { ffi::av_buffer_unref(&mut hw_frames_ctx); }
-                if !hw_device_ctx.is_null() { ffi::av_buffer_unref(&mut hw_device_ctx); }
+                if !hw_frames_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut hw_frames_ctx);
+                }
+                if !hw_device_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                }
                 ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
             }
             return Err(ff_err(ret));
         }
 
-        log::info!("Encoder '{}' opened successfully (hw_type={:?})", encoder_name, hw_type);
+        log::info!(
+            "Encoder '{}' opened successfully (hw_type={:?})",
+            encoder_name,
+            hw_type
+        );
 
         let frame = unsafe { ffi::av_frame_alloc() };
         let sw_frame = unsafe { ffi::av_frame_alloc() };
@@ -840,11 +875,21 @@ impl FfmpegEncoder {
 
         if frame.is_null() || sw_frame.is_null() || packet.is_null() {
             unsafe {
-                if !frame.is_null() { ffi::av_frame_free(&mut (frame as *mut _)); }
-                if !sw_frame.is_null() { ffi::av_frame_free(&mut (sw_frame as *mut _)); }
-                if !packet.is_null() { ffi::av_packet_free(&mut (packet as *mut _)); }
-                if !hw_frames_ctx.is_null() { ffi::av_buffer_unref(&mut hw_frames_ctx); }
-                if !hw_device_ctx.is_null() { ffi::av_buffer_unref(&mut hw_device_ctx); }
+                if !frame.is_null() {
+                    ffi::av_frame_free(&mut (frame as *mut _));
+                }
+                if !sw_frame.is_null() {
+                    ffi::av_frame_free(&mut (sw_frame as *mut _));
+                }
+                if !packet.is_null() {
+                    ffi::av_packet_free(&mut (packet as *mut _));
+                }
+                if !hw_frames_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut hw_frames_ctx);
+                }
+                if !hw_device_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                }
                 ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
             }
             return Err(MediaError::EncoderInitFailed(
@@ -885,7 +930,11 @@ impl FfmpegEncoder {
 
         log::info!(
             "FFmpeg encoder fully initialized: {} {}x{} @{}fps {}kbps",
-            encoder_name, config.width, config.height, config.fps, config.bitrate_kbps,
+            encoder_name,
+            config.width,
+            config.height,
+            config.fps,
+            config.bitrate_kbps,
         );
 
         Ok(())
@@ -912,16 +961,18 @@ impl VideoEncoder for FfmpegEncoder {
 
         // Get the full list of encoder candidates to try.
         let candidates = Self::select_encoder_candidates(config.codec, config.preferred_hw);
-        
+
         let mut last_err = MediaError::EncoderInitFailed("No encoders available".into());
-        
+
         for (encoder_name, hw_type) in &candidates {
             match self.try_initialize_encoder(config, encoder_name, *hw_type) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!(
                         "Encoder '{}' ({:?}) failed to initialize: {}. Trying next candidate...",
-                        encoder_name, hw_type, e
+                        encoder_name,
+                        hw_type,
+                        e
                     );
                     last_err = e;
                 }
@@ -997,7 +1048,10 @@ impl VideoEncoder for FfmpegEncoder {
                     (copier.cu_ctx_get_current)(&mut old_ctx);
                     let res = (copier.cu_ctx_set_current)(ffmpeg_ctx);
                     if res != 0 {
-                        return Err(MediaError::EncodeError(format!("cuCtxSetCurrent failed: {}", res)));
+                        return Err(MediaError::EncodeError(format!(
+                            "cuCtxSetCurrent failed: {}",
+                            res
+                        )));
                     }
 
                     // Use RAII to restore context on scope exit
@@ -1028,7 +1082,10 @@ impl VideoEncoder for FfmpegEncoder {
                         if src_stride == dst_stride_y {
                             let res = (copier.cu_memcpy_dtod)(dst_y, src_y, src_stride * h);
                             if res != 0 {
-                                return Err(MediaError::EncodeError(format!("cuMemcpyDtoD BGRA plane failed: {}", res)));
+                                return Err(MediaError::EncodeError(format!(
+                                    "cuMemcpyDtoD BGRA plane failed: {}",
+                                    res
+                                )));
                             }
                         } else {
                             let w_bytes = *width as usize * 4;
@@ -1037,7 +1094,10 @@ impl VideoEncoder for FfmpegEncoder {
                                 let dst_row = dst_y + (row * dst_stride_y) as u64;
                                 let res = (copier.cu_memcpy_dtod)(dst_row, src_row, w_bytes);
                                 if res != 0 {
-                                    return Err(MediaError::EncodeError(format!("cuMemcpyDtoD BGRA row {} failed: {}", row, res)));
+                                    return Err(MediaError::EncodeError(format!(
+                                        "cuMemcpyDtoD BGRA row {} failed: {}",
+                                        row, res
+                                    )));
                                 }
                             }
                         }
@@ -1050,11 +1110,17 @@ impl VideoEncoder for FfmpegEncoder {
                         if src_stride == dst_stride_y && src_stride == dst_stride_uv {
                             let res = (copier.cu_memcpy_dtod)(dst_y, src_y, src_stride * h);
                             if res != 0 {
-                                return Err(MediaError::EncodeError(format!("cuMemcpyDtoD Y plane failed: {}", res)));
+                                return Err(MediaError::EncodeError(format!(
+                                    "cuMemcpyDtoD Y plane failed: {}",
+                                    res
+                                )));
                             }
                             let res = (copier.cu_memcpy_dtod)(dst_uv, src_uv, src_stride * (h / 2));
                             if res != 0 {
-                                return Err(MediaError::EncodeError(format!("cuMemcpyDtoD UV plane failed: {}", res)));
+                                return Err(MediaError::EncodeError(format!(
+                                    "cuMemcpyDtoD UV plane failed: {}",
+                                    res
+                                )));
                             }
                         } else {
                             for row in 0..h {
@@ -1062,7 +1128,10 @@ impl VideoEncoder for FfmpegEncoder {
                                 let dst_row = dst_y + (row * dst_stride_y) as u64;
                                 let res = (copier.cu_memcpy_dtod)(dst_row, src_row, w);
                                 if res != 0 {
-                                    return Err(MediaError::EncodeError(format!("cuMemcpyDtoD Y row {} failed: {}", row, res)));
+                                    return Err(MediaError::EncodeError(format!(
+                                        "cuMemcpyDtoD Y row {} failed: {}",
+                                        row, res
+                                    )));
                                 }
                             }
                             for row in 0..(h / 2) {
@@ -1070,7 +1139,10 @@ impl VideoEncoder for FfmpegEncoder {
                                 let dst_row = dst_uv + (row * dst_stride_uv) as u64;
                                 let res = (copier.cu_memcpy_dtod)(dst_row, src_row, w);
                                 if res != 0 {
-                                    return Err(MediaError::EncodeError(format!("cuMemcpyDtoD UV row {} failed: {}", row, res)));
+                                    return Err(MediaError::EncodeError(format!(
+                                        "cuMemcpyDtoD UV row {} failed: {}",
+                                        row, res
+                                    )));
                                 }
                             }
                         }
@@ -1110,54 +1182,52 @@ impl VideoEncoder for FfmpegEncoder {
                 }
 
                 match format {
-                    PixelFormat::NV12 => {
-                        unsafe {
-                            let y_dst = (*self.sw_frame).data[0];
-                            let y_dst_stride =
-                                (*self.sw_frame).linesize[0] as usize;
+                    PixelFormat::NV12 => unsafe {
+                        let y_dst = (*self.sw_frame).data[0];
+                        let y_dst_stride = (*self.sw_frame).linesize[0] as usize;
 
-                            for row in 0..h as usize {
-                                let src_offset = row * src_stride;
-                                let dst_offset = row * y_dst_stride;
-                                let copy_len = w as usize;
-                                if src_offset + copy_len <= data.len() {
-                                    ptr::copy_nonoverlapping(
-                                        data.as_ptr().add(src_offset),
-                                        y_dst.add(dst_offset),
-                                        copy_len,
-                                    );
-                                }
-                            }
-
-                            let uv_dst = (*self.sw_frame).data[1];
-                            let uv_dst_stride =
-                                (*self.sw_frame).linesize[1] as usize;
-                            let uv_h = (h / 2) as usize;
-                            let y_plane_size =
-                                h as usize * src_stride;
-
-                            for row in 0..uv_h {
-                                let src_offset =
-                                    y_plane_size + row * src_stride;
-                                let dst_offset = row * uv_dst_stride;
-                                let copy_len = w as usize;
-                                if src_offset + copy_len <= data.len() {
-                                    ptr::copy_nonoverlapping(
-                                        data.as_ptr().add(src_offset),
-                                        uv_dst.add(dst_offset),
-                                        copy_len,
-                                    );
-                                }
+                        for row in 0..h as usize {
+                            let src_offset = row * src_stride;
+                            let dst_offset = row * y_dst_stride;
+                            let copy_len = w as usize;
+                            if src_offset + copy_len <= data.len() {
+                                ptr::copy_nonoverlapping(
+                                    data.as_ptr().add(src_offset),
+                                    y_dst.add(dst_offset),
+                                    copy_len,
+                                );
                             }
                         }
-                    }
+
+                        let uv_dst = (*self.sw_frame).data[1];
+                        let uv_dst_stride = (*self.sw_frame).linesize[1] as usize;
+                        let uv_h = (h / 2) as usize;
+                        let y_plane_size = h as usize * src_stride;
+
+                        for row in 0..uv_h {
+                            let src_offset = y_plane_size + row * src_stride;
+                            let dst_offset = row * uv_dst_stride;
+                            let copy_len = w as usize;
+                            if src_offset + copy_len <= data.len() {
+                                ptr::copy_nonoverlapping(
+                                    data.as_ptr().add(src_offset),
+                                    uv_dst.add(dst_offset),
+                                    copy_len,
+                                );
+                            }
+                        }
+                    },
                     PixelFormat::BGRA => {
                         if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
                             unsafe {
                                 let dst = (*self.sw_frame).data[0];
                                 let dst_stride = (*self.sw_frame).linesize[0] as usize;
                                 if src_stride == dst_stride {
-                                    ptr::copy_nonoverlapping(data.as_ptr(), dst, src_stride * h as usize);
+                                    ptr::copy_nonoverlapping(
+                                        data.as_ptr(),
+                                        dst,
+                                        src_stride * h as usize,
+                                    );
                                 } else {
                                     let w_bytes = w as usize * 4;
                                     for row in 0..h as usize {
@@ -1173,11 +1243,13 @@ impl VideoEncoder for FfmpegEncoder {
                             if self.sws_ctx.is_null() {
                                 self.sws_ctx = unsafe {
                                     ffi::sws_getContext(
-                                        w, h,
+                                        w,
+                                        h,
                                         ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                                        w, h,
+                                        w,
+                                        h,
                                         sw_format,
-                                        1, // SWS_FAST_BILINEAR,
+                                        ffi::SWS_FAST_BILINEAR,
                                         ptr::null_mut(),
                                         ptr::null_mut(),
                                         ptr::null(),
@@ -1196,8 +1268,8 @@ impl VideoEncoder for FfmpegEncoder {
                                         inv_table,
                                         1, // srcRange = Full
                                         table,
-                                        1, // dstRange = Full
-                                        0, // brightness
+                                        1,       // dstRange = Full
+                                        0,       // brightness
                                         1 << 16, // contrast
                                         1 << 16, // saturation
                                     );
@@ -1205,16 +1277,10 @@ impl VideoEncoder for FfmpegEncoder {
                                 log::info!("Created SIMD SwsContext for BGRA→{:?} {}x{} with BT.709 colorspace", sw_format, w, h);
                             }
 
-                            let src_data: [*const u8; 4] = [
-                                data.as_ptr(),
-                                ptr::null(),
-                                ptr::null(),
-                                ptr::null(),
-                            ];
-                            let src_linesize: [libc::c_int; 4] = [
-                                (src_stride) as libc::c_int,
-                                0, 0, 0,
-                            ];
+                            let src_data: [*const u8; 4] =
+                                [data.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+                            let src_linesize: [libc::c_int; 4] =
+                                [(src_stride) as libc::c_int, 0, 0, 0];
 
                             unsafe {
                                 ffi::sws_scale(
@@ -1230,9 +1296,7 @@ impl VideoEncoder for FfmpegEncoder {
                         }
                     }
                     PixelFormat::P010 => {
-                        log::warn!(
-                            "P010 pixel format not yet supported for encoding"
-                        );
+                        log::warn!("P010 pixel format not yet supported for encoding");
                         return Err(MediaError::EncodeError(
                             "P010 pixel format not supported".into(),
                         ));
@@ -1243,29 +1307,15 @@ impl VideoEncoder for FfmpegEncoder {
                     unsafe {
                         ffi::av_frame_unref(self.frame);
 
-                        let ret = ffi::av_hwframe_get_buffer(
-                            self.hw_frames_ctx,
-                            self.frame,
-                            0,
-                        );
+                        let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);
                         if ret < 0 {
-                            log::error!(
-                                "av_hwframe_get_buffer failed: {}",
-                                ret
-                            );
+                            log::error!("av_hwframe_get_buffer failed: {}", ret);
                             return Err(ff_err(ret));
                         }
 
-                        let ret = ffi::av_hwframe_transfer_data(
-                            self.frame,
-                            self.sw_frame,
-                            0,
-                        );
+                        let ret = ffi::av_hwframe_transfer_data(self.frame, self.sw_frame, 0);
                         if ret < 0 {
-                            log::error!(
-                                "av_hwframe_transfer_data failed: {}",
-                                ret
-                            );
+                            log::error!("av_hwframe_transfer_data failed: {}", ret);
                             return Err(ff_err(ret));
                         }
 
@@ -1299,30 +1349,20 @@ impl VideoEncoder for FfmpegEncoder {
         // Force keyframe if requested.
         if self.force_keyframe {
             unsafe {
-                (*send_frame).pict_type =
-                    ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                #[cfg(not(target_os = "windows"))]
-                {
-                    (*send_frame).key_frame = 1;
-                }
+                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*send_frame).key_frame = 1;
                 (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY;
             }
             log::debug!("Forcing keyframe at frame #{}", self.frame_count);
         } else {
             unsafe {
-                (*send_frame).pict_type =
-                    ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
-                #[cfg(not(target_os = "windows"))]
-                {
-                    (*send_frame).key_frame = 0;
-                }
+                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+                (*send_frame).key_frame = 0;
             }
         }
 
         // Send the frame to the encoder.
-        let ret = unsafe {
-            ffi::avcodec_send_frame(self.codec_ctx, send_frame)
-        };
+        let ret = unsafe { ffi::avcodec_send_frame(self.codec_ctx, send_frame) };
         if ret < 0 {
             log::error!(
                 "avcodec_send_frame failed at frame #{}: {}",
@@ -1337,12 +1377,7 @@ impl VideoEncoder for FfmpegEncoder {
         }
 
         // Drain output packets.
-        let result = Self::drain_packets(
-            self.codec_ctx,
-            self.packet,
-            config.codec,
-            config.fps,
-        );
+        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps);
 
         // Clean up frame state for this iteration.
         unsafe {
@@ -1414,21 +1449,14 @@ impl VideoEncoder for FfmpegEncoder {
 
         // SAFETY: Sending a null frame signals end-of-stream to the encoder.
         // The codec context is valid because we checked `initialized`.
-        let ret = unsafe {
-            ffi::avcodec_send_frame(self.codec_ctx, ptr::null())
-        };
+        let ret = unsafe { ffi::avcodec_send_frame(self.codec_ctx, ptr::null()) };
         if ret < 0 && ret != ffi::AVERROR_EOF {
             log::warn!("avcodec_send_frame(NULL) returned {}", ret);
             // Some encoders return AVERROR_EOF if already flushed; not fatal.
         }
 
         // Drain all remaining packets.
-        let result = Self::drain_packets(
-            self.codec_ctx,
-            self.packet,
-            config.codec,
-            config.fps,
-        );
+        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps);
 
         log::debug!(
             "Flush complete: {} packets drained",
