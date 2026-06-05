@@ -551,7 +551,9 @@ impl FfmpegEncoder {
                 opt_set("zerolatency", "1");
                 opt_set("forced-idr", "1");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high"); // Changed from baseline to high (enables CABAC)
+                    // Use baseline profile (CAVLC) to match SDP profile-level-id=42e033 (CBP).
+                    // High Profile uses CABAC which is incompatible with CBP decoders.
+                    opt_set("profile", "baseline");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                     opt_set("repeat_vps_sps_pps", "1");
@@ -563,7 +565,7 @@ impl FfmpegEncoder {
             HwAccelType::Vaapi => {
                 opt_set("rc_mode", "CBR");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high");
+                    opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -577,7 +579,7 @@ impl FfmpegEncoder {
                 opt_set("forced_idr", "1");
                 opt_set("repeat_pps", "1");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high");
+                    opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -591,7 +593,9 @@ impl FfmpegEncoder {
                 opt_set("rc", "cbr");
                 opt_set("header_insertion_mode", "idr");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high");
+                    // constrained_baseline matches SDP profile-level-id=42e033
+                    // AMF encoder: CAVLC entropy coding for CBP compatibility
+                    opt_set("profile", "constrained_baseline");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -600,7 +604,7 @@ impl FfmpegEncoder {
             HwAccelType::VideoToolbox => {
                 opt_set("realtime", "1");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high");
+                    opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -612,7 +616,8 @@ impl FfmpegEncoder {
                     opt_set("tune", "zerolatency");
                 }
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "high"); // Changed from baseline to high (enables CABAC)
+                    // Use constrained_baseline to match SDP 42e033 and enable CAVLC
+                    opt_set("profile", "constrained_baseline");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -978,9 +983,40 @@ impl FfmpegEncoder {
                 let extra = std::slice::from_raw_parts(ctx.extradata, ctx.extradata_size as usize);
                 let annexb = avcc_extradata_to_annexb(extra);
                 if !annexb.is_empty() {
+                    // Log the actual H264 profile from the SPS for verification.
+                    // SPS Annex-B layout: [00 00 00 01] [NAL_header=0x67] [profile_idc] [constraint_flags] [level_idc]
+                    // Bytes 4,5,6,7 (0-indexed) = start_code(4) + NAL_header(1) + profile_idc + constraints + level
+                    let profile_desc = if annexb.len() >= 8 {
+                        let profile_idc = annexb[5];
+                        let constraints = annexb[6];
+                        let level_idc = annexb[7];
+                        let profile_name = match profile_idc {
+                            66 if constraints & 0xE0 == 0xE0 => "Constrained Baseline (CBP)",
+                            66 => "Baseline",
+                            77 => "Main",
+                            88 => "Extended",
+                            100 if constraints & 0x0C == 0x0C => "Constrained High",
+                            100 => "High",
+                            110 => "High 10",
+                            122 => "High 4:2:2",
+                            244 => "High 4:4:4",
+                            _ => "Unknown",
+                        };
+                        format!(
+                            "{} (profile_idc={}, constraints=0x{:02x}, level={}.{})",
+                            profile_name,
+                            profile_idc,
+                            constraints,
+                            level_idc / 10,
+                            level_idc % 10,
+                        )
+                    } else {
+                        "Unknown (SPS too short)".to_string()
+                    };
                     log::info!(
-                        "Cached SPS/PPS extradata: {} bytes (Annex-B) will be prepended to IDR frames",
-                        annexb.len()
+                        "Cached SPS/PPS extradata: {} bytes (Annex-B). Actual H264 profile: {}",
+                        annexb.len(),
+                        profile_desc,
                     );
                     Some(annexb)
                 } else {
