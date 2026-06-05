@@ -34,6 +34,12 @@ use std::sync::Once;
 
 use ffmpeg_next::sys as ffi;
 
+#[cfg(target_os = "windows")]
+const SWS_FAST_BILINEAR: libc::c_int = ffi::SwsFlags::SWS_FAST_BILINEAR as libc::c_int;
+
+#[cfg(not(target_os = "windows"))]
+const SWS_FAST_BILINEAR: libc::c_int = ffi::SWS_FAST_BILINEAR as libc::c_int;
+
 use crate::capture::gpu_buffer::GpuBuffer;
 use crate::encode::{EncoderConfig, VideoEncoder};
 use crate::error::MediaError;
@@ -1249,7 +1255,7 @@ impl VideoEncoder for FfmpegEncoder {
                                         w,
                                         h,
                                         sw_format,
-                                        ffi::SWS_FAST_BILINEAR as libc::c_int,
+                                        SWS_FAST_BILINEAR,
                                         ptr::null_mut(),
                                         ptr::null_mut(),
                                         ptr::null(),
