@@ -632,11 +632,10 @@ impl FfmpegEncoder {
     /// codec parameters it needs to decode, even if the encoder doesn't
     /// support the `repeat-headers` option (e.g. AMF on Windows).
     fn drain_packets(
-        codec_ctx: *mut ffi::AVCodecContext,
-        packet: *mut ffi::AVPacket,
+        &mut self,
         codec: VideoCodec,
         fps: u32,
-        sps_pps_cache: Option<&[u8]>,
+        prepend_headers: bool,
     ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
         let mut frames = Vec::new();
         let duration_us = if fps > 0 {
@@ -649,7 +648,7 @@ impl FfmpegEncoder {
             // SAFETY: codec_ctx and packet are valid, non-null pointers
             // allocated by FFmpeg. `avcodec_receive_packet` may return
             // AVERROR(EAGAIN) when no more output is available.
-            let ret = unsafe { ffi::avcodec_receive_packet(codec_ctx, packet) };
+            let ret = unsafe { ffi::avcodec_receive_packet(self.codec_ctx, self.packet) };
 
             if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
                 // No more packets available right now.
@@ -662,7 +661,7 @@ impl FfmpegEncoder {
             // SAFETY: If avcodec_receive_packet returned 0, the packet data
             // pointer and size are valid. We copy the data out immediately.
             let data = unsafe {
-                let pkt = &*packet;
+                let pkt = &*self.packet;
                 if pkt.data.is_null() || pkt.size <= 0 {
                     Vec::new()
                 } else {
@@ -670,7 +669,7 @@ impl FfmpegEncoder {
                 }
             };
 
-            let is_key = unsafe { (*packet).flags & ffi::AV_PKT_FLAG_KEY != 0 };
+            let is_key = unsafe { (*self.packet).flags & ffi::AV_PKT_FLAG_KEY != 0 };
             let frame_type = if is_key {
                 FrameType::Key
             } else {
@@ -682,7 +681,7 @@ impl FfmpegEncoder {
             // 1. The `repeat-headers` AVOption fails silently for some encoders (AMF on Windows).
             // 2. Without inline SPS/PPS, the browser's H264 decoder fails on every IDR
             //    and continuously sends PLI requests, preventing video from displaying.
-            let final_data = if is_key {
+            let final_data = if is_key && prepend_headers {
                 // Diagnostic: log first 16 bytes of raw encoder output to confirm Annex-B vs AVCC.
                 // Annex-B: starts with 00 00 00 01 or 00 00 01 (start code)
                 // AVCC: starts with 4-byte big-endian NAL length
@@ -697,12 +696,30 @@ impl FfmpegEncoder {
                         "NOT Annex-B! (AVCC?)"
                     }
                 );
-                if let Some(headers) = sps_pps_cache {
-                    let mut combined = Vec::with_capacity(headers.len() + data.len());
-                    combined.extend_from_slice(headers);
-                    combined.extend_from_slice(&data);
-                    log::info!("IDR combined with SPS/PPS: {} bytes total", combined.len());
-                    combined
+
+                // Dynamically cache SPS/PPS/VPS headers from first keyframe if not already cached.
+                if self.sps_pps_cache.is_none() {
+                    if let Some(offset) = find_annexb_headers(&data, codec) {
+                        if offset > 0 {
+                            let cached = data[..offset].to_vec();
+                            log::info!("Dynamically cached SPS/PPS/VPS headers from first keyframe: {} bytes", cached.len());
+                            self.sps_pps_cache = Some(cached);
+                        }
+                    }
+                }
+
+                if let Some(headers) = &self.sps_pps_cache {
+                    let has_headers = data.starts_with(headers);
+                    if !has_headers {
+                        let mut combined = Vec::with_capacity(headers.len() + data.len());
+                        combined.extend_from_slice(headers);
+                        combined.extend_from_slice(&data);
+                        log::info!("IDR combined with SPS/PPS: {} bytes total", combined.len());
+                        combined
+                    } else {
+                        log::info!("IDR frame already has SPS/PPS prepended, using as-is");
+                        data
+                    }
                 } else {
                     data
                 }
@@ -710,7 +727,7 @@ impl FfmpegEncoder {
                 data
             };
 
-            let pts = unsafe { (*packet).pts as u64 };
+            let pts = unsafe { (*self.packet).pts as u64 };
 
             frames.push(EncodedVideoFrame {
                 data: final_data,
@@ -730,7 +747,7 @@ impl FfmpegEncoder {
             // SAFETY: After extracting data, we must unref the packet to
             // release its internal buffers before the next receive call.
             unsafe {
-                ffi::av_packet_unref(packet);
+                ffi::av_packet_unref(self.packet);
             }
         }
 
@@ -1127,6 +1144,50 @@ fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
     }
 
     out
+}
+
+/// Find the byte offset in an Annex-B stream where the first actual coded slice NAL unit starts.
+/// Returns Some(offset) if found, where everything before that offset constitutes the stream headers (VPS/SPS/PPS/SEI).
+fn find_annexb_headers(data: &[u8], codec: VideoCodec) -> Option<usize> {
+    if data.len() < 3 {
+        return None;
+    }
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let mut start_code_len = 0;
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            start_code_len = 3;
+        } else if i + 4 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            start_code_len = 4;
+        }
+
+        if start_code_len > 0 {
+            let nalu_start = i + start_code_len;
+            if nalu_start < data.len() {
+                match codec {
+                    VideoCodec::H264 => {
+                        let nalu_type = data[nalu_start] & 0x1F;
+                        // H.264 slice NAL units: 1 to 5
+                        if nalu_type >= 1 && nalu_type <= 5 {
+                            return Some(i);
+                        }
+                    }
+                    VideoCodec::H265 => {
+                        let nalu_type = (data[nalu_start] >> 1) & 0x3F;
+                        // H.265 coded slice NAL units: 0 to 21
+                        if nalu_type <= 21 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += start_code_len;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 impl VideoEncoder for FfmpegEncoder {
@@ -1564,7 +1625,7 @@ impl VideoEncoder for FfmpegEncoder {
         }
 
         // Drain output packets, prepending SPS/PPS to any IDR keyframes.
-        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps, self.sps_pps_cache.as_deref());
+        let result = self.drain_packets(config.codec, config.fps, true);
 
         // Clean up frame state for this iteration.
         unsafe {
@@ -1643,7 +1704,7 @@ impl VideoEncoder for FfmpegEncoder {
         }
 
         // Drain all remaining packets (flush does not need SPS/PPS prepend).
-        let result = Self::drain_packets(self.codec_ctx, self.packet, config.codec, config.fps, None);
+        let result = self.drain_packets(config.codec, config.fps, false);
 
         log::debug!(
             "Flush complete: {} packets drained",
