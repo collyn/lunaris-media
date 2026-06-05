@@ -1006,40 +1006,49 @@ impl FfmpegEncoder {
     }
 }
 
-/// Convert AVCC-format extradata (from `AVCodecContext.extradata`) to Annex-B format.
+/// Normalize encoder extradata to Annex-B format for prepending to IDR keyframes.
 ///
-/// AVCC stores SPS/PPS as length-prefixed NAL units. Annex-B uses 4-byte start codes
-/// (0x00 0x00 0x00 0x01) before each NAL unit, which is the format used in raw H264
-/// bitstreams and by the FFmpeg H264 packetizer.
+/// Handles two common extradata formats from FFmpeg encoders:
 ///
-/// AVCC structure:
-///   [1] configurationVersion
-///   [1] AVCProfileIndication  
-///   [1] profile_compatibility
-///   [1] AVCLevelIndication
-///   [1] lengthSizeMinusOne | 0xFC
-///   [1] numSPS | 0xE0
-///   [2] spsLength (big-endian)
-///   [spsLength] SPS NAL data
-///   [1] numPPS
-///   [2] ppsLength (big-endian)
-///   [ppsLength] PPS NAL data
+/// **Annex-B format** (AMF, some software encoders): starts with `00 00 00 01` or `00 00 01`.
+///   Used directly as-is — already the correct format.
+///
+/// **AVCC format** (NVENC, most encoders): starts with configurationVersion byte `0x01`,
+///   followed by length-prefixed SPS/PPS NAL units. Converted to Annex-B by replacing
+///   length prefixes with `00 00 00 01` start codes.
 fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
-    // Minimum AVCC header is 7 bytes
-    if extra.len() < 7 {
-        return Vec::new();
-    }
-    // Validate configurationVersion
-    if extra[0] != 1 {
+    if extra.is_empty() {
         return Vec::new();
     }
 
+    // Detect Annex-B format: starts with 4-byte start code 00 00 00 01
+    if extra.len() >= 4 && extra[0] == 0 && extra[1] == 0 && extra[2] == 0 && extra[3] == 1 {
+        log::debug!("Extradata is already in Annex-B format (4-byte start code), using directly");
+        return extra.to_vec();
+    }
+
+    // Detect Annex-B with 3-byte start code 00 00 01
+    if extra.len() >= 3 && extra[0] == 0 && extra[1] == 0 && extra[2] == 1 {
+        log::debug!("Extradata is already in Annex-B format (3-byte start code), using directly");
+        return extra.to_vec();
+    }
+
+    // Try AVCC format: configurationVersion must be 1, minimum 7 bytes
+    if extra.len() < 7 || extra[0] != 1 {
+        log::warn!(
+            "Extradata is neither Annex-B nor valid AVCC (first bytes: {:02x?}); cannot extract SPS/PPS",
+            &extra[..extra.len().min(8)]
+        );
+        return Vec::new();
+    }
+
+    // Parse AVCC and convert each NAL unit to Annex-B
     let mut out = Vec::new();
     let annexb_start_code = &[0u8, 0, 0, 1];
-
     let mut pos = 5; // skip version, profile, compat, level, lengthSizeMinusOne
 
     // SPS NAL units
+    if pos >= extra.len() { return out; }
     let num_sps = (extra[pos] & 0x1F) as usize;
     pos += 1;
     for _ in 0..num_sps {
