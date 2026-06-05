@@ -697,30 +697,31 @@ impl FfmpegEncoder {
                     }
                 );
 
+                let slice_offset = find_annexb_headers(&data, codec).unwrap_or(0);
+                let already_has_headers = has_sps_pps(&data[..slice_offset], codec);
+
                 // Dynamically cache SPS/PPS/VPS headers from first keyframe if not already cached.
-                if self.sps_pps_cache.is_none() {
-                    if let Some(offset) = find_annexb_headers(&data, codec) {
-                        if offset > 0 {
-                            let cached = data[..offset].to_vec();
-                            log::info!("Dynamically cached SPS/PPS/VPS headers from first keyframe: {} bytes", cached.len());
-                            self.sps_pps_cache = Some(cached);
-                        }
+                if self.sps_pps_cache.is_none() && already_has_headers {
+                    let extracted = extract_sps_pps(&data[..slice_offset], codec);
+                    if !extracted.is_empty() {
+                        log::info!("Dynamically cached SPS/PPS/VPS headers from first keyframe: {} bytes", extracted.len());
+                        self.sps_pps_cache = Some(extracted);
                     }
                 }
 
-                if let Some(headers) = &self.sps_pps_cache {
-                    let has_headers = data.starts_with(headers);
-                    if !has_headers {
-                        let mut combined = Vec::with_capacity(headers.len() + data.len());
+                if !already_has_headers {
+                    if let Some(headers) = &self.sps_pps_cache {
+                        let mut combined = Vec::with_capacity(data.len() + headers.len());
+                        combined.extend_from_slice(&data[..slice_offset]);
                         combined.extend_from_slice(headers);
-                        combined.extend_from_slice(&data);
-                        log::info!("IDR combined with SPS/PPS: {} bytes total", combined.len());
+                        combined.extend_from_slice(&data[slice_offset..]);
+                        log::info!("IDR combined with SPS/PPS at offset {}: {} bytes total", slice_offset, combined.len());
                         combined
                     } else {
-                        log::info!("IDR frame already has SPS/PPS prepended, using as-is");
                         data
                     }
                 } else {
+                    log::info!("IDR frame already has SPS/PPS prepended, using as-is");
                     data
                 }
             } else {
@@ -1188,6 +1189,103 @@ fn find_annexb_headers(data: &[u8], codec: VideoCodec) -> Option<usize> {
         }
     }
     None
+}
+
+/// Check if the provided header bytes contain both SPS and PPS NAL units.
+fn has_sps_pps(data: &[u8], codec: VideoCodec) -> bool {
+    if data.len() < 3 {
+        return false;
+    }
+    let mut has_sps = false;
+    let mut has_pps = false;
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let mut start_code_len = 0;
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            start_code_len = 3;
+        } else if i + 4 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            start_code_len = 4;
+        }
+
+        if start_code_len > 0 {
+            let nalu_start = i + start_code_len;
+            if nalu_start < data.len() {
+                match codec {
+                    VideoCodec::H264 => {
+                        let nalu_type = data[nalu_start] & 0x1F;
+                        if nalu_type == 7 {
+                            has_sps = true;
+                        } else if nalu_type == 8 {
+                            has_pps = true;
+                        }
+                    }
+                    VideoCodec::H265 => {
+                        let nalu_type = (data[nalu_start] >> 1) & 0x3F;
+                        if nalu_type == 33 {
+                            has_sps = true;
+                        } else if nalu_type == 34 {
+                            has_pps = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += start_code_len;
+        } else {
+            i += 1;
+        }
+    }
+    has_sps && has_pps
+}
+
+/// Extract only the SPS, PPS (and VPS for H.265) NAL units from the header data.
+fn extract_sps_pps(data: &[u8], codec: VideoCodec) -> Vec<u8> {
+    let mut extracted = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let mut start_code_len = 0;
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            start_code_len = 3;
+        } else if i + 4 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            start_code_len = 4;
+        }
+
+        if start_code_len > 0 {
+            let nalu_start = i + start_code_len;
+            let mut nalu_end = data.len();
+            let mut next_i = nalu_start;
+            while next_i + 3 <= data.len() {
+                let is_next_start = data[next_i] == 0 && data[next_i + 1] == 0 && (data[next_i + 2] == 1 || (next_i + 4 <= data.len() && data[next_i + 2] == 0 && data[next_i + 3] == 1));
+                if is_next_start {
+                    nalu_end = next_i;
+                    break;
+                }
+                next_i += 1;
+            }
+
+            if nalu_start < data.len() {
+                let is_header = match codec {
+                    VideoCodec::H264 => {
+                        let nalu_type = data[nalu_start] & 0x1F;
+                        nalu_type == 7 || nalu_type == 8
+                    }
+                    VideoCodec::H265 => {
+                        let nalu_type = (data[nalu_start] >> 1) & 0x3F;
+                        nalu_type == 32 || nalu_type == 33 || nalu_type == 34
+                    }
+                    _ => false,
+                };
+
+                if is_header {
+                    extracted.extend_from_slice(&data[i..nalu_end]);
+                }
+            }
+            i = nalu_end;
+        } else {
+            i += 1;
+        }
+    }
+    extracted
 }
 
 impl VideoEncoder for FfmpegEncoder {
