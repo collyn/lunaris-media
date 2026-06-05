@@ -761,15 +761,15 @@ impl FfmpegEncoder {
         let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
         let mut hw_frames_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
 
-        if is_hw_encoder(hw_type) {
+        let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
+
+        if is_hw_encoder(hw_type) && has_hw_frames {
             let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) = match hw_type {
                 HwAccelType::Vaapi => (
                     ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
                     Some(CString::new("/dev/dri/renderD128").unwrap()),
                 ),
                 HwAccelType::Nvenc => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, None),
-                HwAccelType::Qsv => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV, None),
-                HwAccelType::Amf => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, None),
                 _ => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None),
             };
 
@@ -806,70 +806,54 @@ impl FfmpegEncoder {
                 device_path.as_ref().map(|p| p.to_str().unwrap_or("?"))
             );
 
-            let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
+            hw_frames_ctx = unsafe { ffi::av_hwframe_ctx_alloc(hw_device_ctx) };
+            if hw_frames_ctx.is_null() {
+                unsafe {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
+                }
+                return Err(MediaError::EncoderInitFailed(
+                    "Failed to allocate HW frames context".into(),
+                ));
+            }
 
-            if has_hw_frames {
-                hw_frames_ctx = unsafe { ffi::av_hwframe_ctx_alloc(hw_device_ctx) };
-                if hw_frames_ctx.is_null() {
-                    unsafe {
-                        ffi::av_buffer_unref(&mut hw_device_ctx);
-                        ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
-                    }
+            unsafe {
+                let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
+                (*frames_ctx).format = hw_pix_fmt(hw_type);
+                let sw_format = match hw_type {
+                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                };
+                (*frames_ctx).sw_format = sw_format;
+                (*frames_ctx).width = config.width as libc::c_int;
+                (*frames_ctx).height = config.height as libc::c_int;
+                (*frames_ctx).initial_pool_size = 4;
+            }
+
+            let ret = unsafe { ffi::av_hwframe_ctx_init(hw_frames_ctx) };
+            if ret < 0 {
+                unsafe {
+                    ffi::av_buffer_unref(&mut hw_frames_ctx);
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
+                }
+                log::error!("Failed to init HW frames context: {}", ret);
+                return Err(ff_err(ret));
+            }
+
+            unsafe {
+                (*codec_ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
+                if (*codec_ctx).hw_frames_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut hw_frames_ctx);
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
                     return Err(MediaError::EncoderInitFailed(
-                        "Failed to allocate HW frames context".into(),
+                        "av_buffer_ref for hw_frames_ctx failed".into(),
                     ));
                 }
-
-                unsafe {
-                    let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
-                    (*frames_ctx).format = hw_pix_fmt(hw_type);
-                    let sw_format = match hw_type {
-                        HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                        _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                    };
-                    (*frames_ctx).sw_format = sw_format;
-                    (*frames_ctx).width = config.width as libc::c_int;
-                    (*frames_ctx).height = config.height as libc::c_int;
-                    (*frames_ctx).initial_pool_size = 4;
-                }
-
-                let ret = unsafe { ffi::av_hwframe_ctx_init(hw_frames_ctx) };
-                if ret < 0 {
-                    unsafe {
-                        ffi::av_buffer_unref(&mut hw_frames_ctx);
-                        ffi::av_buffer_unref(&mut hw_device_ctx);
-                        ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
-                    }
-                    log::error!("Failed to init HW frames context: {}", ret);
-                    return Err(ff_err(ret));
-                }
-
-                unsafe {
-                    (*codec_ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
-                    if (*codec_ctx).hw_frames_ctx.is_null() {
-                        ffi::av_buffer_unref(&mut hw_frames_ctx);
-                        ffi::av_buffer_unref(&mut hw_device_ctx);
-                        ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
-                        return Err(MediaError::EncoderInitFailed(
-                            "av_buffer_ref for hw_frames_ctx failed".into(),
-                        ));
-                    }
-                }
-
-                log::info!("HW frames context initialized: pool_size=4 sw_format=NV12");
-            } else {
-                unsafe {
-                    (*codec_ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
-                    if (*codec_ctx).hw_device_ctx.is_null() {
-                        ffi::av_buffer_unref(&mut hw_device_ctx);
-                        ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
-                        return Err(MediaError::EncoderInitFailed(
-                            "av_buffer_ref for hw_device_ctx failed".into(),
-                        ));
-                    }
-                }
-                log::info!("Configured hw_device_ctx on codec context for {:?}", hw_type);
             }
+
+            log::info!("HW frames context initialized: pool_size=4 sw_format=NV12");
         }
 
         Self::set_encoder_options(codec_ctx, hw_type, config.codec, config.low_latency);
