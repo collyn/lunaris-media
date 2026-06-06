@@ -37,6 +37,26 @@ use ffmpeg_next::sys as ffi;
 #[cfg(target_os = "windows")]
 const SWS_FAST_BILINEAR: libc::c_int = ffi::SwsFlags::SWS_FAST_BILINEAR as libc::c_int;
 
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11Resource,
+    ID3D11VideoDevice, ID3D11VideoContext, ID3D11VideoProcessor,
+    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_FRAME_FORMAT,
+    D3D11_VIDEO_USAGE, D3D11_VPIV_DIMENSION, D3D11_VPOV_DIMENSION,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEX2D_ARRAY_VPOV,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
+#[cfg(target_os = "windows")]
+use windows::core::Interface;
+
 #[cfg(not(target_os = "windows"))]
 const SWS_FAST_BILINEAR: libc::c_int = ffi::SWS_FAST_BILINEAR as libc::c_int;
 
@@ -207,6 +227,33 @@ pub struct FfmpegEncoder {
     /// Prepended to every IDR keyframe to guarantee the browser has codec parameters,
     /// regardless of whether the encoder supports the `repeat-headers` option.
     sps_pps_cache: Option<Vec<u8>>,
+    /// Cached Direct3D11 Video Device for zero-copy format conversion.
+    #[cfg(target_os = "windows")]
+    video_device: Option<ID3D11VideoDevice>,
+    /// Cached Direct3D11 Video Context for zero-copy format conversion.
+    #[cfg(target_os = "windows")]
+    video_context: Option<ID3D11VideoContext>,
+    /// Cached Direct3D11 Video Processor for zero-copy format conversion.
+    #[cfg(target_os = "windows")]
+    video_processor: Option<ID3D11VideoProcessor>,
+    /// Cached Direct3D11 Video Processor Enumerator.
+    #[cfg(target_os = "windows")]
+    video_enumerator: Option<ID3D11VideoProcessorEnumerator>,
+    /// Cached Input View for the video processor.
+    #[cfg(target_os = "windows")]
+    video_input_view: Option<ID3D11VideoProcessorInputView>,
+    /// Cached Output View for the video processor.
+    #[cfg(target_os = "windows")]
+    video_output_view: Option<ID3D11VideoProcessorOutputView>,
+    /// The source texture pointer used to create the cached input view.
+    #[cfg(target_os = "windows")]
+    cached_src_tex: usize,
+    /// The destination texture pointer used to create the cached output view.
+    #[cfg(target_os = "windows")]
+    cached_dst_tex: usize,
+    /// The array index used to create the cached output view.
+    #[cfg(target_os = "windows")]
+    cached_dst_idx: u32,
 }
 
 // SAFETY: The FFmpeg codec context is only accessed through `&mut self` methods,
@@ -235,6 +282,24 @@ impl FfmpegEncoder {
             info: None,
             initialized: false,
             sps_pps_cache: None,
+            #[cfg(target_os = "windows")]
+            video_device: None,
+            #[cfg(target_os = "windows")]
+            video_context: None,
+            #[cfg(target_os = "windows")]
+            video_processor: None,
+            #[cfg(target_os = "windows")]
+            video_enumerator: None,
+            #[cfg(target_os = "windows")]
+            video_input_view: None,
+            #[cfg(target_os = "windows")]
+            video_output_view: None,
+            #[cfg(target_os = "windows")]
+            cached_src_tex: 0,
+            #[cfg(target_os = "windows")]
+            cached_dst_tex: 0,
+            #[cfg(target_os = "windows")]
+            cached_dst_idx: 0,
         })
     }
 
@@ -946,7 +1011,6 @@ impl FfmpegEncoder {
                 (*frames_ctx).format = hw_pix_fmt(hw_type);
                 let sw_format = match hw_type {
                     HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                    HwAccelType::Amf if is_d3d11 => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
                 (*frames_ctx).sw_format = sw_format;
@@ -1426,8 +1490,22 @@ impl VideoEncoder for FfmpegEncoder {
                     let dst_tex_ptr = (*self.frame).data[0] as *mut std::ffi::c_void;
                     let dst_idx = (*self.frame).data[1] as u32;
 
+                    use windows::Win32::Graphics::Direct3D11::{
+                        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11Resource,
+                        ID3D11VideoDevice, ID3D11VideoContext, ID3D11VideoProcessor,
+                        ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+                        ID3D11VideoProcessorOutputView, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+                        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+                        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_FRAME_FORMAT,
+                        D3D11_VIDEO_USAGE, D3D11_VPIV_DIMENSION, D3D11_VPOV_DIMENSION,
+                        D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEX2D_ARRAY_VPOV,
+                        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+                        D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
+                        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+                    };
+                    use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
                     use windows::core::Interface;
-                    use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D, ID3D11Resource};
 
                     let context_ptr = config.d3d11_context.ok_or_else(|| {
                         MediaError::EncodeError("D3D11 context not available in config".into())
@@ -1437,43 +1515,176 @@ impl VideoEncoder for FfmpegEncoder {
                     let src_tex = ID3D11Texture2D::from_raw(*texture);
                     let dst_tex = ID3D11Texture2D::from_raw(dst_tex_ptr);
 
-                    static mut COPY_LOG_COUNT: u32 = 0;
-                    COPY_LOG_COUNT += 1;
-                    if COPY_LOG_COUNT == 1 || COPY_LOG_COUNT % 120 == 0 {
+                    let res = (|| -> Result<(), MediaError> {
                         let mut src_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
                         let mut dst_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
                         src_tex.GetDesc(&mut src_desc);
                         dst_tex.GetDesc(&mut dst_desc);
-                        log::info!(
-                            "D3D11 zero-copy textures (copy #{}): src={:?}x{:?} format={} ArraySize={} | dst={:?}x{:?} format={} ArraySize={} dst_idx={}",
-                            COPY_LOG_COUNT,
-                            src_desc.Width, src_desc.Height, src_desc.Format.0, src_desc.ArraySize,
-                            dst_desc.Width, dst_desc.Height, dst_desc.Format.0, dst_desc.ArraySize,
-                            dst_idx
-                        );
-                    }
 
-                    // Cast to ID3D11Resource
-                    if let (Ok(src_res), Ok(dst_res)) = (src_tex.cast::<ID3D11Resource>(), dst_tex.cast::<ID3D11Resource>()) {
-                        context.CopySubresourceRegion(
-                            &dst_res,
-                            dst_idx,
-                            0, 0, 0,
-                            &src_res,
-                            *array_index,
-                            None,
-                        );
-                        context.Flush();
-                    } else {
-                        std::mem::forget(context);
-                        std::mem::forget(src_tex);
-                        std::mem::forget(dst_tex);
-                        return Err(MediaError::EncodeError("Failed to cast textures to ID3D11Resource".into()));
-                    }
+                        static mut COPY_LOG_COUNT: u32 = 0;
+                        COPY_LOG_COUNT += 1;
+                        if COPY_LOG_COUNT == 1 || COPY_LOG_COUNT % 120 == 0 {
+                            log::info!(
+                                "D3D11 zero-copy textures (copy #{}): src={:?}x{:?} format={} ArraySize={} | dst={:?}x{:?} format={} ArraySize={} dst_idx={}",
+                                COPY_LOG_COUNT,
+                                src_desc.Width, src_desc.Height, src_desc.Format.0, src_desc.ArraySize,
+                                dst_desc.Width, dst_desc.Height, dst_desc.Format.0, dst_desc.ArraySize,
+                                dst_idx
+                            );
+                        }
+
+                        if src_desc.Format == dst_desc.Format {
+                            if let (Ok(src_res), Ok(dst_res)) = (src_tex.cast::<ID3D11Resource>(), dst_tex.cast::<ID3D11Resource>()) {
+                                context.CopySubresourceRegion(
+                                    &dst_res,
+                                    dst_idx,
+                                    0, 0, 0,
+                                    &src_res,
+                                    *array_index,
+                                    None,
+                                );
+                                context.Flush();
+                            } else {
+                                return Err(MediaError::EncodeError("Failed to cast textures to ID3D11Resource".into()));
+                            }
+                        } else {
+                            // Video Processor path
+                            let device_ptr = config.d3d11_device.ok_or_else(|| {
+                                MediaError::EncodeError("D3D11 device not available in config".into())
+                            })? as *mut std::ffi::c_void;
+
+                            if self.video_device.is_none() {
+                                let d3d_device = ID3D11Device::from_raw(device_ptr);
+                                let v_device = d3d_device.cast::<ID3D11VideoDevice>().map_err(|e| {
+                                    MediaError::EncodeError(format!("Cast ID3D11Device to ID3D11VideoDevice failed: {e}"))
+                                })?;
+                                std::mem::forget(d3d_device);
+                                self.video_device = Some(v_device);
+                            }
+                            let video_device = self.video_device.as_ref().unwrap();
+
+                            if self.video_context.is_none() {
+                                let v_context = context.cast::<ID3D11VideoContext>().map_err(|e| {
+                                    MediaError::EncodeError(format!("Cast ID3D11DeviceContext to ID3D11VideoContext failed: {e}"))
+                                })?;
+                                self.video_context = Some(v_context);
+                            }
+                            let video_context = self.video_context.as_ref().unwrap();
+
+                            if self.video_processor.is_none() {
+                                let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                                    InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                                    InputFrameRate: DXGI_RATIONAL { Numerator: config.fps, Denominator: 1 },
+                                    InputWidth: config.width,
+                                    InputHeight: config.height,
+                                    OutputFrameRate: DXGI_RATIONAL { Numerator: config.fps, Denominator: 1 },
+                                    OutputWidth: config.width,
+                                    OutputHeight: config.height,
+                                    Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+                                };
+                                let enumerator = video_device.CreateVideoProcessorEnumerator(&desc).map_err(|e| {
+                                    MediaError::EncodeError(format!("CreateVideoProcessorEnumerator failed: {e}"))
+                                })?;
+                                let processor = video_device.CreateVideoProcessor(&enumerator, 0).map_err(|e| {
+                                    MediaError::EncodeError(format!("CreateVideoProcessor failed: {e}"))
+                                })?;
+                                self.video_enumerator = Some(enumerator);
+                                self.video_processor = Some(processor);
+                            }
+                            let video_processor = self.video_processor.as_ref().unwrap();
+                            let video_enumerator = self.video_enumerator.as_ref().unwrap();
+
+                            let mut recreate_views = false;
+                            if self.video_input_view.is_none() || self.cached_src_tex != *texture {
+                                recreate_views = true;
+                            }
+                            if self.video_output_view.is_none() || self.cached_dst_tex != dst_tex_ptr as usize || self.cached_dst_idx != dst_idx {
+                                recreate_views = true;
+                            }
+
+                            if recreate_views {
+                                let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                                    FourCC: 0,
+                                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                                    Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                                        Texture2D: D3D11_TEX2D_VPIV {
+                                            MipSlice: 0,
+                                            FirstArraySlice: *array_index,
+                                            ArraySize: 1,
+                                        },
+                                    },
+                                };
+                                let in_res = src_tex.cast::<ID3D11Resource>().map_err(|e| {
+                                    MediaError::EncodeError(format!("Cast src_tex to ID3D11Resource failed: {e}"))
+                                })?;
+                                let in_view = video_device.CreateVideoProcessorInputView(&in_res, video_enumerator, &input_desc).map_err(|e| {
+                                    MediaError::EncodeError(format!("CreateVideoProcessorInputView failed: {e}"))
+                                })?;
+                                self.video_input_view = Some(in_view);
+                                self.cached_src_tex = *texture;
+
+                                let output_desc = if dst_desc.ArraySize > 1 {
+                                    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                                        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
+                                        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                                            Texture2DArray: D3D11_TEX2D_ARRAY_VPOV {
+                                                MipSlice: 0,
+                                                FirstArraySlice: dst_idx,
+                                                ArraySize: 1,
+                                            },
+                                        },
+                                    }
+                                } else {
+                                    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                                        ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                                        Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                                            Texture2D: D3D11_TEX2D_VPOV {
+                                                MipSlice: 0,
+                                            },
+                                        },
+                                    }
+                                };
+                                let out_res = dst_tex.cast::<ID3D11Resource>().map_err(|e| {
+                                    MediaError::EncodeError(format!("Cast dst_tex to ID3D11Resource failed: {e}"))
+                                })?;
+                                let out_view = video_device.CreateVideoProcessorOutputView(&out_res, video_enumerator, &output_desc).map_err(|e| {
+                                    MediaError::EncodeError(format!("CreateVideoProcessorOutputView failed: {e}"))
+                                })?;
+                                self.video_output_view = Some(out_view);
+                                self.cached_dst_tex = dst_tex_ptr as usize;
+                                self.cached_dst_idx = dst_idx;
+                            }
+
+                            let input_view = self.video_input_view.as_ref().unwrap();
+                            let output_view = self.video_output_view.as_ref().unwrap();
+
+                            let streams = [D3D11_VIDEO_PROCESSOR_STREAM {
+                                Enable: true.into(),
+                                OutputIndex: 0,
+                                InputFrameOrField: 0,
+                                PastFrames: 0,
+                                FutureFrames: 0,
+                                ppPastSurfaces: std::ptr::null_mut(),
+                                pInputSurface: Some(input_view.clone()),
+                                ppFutureSurfaces: std::ptr::null_mut(),
+                                ppPastSurfacesRight: std::ptr::null_mut(),
+                                pInputSurfaceRight: None,
+                                ppFutureSurfacesRight: std::ptr::null_mut(),
+                            }];
+
+                            video_context.VideoProcessorBlt(video_processor, output_view, 0, &streams).map_err(|e| {
+                                MediaError::EncodeError(format!("VideoProcessorBlt failed: {e}"))
+                            })?;
+                            context.Flush();
+                        }
+                        Ok(())
+                    })();
 
                     std::mem::forget(context);
                     std::mem::forget(src_tex);
                     std::mem::forget(dst_tex);
+
+                    res?;
 
                     (*self.frame).width = config.width as libc::c_int;
                     (*self.frame).height = config.height as libc::c_int;
@@ -2002,6 +2213,18 @@ impl VideoEncoder for FfmpegEncoder {
         self.info = None;
         self.frame_count = 0;
         self.force_keyframe = false;
+        #[cfg(target_os = "windows")]
+        {
+            self.video_device = None;
+            self.video_context = None;
+            self.video_processor = None;
+            self.video_enumerator = None;
+            self.video_input_view = None;
+            self.video_output_view = None;
+            self.cached_src_tex = 0;
+            self.cached_dst_tex = 0;
+            self.cached_dst_idx = 0;
+        }
 
         log::info!("FFmpeg encoder shut down successfully");
     }
