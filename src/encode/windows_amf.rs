@@ -46,8 +46,8 @@ const AMF_VIDEO_ENCODER_VCE_AVC: &[u16] = &[
 ];
 
 type AmfResult = i32;
-type AmfBool = i32;
-type AmfLong = i64;
+type AmfBool = u16;
+type AmfLong = i32;
 type AmfSize = usize;
 type AmfPts = i64;
 type AmfInitFn = unsafe extern "C" fn(u64, *mut *mut AmfFactory) -> AmfResult;
@@ -194,11 +194,22 @@ struct AmfContextVtbl {
     get_opencl_command_queue: *mut c_void,
     get_opencl_device_id: *mut c_void,
     get_opencl_factory: *mut c_void,
+    init_opencl_ex: *mut c_void,
+    lock_opencl: *mut c_void,
+    unlock_opencl: *mut c_void,
     init_opengl: *mut c_void,
     get_opengl_context: *mut c_void,
+    get_opengl_drawable: *mut c_void,
     lock_opengl: *mut c_void,
     unlock_opengl: *mut c_void,
-    get_opengl_drawable: *mut c_void,
+    init_xv: *mut c_void,
+    get_xv_device: *mut c_void,
+    lock_xv: *mut c_void,
+    unlock_xv: *mut c_void,
+    init_gralloc: *mut c_void,
+    get_gralloc_device: *mut c_void,
+    lock_gralloc: *mut c_void,
+    unlock_gralloc: *mut c_void,
     alloc_buffer: *mut c_void,
     alloc_surface: *mut c_void,
     alloc_audio_buffer: *mut c_void,
@@ -211,6 +222,11 @@ struct AmfContextVtbl {
         *mut *mut AmfSurface,
         *mut c_void,
     ) -> AmfResult,
+    create_surface_from_opengl_native: *mut c_void,
+    create_surface_from_gralloc_native: *mut c_void,
+    create_surface_from_opencl_native: *mut c_void,
+    create_buffer_from_opencl_native: *mut c_void,
+    get_compute: *mut c_void,
 }
 
 #[repr(C)]
@@ -229,6 +245,10 @@ struct AmfComponentVtbl {
     has_property: unsafe extern "system" fn(*mut AmfComponent, *const u16) -> AmfBool,
     get_property_count: unsafe extern "system" fn(*mut AmfComponent) -> AmfSize,
     get_property_at: *mut c_void,
+    get_properties_info_count: *mut c_void,
+    get_property_info_at: *mut c_void,
+    get_property_info: *mut c_void,
+    validate_property: *mut c_void,
     init: unsafe extern "system" fn(*mut AmfComponent, i32, i32, i32) -> AmfResult,
     reinit: unsafe extern "system" fn(*mut AmfComponent, i32, i32) -> AmfResult,
     terminate: unsafe extern "system" fn(*mut AmfComponent) -> AmfResult,
@@ -305,6 +325,9 @@ struct AmfSurfaceVtbl {
     get_frame_type: *mut c_void,
     set_frame_type: *mut c_void,
     set_crop: unsafe extern "system" fn(*mut AmfSurface, i32, i32, i32, i32) -> AmfResult,
+    copy_surface_region: *mut c_void,
+    add_observer_surface: *mut c_void,
+    remove_observer_surface: *mut c_void,
 }
 
 #[repr(C)]
@@ -337,6 +360,8 @@ struct AmfBufferVtbl {
     set_size: *mut c_void,
     get_size: unsafe extern "system" fn(*mut AmfBuffer) -> AmfSize,
     get_native: unsafe extern "system" fn(*mut AmfBuffer) -> *mut c_void,
+    add_observer_buffer: *mut c_void,
+    remove_observer_buffer: *mut c_void,
 }
 
 fn amf_ok(status: AmfResult, op: &str) -> Result<(), MediaError> {
@@ -665,7 +690,7 @@ impl WindowsAmfEncoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_DECODER.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -986,8 +1011,14 @@ impl VideoEncoder for WindowsAmfEncoder {
             self.device = Some((*borrowed_device).clone());
             self.d3d_context = Some((*borrowed_context).clone());
         }
+        log::info!("Native AMF: creating D3D11 context");
         self.create_context(device_ptr)?;
+        log::info!("Native AMF: creating AVC component");
         self.create_component(config)?;
+        log::info!(
+            "Native AMF: creating {} aligned NV12 input textures",
+            INPUT_RING_SIZE
+        );
         self.create_slots(config.width, config.height)?;
         self.config = Some(config.clone());
         self.initialized = true;
