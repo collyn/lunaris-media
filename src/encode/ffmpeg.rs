@@ -591,6 +591,7 @@ impl FfmpegEncoder {
             HwAccelType::Amf => {
                 opt_set("usage", "ultralowlatency");
                 opt_set("rc", "cbr");
+                opt_set("forced_idr", "1");
                 opt_set("header_insertion_mode", "idr");
                 if codec == VideoCodec::H264 {
                     // constrained_baseline matches SDP profile-level-id=42e033
@@ -599,7 +600,7 @@ impl FfmpegEncoder {
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
-                log::info!("Applied AMF encoder options");
+                log::info!("Applied AMF encoder options (forced_idr=1)");
             }
             HwAccelType::VideoToolbox => {
                 opt_set("realtime", "1");
@@ -1701,12 +1702,14 @@ impl VideoEncoder for FfmpegEncoder {
         if self.force_keyframe {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*send_frame).key_frame = 1;
                 (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
             }
             log::info!("Forcing keyframe at frame #{}", self.frame_count);
         } else {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+                (*send_frame).key_frame = 0;
                 (*send_frame).flags &= !(ffi::AV_FRAME_FLAG_KEY as libc::c_int);
             }
         }
