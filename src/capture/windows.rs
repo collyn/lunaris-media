@@ -414,10 +414,12 @@ impl ScreenCapture for DxgiCapture {
             }
 
             if is_black {
+                let stride = self.width * 4;
+                let data_size = (stride * self.height) as usize;
                 return Ok(CapturedFrame {
                     buffer: GpuBuffer::CpuBuffer {
-                        data: vec![0; 16],
-                        stride: 4,
+                        data: vec![0; data_size],
+                        stride,
                         format: PixelFormat::BGRA,
                         width: self.width,
                         height: self.height,
