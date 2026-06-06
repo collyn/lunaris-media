@@ -949,10 +949,24 @@ impl FfmpegEncoder {
                         -1
                     } else {
                         unsafe {
+                            let device_raw = config.d3d11_device.unwrap() as *mut std::ffi::c_void;
+                            let context_raw = config.d3d11_context.unwrap() as *mut std::ffi::c_void;
+
+                            // Increment refcount so FFmpeg's internal release doesn't destroy our shared context
+                            let device_owned = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_raw));
+                            let context_owned = std::mem::ManuallyDrop::new(ID3D11DeviceContext::from_raw(context_raw));
+
+                            let device_clone = (*device_owned).clone();
+                            let context_clone = (*context_owned).clone();
+
                             let device_ctx = (*hw_device_ctx).data as *mut ffi::AVHWDeviceContext;
                             let d3d11_ctx = (*device_ctx).hwctx as *mut AVD3D11VADeviceContext;
-                            (*d3d11_ctx).device = config.d3d11_device.unwrap() as *mut std::ffi::c_void;
-                            (*d3d11_ctx).device_context = config.d3d11_context.unwrap() as *mut std::ffi::c_void;
+                            (*d3d11_ctx).device = device_clone.as_raw() as *mut std::ffi::c_void;
+                            (*d3d11_ctx).device_context = context_clone.as_raw() as *mut std::ffi::c_void;
+
+                            std::mem::forget(device_clone);
+                            std::mem::forget(context_clone);
+
                             ffi::av_hwdevice_ctx_init(hw_device_ctx)
                         }
                     }
