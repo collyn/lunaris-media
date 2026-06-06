@@ -1695,7 +1695,7 @@ impl VideoEncoder for FfmpegEncoder {
                         return Err(MediaError::EncodeError("D3D11 zero-copy not supported on non-Windows".into()));
                     }
 
-                    return self.encode_frame(self.sw_frame, pts_us);
+                    self.sw_frame
                 }
 
                 unsafe {
