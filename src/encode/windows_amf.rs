@@ -890,19 +890,42 @@ impl WindowsAmfEncoder {
                 ))
             })?;
             let mut output_view = None;
-            unsafe {
-                video_device
-                    .CreateVideoProcessorOutputView(
-                        &out_res,
-                        &enumerator,
-                        &output_desc,
-                        Some(&mut output_view),
-                    )
-                    .map_err(|e| {
-                        MediaError::EncodeError(format!(
-                            "CreateVideoProcessorOutputView failed: {e}"
-                        ))
-                    })?;
+            let create_result = unsafe {
+                video_device.CreateVideoProcessorOutputView(
+                    &out_res,
+                    &enumerator,
+                    &output_desc,
+                    Some(&mut output_view),
+                )
+            };
+            if let Err(first_err) = create_result {
+                log::warn!(
+                    "CreateVideoProcessorOutputView(Texture2D) failed: {first_err}; retrying Texture2DArray view"
+                );
+                let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                    ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_VPOV {
+                            MipSlice: 0,
+                            FirstArraySlice: 0,
+                            ArraySize: 1,
+                        },
+                    },
+                };
+                unsafe {
+                    video_device
+                        .CreateVideoProcessorOutputView(
+                            &out_res,
+                            &enumerator,
+                            &output_desc,
+                            Some(&mut output_view),
+                        )
+                        .map_err(|second_err| {
+                            MediaError::EncodeError(format!(
+                                "CreateVideoProcessorOutputView failed: Texture2D={first_err}; Texture2DArray={second_err}"
+                            ))
+                        })?;
+                }
             }
             self.slots[slot_idx].output_view = Some(output_view.ok_or_else(|| {
                 MediaError::EncodeError("VideoProcessor output view was None".into())

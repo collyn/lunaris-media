@@ -146,9 +146,14 @@ impl WindowsAutoEncoder {
     }
 
     fn requires_native_amf(config: &EncoderConfig) -> bool {
-        !config.force_ffmpeg
-            && (matches!(config.preferred_hw, Some(HwAccelType::Amf))
-                || Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Amf))
+        if config.force_ffmpeg {
+            return false;
+        }
+        match config.preferred_hw {
+            Some(HwAccelType::Amf) => true,
+            Some(_) => false,
+            None => Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Amf),
+        }
     }
 
     fn supports_native_d3d11_h264(config: &EncoderConfig) -> bool {
