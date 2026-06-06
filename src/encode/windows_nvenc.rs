@@ -836,7 +836,7 @@ impl WindowsNvencEncoder {
         Ok(())
     }
 
-    fn query_sps_pps(&mut self) {
+    fn query_sps_pps(&mut self) -> Result<(), MediaError> {
         let mut buffer = vec![0u8; 512];
         let mut out_size = 0u32;
         let mut payload: NvEncSequenceParamPayload = unsafe { std::mem::zeroed() };
@@ -844,13 +844,11 @@ impl WindowsNvencEncoder {
         payload.in_buffer_size = buffer.len() as u32;
         payload.spspps_buffer = buffer.as_mut_ptr() as *mut c_void;
         payload.out_spspps_payload_size = &mut out_size;
-        let status = unsafe {
-            nvenc_raw!(
-                self.api,
-                nv_enc_get_sequence_params(self.encoder, &mut payload),
-                "NvEncGetSequenceParams"
-            )
-        };
+        let status = nvenc_raw!(
+            self.api,
+            nv_enc_get_sequence_params(self.encoder, &mut payload),
+            "NvEncGetSequenceParams"
+        );
         if status == NV_ENC_SUCCESS && out_size > 0 && out_size as usize <= buffer.len() {
             buffer.truncate(out_size as usize);
             self.sps_pps = buffer;
@@ -861,6 +859,7 @@ impl WindowsNvencEncoder {
                 status
             );
         }
+        Ok(())
     }
 
     fn drain_slot(
@@ -967,7 +966,9 @@ impl VideoEncoder for WindowsNvencEncoder {
         self.initialize_encoder(config)?;
         self.create_slots(config.width, config.height)?;
         self.config = Some(config.clone());
-        self.query_sps_pps();
+        if let Err(err) = self.query_sps_pps() {
+            log::warn!("Failed to query native NVENC SPS/PPS: {err}");
+        }
         self.initialized = true;
         self.force_keyframe = true;
         self.frame_count = 0;
