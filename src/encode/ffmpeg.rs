@@ -1037,7 +1037,11 @@ impl FfmpegEncoder {
                     #[cfg(target_os = "windows")]
                     {
                         let d3d11_frames = (*frames_ctx).hwctx as *mut AVD3D11VAFramesContext;
-                        (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
+                        if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
+                            (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
+                        } else {
+                            (*d3d11_frames).bind_flags = 8;  // D3D11_BIND_SHADER_RESOURCE
+                        }
                         (*d3d11_frames).misc_flags = 0;
                     }
                 } else {
