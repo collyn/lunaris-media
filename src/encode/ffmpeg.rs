@@ -1595,7 +1595,7 @@ impl VideoEncoder for FfmpegEncoder {
                             let video_enumerator = self.video_enumerator.as_ref().unwrap();
 
                             let mut recreate_views = false;
-                            if self.video_input_view.is_none() || self.cached_src_tex != *texture {
+                            if self.video_input_view.is_none() || self.cached_src_tex != *texture as usize {
                                 recreate_views = true;
                             }
                             if self.video_output_view.is_none() || self.cached_dst_tex != dst_tex_ptr as usize || self.cached_dst_idx != dst_idx {
@@ -1609,8 +1609,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
                                         Texture2D: D3D11_TEX2D_VPIV {
                                             MipSlice: 0,
-                                            FirstArraySlice: *array_index,
-                                            ArraySize: 1,
+                                            ArraySlice: *array_index,
                                         },
                                     },
                                 };
@@ -1622,7 +1621,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     MediaError::EncodeError(format!("CreateVideoProcessorInputView failed: {e}"))
                                 })?;
                                 self.video_input_view = in_view;
-                                self.cached_src_tex = *texture;
+                                self.cached_src_tex = *texture as usize;
 
                                 let output_desc = if dst_desc.ArraySize > 1 {
                                     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
