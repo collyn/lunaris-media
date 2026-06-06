@@ -358,6 +358,105 @@ pub fn describe_d3d11_device(_device_ptr: Option<usize>) -> Option<String> {
     None
 }
 
+/// Return a human-readable GPU description for the active host.
+pub fn describe_host_gpu(d3d11_device: Option<usize>) -> Option<String> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = d3d11_device;
+
+    #[cfg(target_os = "windows")]
+    {
+        return describe_d3d11_device(d3d11_device);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return describe_linux_gpu();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = d3d11_device;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn describe_linux_gpu() -> Option<String> {
+    describe_nvidia_proc_gpu().or_else(describe_drm_gpu)
+}
+
+#[cfg(target_os = "linux")]
+fn describe_nvidia_proc_gpu() -> Option<String> {
+    let entries = std::fs::read_dir("/proc/driver/nvidia/gpus").ok()?;
+    for entry in entries.flatten() {
+        let info = std::fs::read_to_string(entry.path().join("information")).ok()?;
+        if let Some(model) = info
+            .lines()
+            .find_map(|line| line.strip_prefix("Model:").map(str::trim))
+        {
+            if !model.is_empty() {
+                return Some(format!("NVIDIA {model}"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn describe_drm_gpu() -> Option<String> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with("card") || file_name.contains('-') {
+            continue;
+        }
+
+        let device_dir = entry.path().join("device");
+        let vendor = read_trimmed(device_dir.join("vendor"))?;
+        let device =
+            read_trimmed(device_dir.join("device")).unwrap_or_else(|| "unknown".to_string());
+        let vendor_name = match vendor.as_str() {
+            "0x10de" => "NVIDIA",
+            "0x1002" | "0x1022" => "AMD",
+            "0x8086" => "Intel",
+            _ => "GPU",
+        };
+
+        if let Some(product_name) = read_trimmed(device_dir.join("product_name"))
+            .or_else(|| read_trimmed(device_dir.join("product_info")))
+            .filter(|name| !name.is_empty())
+        {
+            return Some(format!(
+                "{vendor_name} {product_name} (vendor={vendor}, device={device})"
+            ));
+        }
+
+        let driver = read_trimmed(device_dir.join("uevent"))
+            .and_then(|uevent| {
+                uevent
+                    .lines()
+                    .find_map(|line| line.strip_prefix("DRIVER=").map(str::to_string))
+            })
+            .filter(|driver| !driver.is_empty());
+
+        return Some(match driver {
+            Some(driver) => {
+                format!("{vendor_name} GPU ({driver}, vendor={vendor}, device={device})")
+            }
+            None => format!("{vendor_name} GPU (vendor={vendor}, device={device})"),
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
 /// Create the best available [`VideoEncoder`] for the current platform.
 pub fn create_encoder() -> Result<Box<dyn VideoEncoder>, MediaError> {
     #[cfg(target_os = "windows")]

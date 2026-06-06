@@ -275,7 +275,7 @@ impl MediaPipeline {
             d3d11_context,
         })?;
         let encoder_info = encoder.encoder_info();
-        let gpu_name = encode::describe_d3d11_device(d3d11_device);
+        let gpu_name = encode::describe_host_gpu(d3d11_device);
         log::info!(
             "Encoder initialized: {} ({}) on {}",
             encoder_info.name,
