@@ -1003,6 +1003,9 @@ impl FfmpegEncoder {
 
             if ret < 0 || hw_device_ctx.is_null() {
                 unsafe {
+                    if !hw_device_ctx.is_null() {
+                        ffi::av_buffer_unref(&mut hw_device_ctx);
+                    }
                     ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
                 }
                 log::error!(
@@ -1032,6 +1035,10 @@ impl FfmpegEncoder {
 
             unsafe {
                 let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
+                let sw_format = match hw_type {
+                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                };
                 if is_d3d11 {
                     (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
                     #[cfg(target_os = "windows")]
@@ -1047,10 +1054,6 @@ impl FfmpegEncoder {
                 } else {
                     (*frames_ctx).format = hw_pix_fmt(hw_type);
                 }
-                let sw_format = match hw_type {
-                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                    _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                };
                 (*frames_ctx).sw_format = sw_format;
                 (*frames_ctx).width = config.width as libc::c_int;
                 (*frames_ctx).height = config.height as libc::c_int;
