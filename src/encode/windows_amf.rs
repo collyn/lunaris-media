@@ -104,8 +104,8 @@ const AMF_VARIANT_BOOL: i32 = 1;
 const AMF_VARIANT_INT64: i32 = 2;
 const AMF_VARIANT_SIZE: i32 = 5;
 const AMF_VARIANT_RATE: i32 = 7;
+const AMF_VIDEO_ENCODER_USAGE_TRANSCONDING: i64 = 0;
 const AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY: i64 = 1;
-const AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY: i64 = 2;
 const AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR: i64 = 1;
 const AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED: i64 = 0;
 const AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED: i64 = 1;
@@ -608,14 +608,32 @@ impl WindowsAmfEncoder {
 
     fn configure_component(
         &self,
-        _component: *mut AmfComponent,
+        component: *mut AmfComponent,
         config: &EncoderConfig,
     ) -> Result<(), MediaError> {
+        let usage = if config.low_latency {
+            AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
+        } else {
+            AMF_VIDEO_ENCODER_USAGE_TRANSCONDING
+        };
         log::info!(
-            "Native AMF: using minimal component properties before Init (target {}kbps, {}fps)",
-            config.bitrate_kbps,
-            config.fps
+            "Native AMF: configuring required static properties (usage={}, size={}x{}, fps={})",
+            usage,
+            config.width,
+            config.height,
+            config.fps.max(1)
         );
+        self.set_component_property(component, "Usage", amf_variant_int64(usage))?;
+        self.set_component_property(
+            component,
+            "FrameSize",
+            amf_variant_size(config.width, config.height),
+        )?;
+        self.set_component_property(
+            component,
+            "FrameRate",
+            amf_variant_rate(config.fps.max(1), 1),
+        )?;
         Ok(())
     }
 
