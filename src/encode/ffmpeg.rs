@@ -1101,7 +1101,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                         if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
                             (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
                         } else {
-                            (*d3d11_frames).bind_flags = 0;  // Leave as 0 to use FFmpeg default (D3D11_BIND_DECODER | D3D11_BIND_VIDEO_PROCESSOR)
+                            (*d3d11_frames).bind_flags = 512 | 32; // D3D11_BIND_DECODER (512) | D3D11_BIND_RENDER_TARGET (32)
                         }
                         (*d3d11_frames).misc_flags = 0;
                     }
