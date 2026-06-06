@@ -802,7 +802,7 @@ impl FfmpegEncoder {
             (*codec_ctx).gop_size = if config.keyframe_interval > 0 {
                 config.keyframe_interval as libc::c_int
             } else {
-                100_000_000
+                (config.fps * 5) as libc::c_int // 5 seconds GOP (allows dynamic keyframe insertion on HW encoders)
             };
             (*codec_ctx).max_b_frames = 0;
             (*codec_ctx).thread_count = 1;
@@ -1699,7 +1699,7 @@ impl VideoEncoder for FfmpegEncoder {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
                 (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
             }
-            log::debug!("Forcing keyframe at frame #{}", self.frame_count);
+            log::info!("Forcing keyframe at frame #{}", self.frame_count);
         } else {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
