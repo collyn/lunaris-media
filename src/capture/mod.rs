@@ -18,21 +18,37 @@ pub mod gpu_buffer;
 #[cfg(target_os = "linux")]
 pub mod linux_drm;
 #[cfg(target_os = "linux")]
+pub mod linux_nvfbc;
+#[cfg(target_os = "linux")]
 pub mod linux_wayland;
 #[cfg(target_os = "linux")]
 pub mod linux_x11;
-#[cfg(target_os = "linux")]
-pub mod linux_nvfbc;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod virtual_display;
 #[cfg(target_os = "windows")]
 pub mod windows;
-#[cfg(target_os = "macos")]
-pub mod macos;
 
 use crate::error::MediaError;
 use crate::types::*;
 use gpu_buffer::GpuBuffer;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn should_embed_host_cursor() -> bool {
+    if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_ok() {
+        return false;
+    }
+
+    std::env::var("LUNARIS_EMBED_HOST_CURSOR")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// A frame captured from the screen, containing a GPU-resident buffer.
 ///

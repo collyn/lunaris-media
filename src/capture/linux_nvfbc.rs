@@ -493,8 +493,11 @@ impl NvfbcCapture {
                                     ActiveCapturer::Cuda(_) => nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_SHARED_CUDA,
                                 };
 
-                                // Capture the cursor in the video stream unless LUNARIS_HIDE_HOST_CURSOR is set
-                                let with_cursor = std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err();
+                                let with_cursor = crate::capture::should_embed_host_cursor();
+                                log::info!(
+                                    "NvFBC capture: {} host cursor in video stream",
+                                    if with_cursor { "embedding" } else { "hiding" }
+                                );
 
                                 let res = unsafe {
                                     custom_start_nvfbc(
@@ -592,7 +595,11 @@ impl NvfbcCapture {
                                             ActiveCapturer::System(_) => nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_TO_SYS,
                                             ActiveCapturer::Cuda(_) => nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_SHARED_CUDA,
                                         };
-                                        let with_cursor = std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err();
+                                        let with_cursor = crate::capture::should_embed_host_cursor();
+                                        log::info!(
+                                            "NvFBC capture: {} host cursor in video stream",
+                                            if with_cursor { "embedding" } else { "hiding" }
+                                        );
                                         let res = unsafe {
                                             custom_start_nvfbc(
                                                 handle,

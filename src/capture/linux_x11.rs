@@ -248,7 +248,7 @@ impl X11Capture {
             let bgra_slice = unsafe {
                 std::slice::from_raw_parts_mut(self.shm_info.shmaddr as *mut u8, data_len)
             };
-            if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
+            if crate::capture::should_embed_host_cursor() {
                 unsafe {
                     draw_cursor(
                         self.display,
@@ -320,7 +320,7 @@ impl X11Capture {
                 let data_len = (self.width * self.height * 4) as usize;
                 let bgra_slice =
                     unsafe { std::slice::from_raw_parts_mut((*img).data as *mut u8, data_len) };
-                if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
+                if crate::capture::should_embed_host_cursor() {
                     unsafe {
                         draw_cursor(
                             self.display,
@@ -522,6 +522,14 @@ impl ScreenCapture for X11Capture {
         self.capture_x = 0;
         self.capture_y = 0;
         self.last_frame_time = std::time::Instant::now();
+
+        if crate::capture::should_embed_host_cursor() {
+            log::info!("X11 capture: embedding host cursor in video frames");
+        } else {
+            log::info!(
+                "X11 capture: hiding host cursor from video frames; browser overlay will render it"
+            );
+        }
 
         if let Ok(displays) = Self::query_xrandr_displays() {
             if let Some((display, x, y)) = displays
