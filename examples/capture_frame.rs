@@ -47,15 +47,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting capture...");
     capture.start(&primary_display.id, &config).await?;
 
-    println!("Waiting for the first new frame...");
+    println!("Waiting for frames (capturing 5 frames to allow potential GDI fallback)...");
     let mut frame = None;
-    for _ in 0..10 {
+    let mut new_frame_count = 0;
+    for _ in 0..30 {
         match capture.next_frame().await {
             Ok(f) => {
                 if f.is_new_frame {
-                    println!("Successfully captured a new frame! Size: {}x{}", f.width, f.height);
+                    new_frame_count += 1;
+                    println!("Successfully captured frame #{}! Size: {}x{}", new_frame_count, f.width, f.height);
                     frame = Some(f);
-                    break;
+                    if new_frame_count >= 5 {
+                        break;
+                    }
                 } else {
                     println!("Captured a keepalive/timeout frame, waiting...");
                 }
