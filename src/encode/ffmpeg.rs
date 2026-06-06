@@ -1047,7 +1047,7 @@ impl FfmpegEncoder {
                         if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
                             (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
                         } else {
-                            (*d3d11_frames).bind_flags = 8;  // D3D11_BIND_SHADER_RESOURCE
+                            (*d3d11_frames).bind_flags = 0;  // Leave as 0 to use FFmpeg default (D3D11_BIND_DECODER | D3D11_BIND_VIDEO_PROCESSOR)
                         }
                         (*d3d11_frames).misc_flags = 0;
                     }
@@ -1063,6 +1063,14 @@ impl FfmpegEncoder {
             let ret = unsafe { ffi::av_hwframe_ctx_init(hw_frames_ctx) };
             if ret < 0 {
                 unsafe {
+                    #[cfg(target_os = "windows")]
+                    if is_d3d11 {
+                        let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
+                        let d3d11_frames = (*frames_ctx).hwctx as *mut AVD3D11VAFramesContext;
+                        (*d3d11_frames).texture = ptr::null_mut();
+                        (*d3d11_frames).textures = ptr::null_mut();
+                        (*d3d11_frames).nb_textures = 0;
+                    }
                     ffi::av_buffer_unref(&mut hw_frames_ctx);
                     ffi::av_buffer_unref(&mut hw_device_ctx);
                     ffi::avcodec_free_context(&mut (codec_ctx as *mut _));
