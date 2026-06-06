@@ -329,6 +329,7 @@ impl MediaPipeline {
 
         let mut last_sent_time = Instant::now() - Duration::from_secs(5);
         let mut keyframe_requested = true; // Force first frame immediately
+        let mut last_frame: Option<crate::capture::CapturedFrame> = None;
 
         loop {
             tokio::select! {
@@ -350,11 +351,18 @@ impl MediaPipeline {
 
                     match frame_result {
                         Ok(captured) => {
-                            if matches!(&captured.buffer, crate::capture::gpu_buffer::GpuBuffer::CpuBuffer { data, .. } if data.is_empty()) {
-                                continue;
+                            let is_empty = matches!(&captured.buffer, crate::capture::gpu_buffer::GpuBuffer::CpuBuffer { data, .. } if data.is_empty());
+
+                            if !is_empty {
+                                last_frame = Some(captured);
                             }
 
-                            let should_encode = captured.is_new_frame
+                            let frame = match &last_frame {
+                                Some(f) => f,
+                                None => continue, // No frame captured yet
+                            };
+
+                            let should_encode = (!is_empty && frame.is_new_frame)
                                 || keyframe_requested
                                 || last_sent_time.elapsed() >= Duration::from_millis(500);
 
@@ -365,8 +373,8 @@ impl MediaPipeline {
                             keyframe_requested = false;
                             last_sent_time = Instant::now();
 
-                            let pts = captured.timestamp_us;
-                            match encoder.encode(&captured.buffer, pts) {
+                            let pts = frame.timestamp_us;
+                            match encoder.encode(&frame.buffer, pts) {
                                 Ok(encoded_frames) => {
                                     for ef in encoded_frames {
                                         total_frames += 1;
