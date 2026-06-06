@@ -505,11 +505,33 @@ impl FfmpegEncoder {
         Err(MediaError::NoEncoderAvailable)
     }
 
+#[cfg(target_os = "windows")]
+fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+
+    unsafe {
+        let device_raw = device_ptr as *mut std::ffi::c_void;
+        let device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_raw));
+        let dxgi_device: Result<IDXGIDevice, _> = (*device).cast();
+        if let Ok(dxgi_dev) = dxgi_device {
+            if let Ok(adapter) = dxgi_dev.GetAdapter() {
+                if let Ok(desc) = adapter.GetDesc() {
+                    return Some(desc.VendorId);
+                }
+            }
+        }
+    }
+    None
+}
+
     /// Returns all available encoder candidates in priority order.
     /// Used by `initialize()` to try each one until one succeeds at `avcodec_open2`.
     pub fn select_encoder_candidates(
         codec: VideoCodec,
         preferred_hw: Option<HwAccelType>,
+        d3d11_device: Option<usize>,
     ) -> Vec<(String, HwAccelType)> {
         let candidates: &[(&str, HwAccelType)] = match codec {
             VideoCodec::H264 => &[
@@ -566,10 +588,42 @@ impl FfmpegEncoder {
             ],
         };
 
+        #[cfg(not(target_os = "windows"))]
+        let _ = d3d11_device;
+
+        let detected_hw = {
+            #[allow(unused_mut)]
+            let mut hw = None;
+            #[cfg(target_os = "windows")]
+            if let Some(device_ptr) = d3d11_device {
+                if let Some(vendor_id) = get_d3d11_vendor_id(device_ptr) {
+                    log::info!("Detected GPU Vendor ID: {:#X}", vendor_id);
+                    match vendor_id {
+                        0x10DE => {
+                            log::info!("Primary GPU is Nvidia. Prioritizing NVENC.");
+                            hw = Some(HwAccelType::Nvenc);
+                        }
+                        0x1002 => {
+                            log::info!("Primary GPU is AMD. Prioritizing AMF.");
+                            hw = Some(HwAccelType::Amf);
+                        }
+                        0x8086 => {
+                            log::info!("Primary GPU is Intel. Prioritizing QSV.");
+                            hw = Some(HwAccelType::Qsv);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            hw
+        };
+
+        let effective_pref = preferred_hw.or(detected_hw);
+
         let mut result = Vec::new();
 
-        // If preferred HW specified, put those first
-        if let Some(preferred) = preferred_hw {
+        // If preferred HW specified or detected, put those first
+        if let Some(preferred) = effective_pref {
             for &(name, hw_type) in candidates {
                 if hw_type == preferred {
                     let cname = CString::new(name).unwrap();
@@ -1485,7 +1539,7 @@ impl VideoEncoder for FfmpegEncoder {
         );
 
         // Get the full list of encoder candidates to try.
-        let candidates = Self::select_encoder_candidates(config.codec, config.preferred_hw);
+        let candidates = Self::select_encoder_candidates(config.codec, config.preferred_hw, config.d3d11_device);
 
         let mut last_err = MediaError::EncoderInitFailed("No encoders available".into());
 
