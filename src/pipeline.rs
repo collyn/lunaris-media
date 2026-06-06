@@ -173,22 +173,22 @@ impl MediaPipeline {
         let mut audio_capture = audio::create_audio_capture()?;
         let mut cursor_capture = cursor::create_cursor_capture()?;
 
-        // 2. Initialize encoder
-        encoder.initialize(&EncoderConfig {
-            codec: self.config.codec,
-            width: self.config.width,
-            height: self.config.height,
-            fps: self.config.fps,
-            bitrate_kbps: self.config.bitrate_kbps,
-            low_latency: true,
-            keyframe_interval: 0,
-            preferred_hw: StreamConfig::parse_encoder_preference(
-                self.config.preferred_encoder.as_deref().unwrap_or("auto"),
-            ),
-        })?;
-        log::info!("Encoder initialized: {}", encoder.encoder_info().name);
+        let preferred_hw = StreamConfig::parse_encoder_preference(
+            self.config.preferred_encoder.as_deref().unwrap_or("auto"),
+        );
 
-        // 3. Start capture
+        let use_gdi_only = std::env::var("LUNARIS_USE_GDI")
+            .map(|val| val == "1" || val.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let is_hw_preferred = preferred_hw.map_or(true, |hw| hw != HwAccelType::Software);
+
+        if cfg!(target_os = "windows") && !use_gdi_only && is_hw_preferred {
+            log::info!("Zero-copy GPU pipeline requested. Setting LUNARIS_ZERO_COPY=1");
+            std::env::set_var("LUNARIS_ZERO_COPY", "1");
+        }
+
+        // 2. Start capture
         #[allow(unused_mut)]
         let mut capture_display_id = display_id.to_string();
 
@@ -237,6 +237,36 @@ impl MediaPipeline {
 
         capture.start(&capture_display_id, &self.config).await?;
         log::info!("Screen capture started on '{}'", capture_display_id);
+
+        let (d3d11_device, d3d11_context) = if cfg!(target_os = "windows") {
+            if let Some((device, context)) = capture.get_d3d11_device() {
+                log::info!(
+                    "Retrieved shared D3D11 device from capture backend (device={:#x}, context={:#x})",
+                    device,
+                    context
+                );
+                (Some(device), Some(context))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // 3. Initialize encoder
+        encoder.initialize(&EncoderConfig {
+            codec: self.config.codec,
+            width: self.config.width,
+            height: self.config.height,
+            fps: self.config.fps,
+            bitrate_kbps: self.config.bitrate_kbps,
+            low_latency: true,
+            keyframe_interval: 0,
+            preferred_hw,
+            d3d11_device,
+            d3d11_context,
+        })?;
+        log::info!("Encoder initialized: {}", encoder.encoder_info().name);
 
         // 4. Start audio on a separate blocking task (cpal is !Send for Stream)
         let mut audio_config = AudioCaptureConfig::default();

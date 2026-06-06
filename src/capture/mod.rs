@@ -80,6 +80,11 @@ pub trait ScreenCapture: Send {
 
     /// Returns `true` if capture is currently active.
     fn is_capturing(&self) -> bool;
+
+    /// Optional: Get the Direct3D11 device and context pointers (cast to usize) for Windows.
+    fn get_d3d11_device(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// Create a [`ScreenCapture`] backend appropriate for the current platform.

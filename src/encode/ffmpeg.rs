@@ -57,6 +57,24 @@ struct CudaCopier {
 unsafe impl Send for CudaCopier {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for CudaCopier {}
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct AVD3D11VADeviceContext {
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+    video_device: *mut std::ffi::c_void,
+    video_context: *mut std::ffi::c_void,
+    lock: Option<unsafe extern "C" fn(lock_ctx: *mut std::ffi::c_void)>,
+    unlock: Option<unsafe extern "C" fn(lock_ctx: *mut std::ffi::c_void)>,
+    lock_ctx: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct AVD3D11VAFramesContext {
+    texture: *mut std::ffi::c_void,
+    texture_infos: *mut std::ffi::c_void,
+}
 
 #[cfg(target_os = "linux")]
 static CUDA_COPIER: std::sync::OnceLock<Option<CudaCopier>> = std::sync::OnceLock::new();
@@ -812,7 +830,14 @@ impl FfmpegEncoder {
                 (*codec_ctx).level = 31; // Match SDP profile-level-id=42001f (Level 3.1)
             }
 
-            let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
+            let is_d3d11 = if cfg!(target_os = "windows") && config.d3d11_device.is_some() && config.d3d11_context.is_some() && matches!(hw_type, HwAccelType::Amf | HwAccelType::Nvenc) {
+                true
+            } else {
+                false
+            };
+
+            let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc) || is_d3d11;
+
             if is_hw_encoder(hw_type) {
                 if has_hw_frames {
                     (*codec_ctx).pix_fmt = hw_pix_fmt(hw_type);
@@ -831,31 +856,59 @@ impl FfmpegEncoder {
         let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
         let mut hw_frames_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
 
-        let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
+        let is_d3d11 = if cfg!(target_os = "windows") && config.d3d11_device.is_some() && config.d3d11_context.is_some() && matches!(hw_type, HwAccelType::Amf | HwAccelType::Nvenc) {
+            true
+        } else {
+            false
+        };
+
+        let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc) || is_d3d11;
 
         if is_hw_encoder(hw_type) && has_hw_frames {
-            let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) = match hw_type {
-                HwAccelType::Vaapi => (
-                    ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                    Some(CString::new("/dev/dri/renderD128").unwrap()),
-                ),
-                HwAccelType::Nvenc => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, None),
-                _ => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None),
-            };
+            let ret = if is_d3d11 {
+                #[cfg(target_os = "windows")]
+                {
+                    hw_device_ctx = unsafe { ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA) };
+                    if hw_device_ctx.is_null() {
+                        -1
+                    } else {
+                        unsafe {
+                            let device_ctx = (*hw_device_ctx).data as *mut ffi::AVHWDeviceContext;
+                            let d3d11_ctx = (*device_ctx).hwctx as *mut AVD3D11VADeviceContext;
+                            (*d3d11_ctx).device = config.d3d11_device.unwrap() as *mut std::ffi::c_void;
+                            (*d3d11_ctx).device_context = config.d3d11_context.unwrap() as *mut std::ffi::c_void;
+                            ffi::av_hwdevice_ctx_init(hw_device_ctx)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    -1
+                }
+            } else {
+                let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) = match hw_type {
+                    HwAccelType::Vaapi => (
+                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                        Some(CString::new("/dev/dri/renderD128").unwrap()),
+                    ),
+                    HwAccelType::Nvenc => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, None),
+                    _ => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None),
+                };
 
-            let device_ptr = device_path
-                .as_ref()
-                .map(|p| p.as_ptr())
-                .unwrap_or(ptr::null());
+                let device_ptr = device_path
+                    .as_ref()
+                    .map(|p| p.as_ptr())
+                    .unwrap_or(ptr::null());
 
-            let ret = unsafe {
-                ffi::av_hwdevice_ctx_create(
-                    &mut hw_device_ctx,
-                    device_type,
-                    device_ptr,
-                    ptr::null_mut(),
-                    0,
-                )
+                unsafe {
+                    ffi::av_hwdevice_ctx_create(
+                        &mut hw_device_ctx,
+                        device_type,
+                        device_ptr,
+                        ptr::null_mut(),
+                        0,
+                    )
+                }
             };
 
             if ret < 0 || hw_device_ctx.is_null() {
@@ -871,9 +924,9 @@ impl FfmpegEncoder {
             }
 
             log::info!(
-                "Created HW device context for {:?} (device={:?})",
+                "Created HW device context for {:?} (shared_d3d11={})",
                 hw_type,
-                device_path.as_ref().map(|p| p.to_str().unwrap_or("?"))
+                is_d3d11
             );
 
             hw_frames_ctx = unsafe { ffi::av_hwframe_ctx_alloc(hw_device_ctx) };
@@ -892,6 +945,7 @@ impl FfmpegEncoder {
                 (*frames_ctx).format = hw_pix_fmt(hw_type);
                 let sw_format = match hw_type {
                     HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Amf if is_d3d11 => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
                 (*frames_ctx).sw_format = sw_format;
@@ -1349,6 +1403,61 @@ impl VideoEncoder for FfmpegEncoder {
         let use_hw = is_hw_encoder(hw_type);
 
         let send_frame: *mut ffi::AVFrame = match buffer {
+            #[cfg(target_os = "windows")]
+            GpuBuffer::D3D11Texture { texture, array_index } => {
+                if self.hw_frames_ctx.is_null() {
+                    return Err(MediaError::EncodeError("hw_frames_ctx is null".into()));
+                }
+
+                unsafe {
+                    ffi::av_frame_unref(self.frame);
+                    let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);
+                    if ret < 0 {
+                        log::error!("av_hwframe_get_buffer failed: {}", ret);
+                        return Err(ff_err(ret));
+                    }
+
+                    let dst_tex_ptr = (*self.frame).data[0] as *mut std::ffi::c_void;
+                    let dst_idx = (*self.frame).data[1] as u32;
+
+                    use windows::core::Interface;
+                    use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D, ID3D11Resource};
+
+                    let context_ptr = config.d3d11_context.ok_or_else(|| {
+                        MediaError::EncodeError("D3D11 context not available in config".into())
+                    })? as *mut std::ffi::c_void;
+
+                    let context = ID3D11DeviceContext::from_raw(context_ptr);
+                    let src_tex = ID3D11Texture2D::from_raw(*texture);
+                    let dst_tex = ID3D11Texture2D::from_raw(dst_tex_ptr);
+
+                    // Cast to ID3D11Resource
+                    if let (Ok(src_res), Ok(dst_res)) = (src_tex.cast::<ID3D11Resource>(), dst_tex.cast::<ID3D11Resource>()) {
+                        context.CopySubresourceRegion(
+                            &dst_res,
+                            dst_idx,
+                            0, 0, 0,
+                            &src_res,
+                            *array_index,
+                            None,
+                        );
+                    } else {
+                        std::mem::forget(context);
+                        std::mem::forget(src_tex);
+                        std::mem::forget(dst_tex);
+                        return Err(MediaError::EncodeError("Failed to cast textures to ID3D11Resource".into()));
+                    }
+
+                    std::mem::forget(context);
+                    std::mem::forget(src_tex);
+                    std::mem::forget(dst_tex);
+
+                    (*self.frame).width = config.width as libc::c_int;
+                    (*self.frame).height = config.height as libc::c_int;
+                }
+                self.frame
+            }
+
             #[cfg(target_os = "linux")]
             GpuBuffer::DmaBuf { .. } => {
                 log::warn!(

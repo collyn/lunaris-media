@@ -29,6 +29,7 @@ pub struct DxgiCapture {
     context: Option<ID3D11DeviceContext>,
     duplication: Option<IDXGIOutputDuplication>,
     staging_texture: Option<ID3D11Texture2D>,
+    gpu_texture: Option<ID3D11Texture2D>,
     width: u32,
     height: u32,
     x_offset: i32,
@@ -38,6 +39,7 @@ pub struct DxgiCapture {
     frame_count: u64,
     last_frame_data: Option<(Vec<u8>, u32)>, // (data, stride) — cached for timeout reuse
     last_returned_time: Option<Instant>,
+    use_zero_copy: bool,
 }
 
 impl DxgiCapture {
@@ -47,6 +49,7 @@ impl DxgiCapture {
             context: None,
             duplication: None,
             staging_texture: None,
+            gpu_texture: None,
             width: 0,
             height: 0,
             x_offset: 0,
@@ -56,6 +59,7 @@ impl DxgiCapture {
             frame_count: 0,
             last_frame_data: None,
             last_returned_time: None,
+            use_zero_copy: false,
         })
     }
 
@@ -152,6 +156,39 @@ impl DxgiCapture {
 
         texture.ok_or_else(|| MediaError::CaptureError("Staging texture is None".into()))
     }
+
+    fn create_gpu_texture(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> Result<ID3D11Texture2D, MediaError> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+
+        let mut texture = None;
+        unsafe {
+            device
+                .CreateTexture2D(&desc, None, Some(&mut texture))
+                .map_err(|e| {
+                    MediaError::CaptureError(format!("CreateTexture2D gpu failed: {e}"))
+                })?;
+        }
+
+        texture.ok_or_else(|| MediaError::CaptureError("GPU texture is None".into()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -215,10 +252,23 @@ impl ScreenCapture for DxgiCapture {
 
         let staging = Self::create_staging_texture(&device, self.width, self.height)?;
 
+        let use_zero_copy = std::env::var("LUNARIS_ZERO_COPY")
+            .map(|val| val == "1" || val.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let gpu_texture = if use_zero_copy {
+            log::info!("DXGI: Creating GPU-only texture for Zero-Copy mode");
+            Some(Self::create_gpu_texture(&device, self.width, self.height)?)
+        } else {
+            None
+        };
+
         self.device = Some(device);
         self.context = Some(context);
         self.duplication = Some(duplication);
         self.staging_texture = Some(staging);
+        self.gpu_texture = gpu_texture;
+        self.use_zero_copy = use_zero_copy;
         self.x_offset = rect.left;
         self.y_offset = rect.top;
         self.capturing = true;
@@ -253,6 +303,38 @@ impl ScreenCapture for DxgiCapture {
                 
                 // Return a keepalive frame at most once every 500ms when screen is static
                 let need_keepalive = self.last_returned_time.map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(500));
+
+                if self.use_zero_copy {
+                    if need_keepalive && self.gpu_texture.is_some() {
+                        self.last_returned_time = Some(std::time::Instant::now());
+                        return Ok(CapturedFrame {
+                            buffer: GpuBuffer::D3D11Texture {
+                                texture: self.gpu_texture.as_ref().unwrap().as_raw(),
+                                array_index: 0,
+                            },
+                            timestamp_us: timestamp,
+                            width: self.width,
+                            height: self.height,
+                            format: PixelFormat::BGRA,
+                            is_new_frame: false,
+                        });
+                    } else {
+                        return Ok(CapturedFrame {
+                            buffer: GpuBuffer::CpuBuffer {
+                                data: Vec::new(),
+                                stride: 0,
+                                format: PixelFormat::BGRA,
+                                width: self.width,
+                                height: self.height,
+                            },
+                            timestamp_us: timestamp,
+                            width: self.width,
+                            height: self.height,
+                            format: PixelFormat::BGRA,
+                            is_new_frame: false,
+                        });
+                    }
+                }
 
                 let (data, stride) = if need_keepalive {
                     if let Some((d, s)) = &self.last_frame_data {
@@ -293,6 +375,34 @@ impl ScreenCapture for DxgiCapture {
         let texture: ID3D11Texture2D = resource
             .cast()
             .map_err(|e| MediaError::CaptureError(format!("Cast to Texture2D failed: {e}")))?;
+
+        let timestamp = self
+            .start_time
+            .as_ref()
+            .map_or(0, |t| t.elapsed().as_micros() as u64);
+        self.frame_count += 1;
+
+        if self.use_zero_copy {
+            let gpu_tex = self.gpu_texture.as_ref().unwrap();
+            unsafe {
+                context.CopyResource(gpu_tex, &texture);
+            }
+            unsafe {
+                let _ = duplication.ReleaseFrame();
+            }
+            self.last_returned_time = Some(std::time::Instant::now());
+            return Ok(CapturedFrame {
+                buffer: GpuBuffer::D3D11Texture {
+                    texture: gpu_tex.as_raw(),
+                    array_index: 0,
+                },
+                timestamp_us: timestamp,
+                width: self.width,
+                height: self.height,
+                format: PixelFormat::BGRA,
+                is_new_frame: true,
+            });
+        }
 
         unsafe {
             context.CopyResource(staging, &texture);
@@ -374,6 +484,13 @@ impl ScreenCapture for DxgiCapture {
 
     fn is_capturing(&self) -> bool {
         self.capturing
+    }
+
+    fn get_d3d11_device(&self) -> Option<(usize, usize)> {
+        match (&self.device, &self.context) {
+            (Some(d), Some(c)) => Some((d.as_raw() as usize, c.as_raw() as usize)),
+            _ => None,
+        }
     }
 }
 
@@ -826,6 +943,14 @@ impl ScreenCapture for WindowsScreenCapture {
             self.gdi.as_ref().map_or(false, |gdi| gdi.is_capturing())
         } else {
             self.dxgi.as_ref().map_or(false, |dxgi| dxgi.is_capturing())
+        }
+    }
+
+    fn get_d3d11_device(&self) -> Option<(usize, usize)> {
+        if self.active_is_gdi {
+            None
+        } else {
+            self.dxgi.as_ref().and_then(|dxgi| dxgi.get_d3d11_device())
         }
     }
 }

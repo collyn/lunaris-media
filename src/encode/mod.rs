@@ -35,6 +35,10 @@ pub struct EncoderConfig {
     pub keyframe_interval: u32,
     /// Preferred hardware acceleration type, or `None` for auto-detection.
     pub preferred_hw: Option<HwAccelType>,
+    /// Optional Direct3D11 device pointer (cast to usize) for Windows zero-copy GPU encoding.
+    pub d3d11_device: Option<usize>,
+    /// Optional Direct3D11 device context pointer (cast to usize) for Windows zero-copy GPU encoding.
+    pub d3d11_context: Option<usize>,
 }
 
 impl Default for EncoderConfig {
@@ -48,6 +52,8 @@ impl Default for EncoderConfig {
             low_latency: true,
             keyframe_interval: 0,
             preferred_hw: None,
+            d3d11_device: None,
+            d3d11_context: None,
         }
     }
 }
