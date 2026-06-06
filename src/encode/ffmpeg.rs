@@ -1111,7 +1111,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 (*frames_ctx).sw_format = sw_format;
                 (*frames_ctx).width = config.width as libc::c_int;
                 (*frames_ctx).height = config.height as libc::c_int;
-                (*frames_ctx).initial_pool_size = 4;
+                (*frames_ctx).initial_pool_size = if hw_type == HwAccelType::Amf { 1 } else { 4 };
             }
 
             let ret = unsafe { ffi::av_hwframe_ctx_init(hw_frames_ctx) };
