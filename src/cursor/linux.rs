@@ -16,6 +16,7 @@
 //! Proper cursor tracking via X11/XFixes or PipeWire metadata will be added
 //! in a future phase.
 
+use std::ffi::CStr;
 use std::ptr;
 
 use crate::cursor::CursorCapture;
@@ -131,6 +132,9 @@ impl LinuxCursorCapture {
         let image = unsafe { *image_ptr };
         self.last_state.x = image.x as i32;
         self.last_state.y = image.y as i32;
+        if let Some(kind) = cursor_kind_from_xfixes_name(image.name) {
+            self.last_state.kind = kind;
+        }
         let serial = image.cursor_serial as u64;
         let width = image.width as u32;
         let height = image.height as u32;
@@ -184,6 +188,40 @@ impl LinuxCursorCapture {
         // from the `SPA_META_Cursor` metadata attached to each buffer.
         None
     }
+}
+
+fn cursor_kind_from_xfixes_name(name: *const libc::c_char) -> Option<CursorKind> {
+    if name.is_null() {
+        return None;
+    }
+
+    let name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "");
+
+    let kind = match name.as_str() {
+        "xterm" | "text" | "ibeam" => CursorKind::IBeam,
+        "hand" | "hand1" | "hand2" | "pointer" | "openhand" | "dndcopy" | "dndlink" | "dndask" => {
+            CursorKind::Hand
+        }
+        "cross" | "crosshair" | "tcross" => CursorKind::Cross,
+        "fleur" | "move" | "allscroll" | "sizeall" | "grab" | "grabbed" | "grabbing" | "drag"
+        | "dragging" | "closedhand" | "dndmove" => CursorKind::Move,
+        "sbvdoublearrow" | "sizens" | "nsresize" | "rowresize" | "nresize" | "sresize" => {
+            CursorKind::ResizeNs
+        }
+        "sbhdoublearrow" | "sizewe" | "ewresize" | "colresize" | "eresize" | "wresize" => {
+            CursorKind::ResizeEw
+        }
+        "sizenesw" | "neswresize" | "neresize" | "swresize" => CursorKind::ResizeNesw,
+        "sizenwse" | "nwseresize" | "nwresize" | "seresize" => CursorKind::ResizeNwse,
+        "notallowed" | "no" | "crossedcircle" | "forbidden" | "dndnone" => CursorKind::Unavailable,
+        "leftptr" | "default" | "arrow" | "topleftarrow" => CursorKind::Arrow,
+        _ => return None,
+    };
+
+    Some(kind)
 }
 
 impl CursorCapture for LinuxCursorCapture {
