@@ -608,68 +608,14 @@ impl WindowsAmfEncoder {
 
     fn configure_component(
         &self,
-        component: *mut AmfComponent,
+        _component: *mut AmfComponent,
         config: &EncoderConfig,
     ) -> Result<(), MediaError> {
-        let idr_period = if config.keyframe_interval > 0 {
-            config.keyframe_interval
-        } else {
-            config.fps.max(1) * 2
-        };
-        let bitrate = config.bitrate_kbps as i64 * 1000;
-        self.set_component_property(
-            component,
-            "Usage",
-            amf_variant_int64(if config.low_latency {
-                AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
-            } else {
-                AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY
-            }),
-        )?;
-        self.set_component_property(
-            component,
-            "FrameSize",
-            amf_variant_size(config.width, config.height),
-        )?;
-        self.set_component_property(
-            component,
-            "FrameRate",
-            amf_variant_rate(config.fps.max(1), 1),
-        )?;
-        self.set_component_property(component, "TargetBitrate", amf_variant_int64(bitrate))?;
-        self.set_component_property(component, "PeakBitrate", amf_variant_int64(bitrate))?;
-        self.set_component_property(
-            component,
-            "RateControlMethod",
-            amf_variant_int64(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR),
-        )?;
-        self.set_component_property(
-            component,
-            "QualityPreset",
-            amf_variant_int64(if config.low_latency {
-                AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED
-            } else {
-                AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
-            }),
-        )?;
-        self.set_component_property(component, "BPicturesPattern", amf_variant_int64(0))?;
-        self.set_component_property(
-            component,
-            "LowLatencyInternal",
-            amf_variant_bool(config.low_latency),
-        )?;
-        self.set_component_property(component, "IDRPeriod", amf_variant_int64(idr_period as i64))?;
-        self.set_component_property(
-            component,
-            "HeaderInsertionSpacing",
-            amf_variant_int64(idr_period as i64),
-        )?;
-        self.set_component_property(
-            component,
-            "OutputMode",
-            amf_variant_int64(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME),
-        )?;
-        self.set_component_property(component, "QueryTimeout", amf_variant_int64(0))?;
+        log::info!(
+            "Native AMF: using minimal component properties before Init (target {}kbps, {}fps)",
+            config.bitrate_kbps,
+            config.fps
+        );
         Ok(())
     }
 
