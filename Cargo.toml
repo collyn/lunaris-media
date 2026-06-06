@@ -48,6 +48,6 @@ screencapturekit = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-rustacuda = "0.1"
 image = "0.24"
+
 
