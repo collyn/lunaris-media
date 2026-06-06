@@ -1617,10 +1617,11 @@ impl VideoEncoder for FfmpegEncoder {
                                 let in_res = src_tex.cast::<ID3D11Resource>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast src_tex to ID3D11Resource failed: {e}"))
                                 })?;
-                                let in_view = video_device.CreateVideoProcessorInputView(&in_res, video_enumerator, &input_desc).map_err(|e| {
+                                let mut in_view = None;
+                                video_device.CreateVideoProcessorInputView(&in_res, video_enumerator, &input_desc, Some(&mut in_view)).map_err(|e| {
                                     MediaError::EncodeError(format!("CreateVideoProcessorInputView failed: {e}"))
                                 })?;
-                                self.video_input_view = Some(in_view);
+                                self.video_input_view = in_view;
                                 self.cached_src_tex = *texture;
 
                                 let output_desc = if dst_desc.ArraySize > 1 {
@@ -1647,10 +1648,11 @@ impl VideoEncoder for FfmpegEncoder {
                                 let out_res = dst_tex.cast::<ID3D11Resource>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast dst_tex to ID3D11Resource failed: {e}"))
                                 })?;
-                                let out_view = video_device.CreateVideoProcessorOutputView(&out_res, video_enumerator, &output_desc).map_err(|e| {
+                                let mut out_view = None;
+                                video_device.CreateVideoProcessorOutputView(&out_res, video_enumerator, &output_desc, Some(&mut out_view)).map_err(|e| {
                                     MediaError::EncodeError(format!("CreateVideoProcessorOutputView failed: {e}"))
                                 })?;
-                                self.video_output_view = Some(out_view);
+                                self.video_output_view = out_view;
                                 self.cached_dst_tex = dst_tex_ptr as usize;
                                 self.cached_dst_idx = dst_idx;
                             }
@@ -1658,19 +1660,10 @@ impl VideoEncoder for FfmpegEncoder {
                             let input_view = self.video_input_view.as_ref().unwrap();
                             let output_view = self.video_output_view.as_ref().unwrap();
 
-                            let streams = [D3D11_VIDEO_PROCESSOR_STREAM {
-                                Enable: true.into(),
-                                OutputIndex: 0,
-                                InputFrameOrField: 0,
-                                PastFrames: 0,
-                                FutureFrames: 0,
-                                ppPastSurfaces: std::ptr::null_mut(),
-                                pInputSurface: Some(input_view.clone()),
-                                ppFutureSurfaces: std::ptr::null_mut(),
-                                ppPastSurfacesRight: std::ptr::null_mut(),
-                                pInputSurfaceRight: None,
-                                ppFutureSurfacesRight: std::ptr::null_mut(),
-                            }];
+                            let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
+                            stream.Enable = true.into();
+                            stream.pInputSurface = std::mem::ManuallyDrop::new(Some(input_view.clone()));
+                            let streams = [stream];
 
                             video_context.VideoProcessorBlt(video_processor, output_view, 0, &streams).map_err(|e| {
                                 MediaError::EncodeError(format!("VideoProcessorBlt failed: {e}"))
