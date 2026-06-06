@@ -349,12 +349,12 @@ impl MediaPipeline {
         let cursor_event_tx = self.event_tx.clone();
         let cursor_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60Hz
-            let mut last_pos = (0i32, 0i32);
+            let mut last_state: Option<CursorState> = None;
             loop {
                 interval.tick().await;
                 if let Ok(state) = cursor_capture.get_cursor_state() {
-                    if state.x != last_pos.0 || state.y != last_pos.1 || state.image.is_some() {
-                        last_pos = (state.x, state.y);
+                    if last_state.as_ref() != Some(&state) {
+                        last_state = Some(state.clone());
                         if let Err(e) = cursor_event_tx.try_send(MediaEvent::CursorUpdate(state)) {
                             if matches!(e, mpsc::error::TrySendError::Closed(_)) {
                                 break; // channel closed

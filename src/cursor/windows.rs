@@ -9,7 +9,9 @@ use crate::types::*;
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, GetCursorPos, CURSORINFO, CURSOR_SHOWING,
+    GetCursorInfo, GetCursorPos, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW,
+    IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
+    IDC_SIZEWE,
 };
 
 pub struct WindowsCursorCapture {
@@ -22,6 +24,36 @@ impl WindowsCursorCapture {
     }
 }
 
+fn cursor_kind_from_handle(handle: HCURSOR) -> CursorKind {
+    fn matches_system_cursor(handle: HCURSOR, cursor_name: windows::core::PCWSTR) -> bool {
+        unsafe { LoadCursorW(None, cursor_name).is_ok_and(|system| system == handle) }
+    }
+
+    if matches_system_cursor(handle, IDC_IBEAM) {
+        CursorKind::IBeam
+    } else if matches_system_cursor(handle, IDC_HAND) {
+        CursorKind::Hand
+    } else if matches_system_cursor(handle, IDC_CROSS) {
+        CursorKind::Cross
+    } else if matches_system_cursor(handle, IDC_SIZEALL) {
+        CursorKind::Move
+    } else if matches_system_cursor(handle, IDC_SIZENS) {
+        CursorKind::ResizeNs
+    } else if matches_system_cursor(handle, IDC_SIZEWE) {
+        CursorKind::ResizeEw
+    } else if matches_system_cursor(handle, IDC_SIZENESW) {
+        CursorKind::ResizeNesw
+    } else if matches_system_cursor(handle, IDC_SIZENWSE) {
+        CursorKind::ResizeNwse
+    } else if matches_system_cursor(handle, IDC_NO) {
+        CursorKind::Unavailable
+    } else if matches_system_cursor(handle, IDC_ARROW) {
+        CursorKind::Arrow
+    } else {
+        CursorKind::Unknown
+    }
+}
+
 impl CursorCapture for WindowsCursorCapture {
     fn start(&mut self) -> Result<(), MediaError> {
         log::info!("Starting Windows cursor capture");
@@ -31,9 +63,7 @@ impl CursorCapture for WindowsCursorCapture {
 
     fn get_cursor_state(&mut self) -> Result<CursorState, MediaError> {
         if !self.active {
-            return Err(MediaError::CursorError(
-                "Cursor capture not started".into(),
-            ));
+            return Err(MediaError::CursorError("Cursor capture not started".into()));
         }
 
         let mut point = POINT::default();
@@ -48,11 +78,13 @@ impl CursorCapture for WindowsCursorCapture {
         }
 
         let visible = (cursor_info.flags.0 & CURSOR_SHOWING.0) != 0;
+        let kind = cursor_kind_from_handle(cursor_info.hCursor);
 
         Ok(CursorState {
             x: point.x,
             y: point.y,
             visible,
+            kind,
             image: None, // Phase 2: extract cursor image via GetIconInfo + GetBitmapBits
         })
     }

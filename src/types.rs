@@ -216,8 +216,44 @@ pub struct CursorState {
     pub y: i32,
     /// Whether the cursor is currently visible.
     pub visible: bool,
+    /// Best-effort cursor shape classification.
+    pub kind: CursorKind,
     /// Optional cursor image (provided when the shape changes).
     pub image: Option<CursorImage>,
+}
+
+/// Common cursor shape categories used by remoting clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Arrow,
+    IBeam,
+    Hand,
+    Cross,
+    Move,
+    ResizeNs,
+    ResizeEw,
+    ResizeNesw,
+    ResizeNwse,
+    Unavailable,
+    Unknown,
+}
+
+impl CursorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Arrow => "arrow",
+            Self::IBeam => "ibeam",
+            Self::Hand => "hand",
+            Self::Cross => "cross",
+            Self::Move => "move",
+            Self::ResizeNs => "resize_ns",
+            Self::ResizeEw => "resize_ew",
+            Self::ResizeNesw => "resize_nesw",
+            Self::ResizeNwse => "resize_nwse",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// RGBA image data for a custom cursor shape.

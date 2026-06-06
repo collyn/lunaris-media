@@ -48,6 +48,7 @@ impl LinuxCursorCapture {
                 x: 0,
                 y: 0,
                 visible: true,
+                kind: CursorKind::Arrow,
                 image: None,
             },
             active: false,
@@ -116,9 +117,7 @@ impl CursorCapture for LinuxCursorCapture {
     /// TODO(phase-2): Query real cursor position from X11 or PipeWire.
     fn get_cursor_state(&mut self) -> Result<CursorState, MediaError> {
         if !self.active {
-            return Err(MediaError::CursorError(
-                "Cursor capture not started".into(),
-            ));
+            return Err(MediaError::CursorError("Cursor capture not started".into()));
         }
 
         // TODO(phase-2): Replace with actual cursor queries:
