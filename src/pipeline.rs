@@ -189,6 +189,7 @@ impl MediaPipeline {
         log::info!("Encoder initialized: {}", encoder.encoder_info().name);
 
         // 3. Start capture
+        #[allow(unused_mut)]
         let mut capture_display_id = display_id.to_string();
 
         #[cfg(target_os = "linux")]

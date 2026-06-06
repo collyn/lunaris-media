@@ -182,7 +182,7 @@ impl ScreenCapture for DxgiCapture {
         Ok(displays)
     }
 
-    async fn start(&mut self, display_id: &str, config: &StreamConfig) -> Result<(), MediaError> {
+    async fn start(&mut self, display_id: &str, _config: &StreamConfig) -> Result<(), MediaError> {
         if self.capturing {
             return Err(MediaError::CaptureAlreadyStarted);
         }
@@ -399,7 +399,7 @@ fn enumerate_gdi_monitors_with_coords() -> Result<Vec<GdiMonitorInfo>, MediaErro
         let monitors = &mut *(lparam.0 as *mut Vec<GdiMonitorInfo>);
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).is_ok() {
+        if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).as_bool() {
             let rect = info.monitorInfo.rcMonitor;
             let x = rect.left;
             let y = rect.top;
@@ -478,7 +478,7 @@ fn capture_gdi(
 
         let h_old = SelectObject(hdc_mem, h_bitmap);
 
-        let bitblt_res = BitBlt(
+        if let Err(e) = BitBlt(
             hdc_mem,
             0,
             0,
@@ -488,14 +488,12 @@ fn capture_gdi(
             x,
             y,
             SRCCOPY,
-        );
-
-        if !bitblt_res.as_bool() {
+        ) {
             let _ = SelectObject(hdc_mem, h_old);
             let _ = DeleteObject(h_bitmap);
             let _ = DeleteDC(hdc_mem);
             let _ = ReleaseDC(None, hdc_screen);
-            return Err(MediaError::CaptureError("BitBlt failed".into()));
+            return Err(MediaError::CaptureError(format!("BitBlt failed: {e}")));
         }
 
         let mut bmi = BITMAPINFO {
