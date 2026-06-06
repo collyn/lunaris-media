@@ -351,20 +351,40 @@ impl MediaPipeline {
         let mut total_frames: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut skipped_frames: u64 = 0;
+        let mut dropped_frames: u64 = 0;
         let start_time = Instant::now();
         let event_capacity = 64usize; // must match mpsc::channel capacity above
         let mut target_interval = Duration::from_nanos(1_000_000_000 / self.config.fps as u64);
         let mut frame_ticker = tokio::time::interval(target_interval);
         frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let constant_fps = std::env::var("LUNARIS_CONSTANT_FPS")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(cfg!(target_os = "windows"));
+        log::info!("Pipeline constant-FPS output: {}", constant_fps);
 
         let mut last_sent_time = Instant::now() - Duration::from_secs(5);
         let mut keyframe_requested = true; // Force first frame immediately
         let mut last_frame: Option<crate::capture::CapturedFrame> = None;
+        let mut metrics_started = Instant::now();
+        let mut metrics_ticks: u64 = 0;
+        let mut metrics_new_captures: u64 = 0;
+        let mut metrics_encode_attempts: u64 = 0;
+        let mut metrics_encoded_frames: u64 = 0;
+        let mut metrics_sent_frames: u64 = 0;
+        let mut metrics_dropped_frames: u64 = 0;
+        let mut metrics_bytes: u64 = 0;
+        let mut metrics_encode_time = Duration::ZERO;
 
         loop {
             tokio::select! {
                 // Video: capture → encode → send
                 _ = frame_ticker.tick() => {
+                    metrics_ticks += 1;
                     let frame_result = capture.next_frame().await;
                     // Backpressure: skip encode if downstream is congested.
                     // This prevents unbounded queue growth and keeps latency low.
@@ -382,6 +402,10 @@ impl MediaPipeline {
                     match frame_result {
                         Ok(captured) => {
                             let is_empty = matches!(&captured.buffer, crate::capture::gpu_buffer::GpuBuffer::CpuBuffer { data, .. } if data.is_empty());
+                            let is_new_frame = !is_empty && captured.is_new_frame;
+                            if is_new_frame {
+                                metrics_new_captures += 1;
+                            }
 
                             if !is_empty {
                                 last_frame = Some(captured);
@@ -392,7 +416,8 @@ impl MediaPipeline {
                                 None => continue, // No frame captured yet
                             };
 
-                            let should_encode = (!is_empty && frame.is_new_frame)
+                            let should_encode = constant_fps
+                                || is_new_frame
                                 || keyframe_requested
                                 || last_sent_time.elapsed() >= Duration::from_millis(500);
 
@@ -403,18 +428,28 @@ impl MediaPipeline {
                             keyframe_requested = false;
                             last_sent_time = Instant::now();
 
-                            let pts = frame.timestamp_us;
+                            let pts = start_time.elapsed().as_micros() as u64;
+                            metrics_encode_attempts += 1;
+                            let encode_started = Instant::now();
                             match encoder.encode(&frame.buffer, pts) {
                                 Ok(encoded_frames) => {
+                                    metrics_encode_time += encode_started.elapsed();
                                     for ef in encoded_frames {
                                         total_frames += 1;
                                         total_bytes += ef.data.len() as u64;
+                                        metrics_encoded_frames += 1;
+                                        metrics_bytes += ef.data.len() as u64;
                                         if self.event_tx.try_send(MediaEvent::VideoFrame(ef)).is_err() {
+                                            dropped_frames += 1;
+                                            metrics_dropped_frames += 1;
                                             log::warn!("Video event channel full, dropping frame");
+                                        } else {
+                                            metrics_sent_frames += 1;
                                         }
                                     }
                                 }
                                 Err(e) => {
+                                    metrics_encode_time += encode_started.elapsed();
                                     log::error!("Encode error: {}", e);
                                     let _ = self.event_tx.try_send(MediaEvent::Error(e.to_string()));
                                 }
@@ -424,6 +459,38 @@ impl MediaPipeline {
                             log::error!("Capture error: {}", e);
                             let _ = self.event_tx.try_send(MediaEvent::Error(e.to_string()));
                         }
+                    }
+                    let metrics_elapsed = metrics_started.elapsed();
+                    if metrics_elapsed >= Duration::from_secs(1) {
+                        let secs = metrics_elapsed.as_secs_f64();
+                        let avg_encode_ms = if metrics_encode_attempts > 0 {
+                            metrics_encode_time.as_secs_f64() * 1000.0 / metrics_encode_attempts as f64
+                        } else {
+                            0.0
+                        };
+                        let queue_len = event_capacity - self.event_tx.capacity();
+                        log::info!(
+                            "Pipeline metrics: ticks={:.1}/s capture_new={:.1}/s encode_attempts={:.1}/s encoded={:.1}/s sent={:.1}/s dropped={} bitrate={:.2}Mbps queue={} avg_encode={:.2}ms constant_fps={}",
+                            metrics_ticks as f64 / secs,
+                            metrics_new_captures as f64 / secs,
+                            metrics_encode_attempts as f64 / secs,
+                            metrics_encoded_frames as f64 / secs,
+                            metrics_sent_frames as f64 / secs,
+                            metrics_dropped_frames,
+                            (metrics_bytes as f64 * 8.0 / secs) / 1_000_000.0,
+                            queue_len,
+                            avg_encode_ms,
+                            constant_fps
+                        );
+                        metrics_started = Instant::now();
+                        metrics_ticks = 0;
+                        metrics_new_captures = 0;
+                        metrics_encode_attempts = 0;
+                        metrics_encoded_frames = 0;
+                        metrics_sent_frames = 0;
+                        metrics_dropped_frames = 0;
+                        metrics_bytes = 0;
+                        metrics_encode_time = Duration::ZERO;
                     }
                     tokio::task::yield_now().await;
                 }
@@ -491,9 +558,10 @@ impl MediaPipeline {
         // Stats
         let elapsed = start_time.elapsed();
         log::info!(
-            "Pipeline stopped. {} frames ({} skipped), {:.2} MB, {:.1} FPS, {:.1}s",
+            "Pipeline stopped. {} frames ({} skipped, {} dropped), {:.2} MB, {:.1} FPS, {:.1}s",
             total_frames,
             skipped_frames,
+            dropped_frames,
             total_bytes as f64 / 1_048_576.0,
             total_frames as f64 / elapsed.as_secs_f64(),
             elapsed.as_secs_f64(),

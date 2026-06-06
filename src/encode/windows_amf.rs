@@ -487,6 +487,7 @@ impl AmfApi {
 
 struct InputSlot {
     texture: ID3D11Texture2D,
+    output_view: Option<ID3D11VideoProcessorOutputView>,
 }
 
 pub struct WindowsAmfEncoder {
@@ -506,6 +507,10 @@ pub struct WindowsAmfEncoder {
     initialized: bool,
     force_keyframe: bool,
     frame_count: u64,
+    cached_input_texture: usize,
+    cached_input_index: u32,
+    cached_input_view: Option<ID3D11VideoProcessorInputView>,
+    flush_each_frame: bool,
 }
 
 unsafe impl Send for WindowsAmfEncoder {}
@@ -534,6 +539,17 @@ impl WindowsAmfEncoder {
             initialized: false,
             force_keyframe: false,
             frame_count: 0,
+            cached_input_texture: 0,
+            cached_input_index: 0,
+            cached_input_view: None,
+            flush_each_frame: std::env::var("LUNARIS_AMF_FLUSH_EACH_FRAME")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false),
         })
     }
 
@@ -740,6 +756,7 @@ impl WindowsAmfEncoder {
         for _ in 0..INPUT_RING_SIZE {
             self.slots.push(InputSlot {
                 texture: Self::create_input_texture(device, width, height)?,
+                output_view: None,
             });
         }
         Ok(())
@@ -800,85 +817,115 @@ impl WindowsAmfEncoder {
         &mut self,
         src_texture: *mut c_void,
         src_index: u32,
-        dst_texture: &ID3D11Texture2D,
-    ) -> Result<(), MediaError> {
+        slot_idx: usize,
+    ) -> Result<ID3D11Texture2D, MediaError> {
         let config = self
             .config
             .clone()
             .ok_or(MediaError::EncoderNotInitialized)?;
         self.ensure_video_processor(&config)?;
+        if slot_idx >= self.slots.len() {
+            return Err(MediaError::EncoderNotInitialized);
+        }
+
         let src = unsafe { ManuallyDrop::new(ID3D11Texture2D::from_raw(src_texture)) };
-        let video_device = self.video_device.as_ref().unwrap();
-        let video_context = self.video_context.as_ref().unwrap();
-        let processor = self.video_processor.as_ref().unwrap();
-        let enumerator = self.video_enumerator.as_ref().unwrap();
-        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: src_index,
+        let video_device = self.video_device.as_ref().unwrap().clone();
+        let video_context = self.video_context.as_ref().unwrap().clone();
+        let processor = self.video_processor.as_ref().unwrap().clone();
+        let enumerator = self.video_enumerator.as_ref().unwrap().clone();
+        let src_key = src_texture as usize;
+
+        if self.cached_input_view.is_none()
+            || self.cached_input_texture != src_key
+            || self.cached_input_index != src_index
+        {
+            let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: src_index,
+                    },
                 },
-            },
-        };
-        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
-        };
-        let in_res: ID3D11Resource = (*src).cast().map_err(|e| {
-            MediaError::EncodeError(format!("Cast source texture to ID3D11Resource failed: {e}"))
-        })?;
-        let out_res: ID3D11Resource = dst_texture.cast().map_err(|e| {
-            MediaError::EncodeError(format!(
-                "Cast destination texture to ID3D11Resource failed: {e}"
-            ))
-        })?;
-        let mut input_view = None;
-        unsafe {
-            video_device
-                .CreateVideoProcessorInputView(
-                    &in_res,
-                    enumerator,
-                    &input_desc,
-                    Some(&mut input_view),
-                )
-                .map_err(|e| {
-                    MediaError::EncodeError(format!("CreateVideoProcessorInputView failed: {e}"))
-                })?;
+            };
+            let in_res: ID3D11Resource = (*src).cast().map_err(|e| {
+                MediaError::EncodeError(format!(
+                    "Cast source texture to ID3D11Resource failed: {e}"
+                ))
+            })?;
+            let mut input_view = None;
+            unsafe {
+                video_device
+                    .CreateVideoProcessorInputView(
+                        &in_res,
+                        &enumerator,
+                        &input_desc,
+                        Some(&mut input_view),
+                    )
+                    .map_err(|e| {
+                        MediaError::EncodeError(format!(
+                            "CreateVideoProcessorInputView failed: {e}"
+                        ))
+                    })?;
+            }
+            self.cached_input_texture = src_key;
+            self.cached_input_index = src_index;
+            self.cached_input_view = Some(input_view.ok_or_else(|| {
+                MediaError::EncodeError("VideoProcessor input view was None".into())
+            })?);
         }
-        let mut output_view = None;
-        unsafe {
-            video_device
-                .CreateVideoProcessorOutputView(
-                    &out_res,
-                    enumerator,
-                    &output_desc,
-                    Some(&mut output_view),
-                )
-                .map_err(|e| {
-                    MediaError::EncodeError(format!("CreateVideoProcessorOutputView failed: {e}"))
-                })?;
+
+        let dst_texture = self.slots[slot_idx].texture.clone();
+        if self.slots[slot_idx].output_view.is_none() {
+            let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let out_res: ID3D11Resource = dst_texture.cast().map_err(|e| {
+                MediaError::EncodeError(format!(
+                    "Cast destination texture to ID3D11Resource failed: {e}"
+                ))
+            })?;
+            let mut output_view = None;
+            unsafe {
+                video_device
+                    .CreateVideoProcessorOutputView(
+                        &out_res,
+                        &enumerator,
+                        &output_desc,
+                        Some(&mut output_view),
+                    )
+                    .map_err(|e| {
+                        MediaError::EncodeError(format!(
+                            "CreateVideoProcessorOutputView failed: {e}"
+                        ))
+                    })?;
+            }
+            self.slots[slot_idx].output_view = Some(output_view.ok_or_else(|| {
+                MediaError::EncodeError("VideoProcessor output view was None".into())
+            })?);
         }
-        let input_view = input_view
-            .ok_or_else(|| MediaError::EncodeError("VideoProcessor input view was None".into()))?;
-        let output_view = output_view
-            .ok_or_else(|| MediaError::EncodeError("VideoProcessor output view was None".into()))?;
+
+        let input_view = self.cached_input_view.as_ref().unwrap().clone();
+        let output_view = self.slots[slot_idx].output_view.as_ref().unwrap().clone();
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
         stream.Enable = true.into();
         stream.pInputSurface = ManuallyDrop::new(Some(input_view));
         let streams = [stream];
         unsafe {
             video_context
-                .VideoProcessorBlt(processor, &output_view, self.frame_count as u32, &streams)
+                .VideoProcessorBlt(&processor, &output_view, self.frame_count as u32, &streams)
                 .map_err(|e| MediaError::EncodeError(format!("VideoProcessorBlt failed: {e}")))?;
         }
-        if let Some(context) = &self.d3d_context {
-            unsafe { context.Flush() };
+        if self.flush_each_frame {
+            if let Some(context) = &self.d3d_context {
+                unsafe { context.Flush() };
+            }
         }
-        Ok(())
+        Ok(dst_texture)
     }
 
     fn wrap_surface(
@@ -1049,6 +1096,12 @@ impl VideoEncoder for WindowsAmfEncoder {
         self.initialized = true;
         self.force_keyframe = true;
         self.frame_count = 0;
+        self.cached_input_texture = 0;
+        self.cached_input_index = 0;
+        self.cached_input_view = None;
+        if self.flush_each_frame {
+            log::warn!("Native AMF: flushing D3D11 context after every VideoProcessorBlt");
+        }
         log::info!(
             "Native Windows AMF D3D11 initialized: {}x{} @{}fps {}kbps (runtime={:#x})",
             config.width,
@@ -1081,8 +1134,7 @@ impl VideoEncoder for WindowsAmfEncoder {
         };
         let slot_idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
-        let slot_texture = self.slots[slot_idx].texture.clone();
-        self.convert_bgra_to_nv12(src_texture, src_index, &slot_texture)?;
+        let slot_texture = self.convert_bgra_to_nv12(src_texture, src_index, slot_idx)?;
         let surface = self.wrap_surface(&slot_texture, pts_us)?;
         let submit = unsafe {
             ((*(*self.component).vtbl).submit_input)(self.component, surface as *mut AmfData)
@@ -1178,6 +1230,9 @@ impl VideoEncoder for WindowsAmfEncoder {
         self.video_context = None;
         self.video_processor = None;
         self.video_enumerator = None;
+        self.cached_input_texture = 0;
+        self.cached_input_index = 0;
+        self.cached_input_view = None;
         self.slots.clear();
         self.initialized = false;
     }
