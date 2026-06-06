@@ -807,6 +807,10 @@ impl FfmpegEncoder {
             (*codec_ctx).max_b_frames = 0;
             (*codec_ctx).thread_count = 1;
 
+            if config.codec == VideoCodec::H264 {
+                (*codec_ctx).level = 31; // Match SDP profile-level-id=42001f (Level 3.1)
+            }
+
             let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc);
             if is_hw_encoder(hw_type) {
                 if has_hw_frames {
