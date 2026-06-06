@@ -611,6 +611,17 @@ impl WindowsAmfEncoder {
         }
     }
 
+    fn try_set_component_property(
+        &self,
+        component: *mut AmfComponent,
+        name: &str,
+        value: AmfVariantStruct,
+    ) {
+        if let Err(err) = self.set_component_property(component, name, value) {
+            log::warn!("Native AMF optional property {name} was not accepted: {err}");
+        }
+    }
+
     fn configure_component(
         &self,
         component: *mut AmfComponent,
@@ -621,12 +632,19 @@ impl WindowsAmfEncoder {
         } else {
             AMF_VIDEO_ENCODER_USAGE_TRANSCONDING
         };
+        let idr_period = if config.keyframe_interval > 0 {
+            config.keyframe_interval
+        } else {
+            config.fps.max(1) * 2
+        };
+        let bitrate = config.bitrate_kbps as i64 * 1000;
         log::info!(
-            "Native AMF: configuring required static properties (usage={}, size={}x{}, fps={})",
+            "Native AMF: configuring component (usage={}, size={}x{}, fps={}, bitrate={}kbps)",
             usage,
             config.width,
             config.height,
-            config.fps.max(1)
+            config.fps.max(1),
+            config.bitrate_kbps
         );
         self.set_component_property(component, "Usage", amf_variant_int64(usage))?;
         self.set_component_property(
@@ -639,6 +657,44 @@ impl WindowsAmfEncoder {
             "FrameRate",
             amf_variant_rate(config.fps.max(1), 1),
         )?;
+        self.try_set_component_property(component, "TargetBitrate", amf_variant_int64(bitrate));
+        self.try_set_component_property(component, "PeakBitrate", amf_variant_int64(bitrate));
+        self.try_set_component_property(
+            component,
+            "RateControlMethod",
+            amf_variant_int64(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR),
+        );
+        self.try_set_component_property(
+            component,
+            "QualityPreset",
+            amf_variant_int64(if config.low_latency {
+                AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED
+            } else {
+                AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED
+            }),
+        );
+        self.try_set_component_property(component, "BPicturesPattern", amf_variant_int64(0));
+        self.try_set_component_property(
+            component,
+            "LowLatencyInternal",
+            amf_variant_bool(config.low_latency),
+        );
+        self.try_set_component_property(
+            component,
+            "IDRPeriod",
+            amf_variant_int64(idr_period as i64),
+        );
+        self.try_set_component_property(
+            component,
+            "HeaderInsertionSpacing",
+            amf_variant_int64(idr_period as i64),
+        );
+        self.try_set_component_property(
+            component,
+            "OutputMode",
+            amf_variant_int64(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME),
+        );
+        self.try_set_component_property(component, "QueryTimeout", amf_variant_int64(0));
         Ok(())
     }
 
@@ -1054,7 +1110,7 @@ impl VideoEncoder for WindowsAmfEncoder {
 
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
-        log::warn!("Native AMF explicit IDR request is not wired yet; next output is marked conservatively");
+        log::debug!("Native AMF IDR requested for the next submitted surface");
     }
 
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), MediaError> {
@@ -1064,11 +1120,21 @@ impl VideoEncoder for WindowsAmfEncoder {
         if let Some(config) = &mut self.config {
             config.bitrate_kbps = bitrate_kbps;
         }
+        if !self.component.is_null() {
+            let bitrate = bitrate_kbps as i64 * 1000;
+            self.set_component_property(
+                self.component,
+                "TargetBitrate",
+                amf_variant_int64(bitrate),
+            )?;
+            self.try_set_component_property(
+                self.component,
+                "PeakBitrate",
+                amf_variant_int64(bitrate),
+            );
+        }
         self.force_keyframe = true;
-        log::warn!(
-            "Native AMF bitrate reconfigure is not wired yet; updated target to {}kbps",
-            bitrate_kbps
-        );
+        log::info!("Native AMF target bitrate updated to {}kbps", bitrate_kbps);
         Ok(())
     }
 
