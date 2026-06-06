@@ -388,9 +388,48 @@ impl ScreenCapture for DxgiCapture {
                 context.CopyResource(gpu_tex, &texture);
                 context.Flush();
             }
+
+            let is_black = if self.frame_count < 3 {
+                unsafe {
+                    context.CopyResource(staging, &texture);
+                    context.Flush();
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    if context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).is_ok() {
+                        let stride = mapped.RowPitch;
+                        let data_size = (stride * self.height) as usize;
+                        let data_slice = std::slice::from_raw_parts(mapped.pData as *const u8, data_size);
+                        let black = is_buffer_black(data_slice);
+                        context.Unmap(staging, 0);
+                        black
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
             unsafe {
                 let _ = duplication.ReleaseFrame();
             }
+
+            if is_black {
+                return Ok(CapturedFrame {
+                    buffer: GpuBuffer::CpuBuffer {
+                        data: vec![0; 16],
+                        stride: 4,
+                        format: PixelFormat::BGRA,
+                        width: self.width,
+                        height: self.height,
+                    },
+                    timestamp_us: timestamp,
+                    width: self.width,
+                    height: self.height,
+                    format: PixelFormat::BGRA,
+                    is_new_frame: true,
+                });
+            }
+
             self.last_returned_time = Some(std::time::Instant::now());
             return Ok(CapturedFrame {
                 buffer: GpuBuffer::D3D11Texture {
