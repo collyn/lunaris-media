@@ -46,7 +46,7 @@ const AMF_VIDEO_ENCODER_VCE_AVC: &[u16] = &[
 ];
 
 type AmfResult = i32;
-type AmfBool = u16;
+type AmfBool = u8;
 type AmfLong = i32;
 type AmfSize = usize;
 type AmfPts = i64;
@@ -245,6 +245,11 @@ struct AmfComponentVtbl {
     has_property: unsafe extern "system" fn(*mut AmfComponent, *const u16) -> AmfBool,
     get_property_count: unsafe extern "system" fn(*mut AmfComponent) -> AmfSize,
     get_property_at: *mut c_void,
+    clear: *mut c_void,
+    add_to: *mut c_void,
+    copy_to: *mut c_void,
+    add_observer: *mut c_void,
+    remove_observer: *mut c_void,
     get_properties_info_count: *mut c_void,
     get_property_info_at: *mut c_void,
     get_property_info: *mut c_void,
