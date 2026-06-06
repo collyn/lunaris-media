@@ -39,6 +39,8 @@ pub struct EncoderConfig {
     pub keyframe_interval: u32,
     /// Preferred hardware acceleration type, or `None` for auto-detection.
     pub preferred_hw: Option<HwAccelType>,
+    /// Force the FFmpeg backend even when a native Windows backend is available.
+    pub force_ffmpeg: bool,
     /// Optional Direct3D11 device pointer (cast to usize) for Windows zero-copy GPU encoding.
     pub d3d11_device: Option<usize>,
     /// Optional Direct3D11 device context pointer (cast to usize) for Windows zero-copy GPU encoding.
@@ -56,6 +58,7 @@ impl Default for EncoderConfig {
             low_latency: true,
             keyframe_interval: 0,
             preferred_hw: None,
+            force_ffmpeg: false,
             d3d11_device: None,
             d3d11_context: None,
         }
@@ -143,8 +146,9 @@ impl WindowsAutoEncoder {
     }
 
     fn requires_native_amf(config: &EncoderConfig) -> bool {
-        matches!(config.preferred_hw, Some(HwAccelType::Amf))
-            || Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Amf)
+        !config.force_ffmpeg
+            && (matches!(config.preferred_hw, Some(HwAccelType::Amf))
+                || Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Amf))
     }
 
     fn supports_native_d3d11_h264(config: &EncoderConfig) -> bool {
@@ -152,7 +156,7 @@ impl WindowsAutoEncoder {
     }
 
     fn should_try_native_nvenc(config: &EncoderConfig) -> bool {
-        if !Self::supports_native_d3d11_h264(config) {
+        if config.force_ffmpeg || !Self::supports_native_d3d11_h264(config) {
             return false;
         }
 
@@ -164,7 +168,7 @@ impl WindowsAutoEncoder {
     }
 
     fn should_try_native_amf(config: &EncoderConfig) -> bool {
-        if !Self::supports_native_d3d11_h264(config) {
+        if config.force_ffmpeg || !Self::supports_native_d3d11_h264(config) {
             return false;
         }
 
@@ -179,6 +183,12 @@ impl WindowsAutoEncoder {
 #[cfg(target_os = "windows")]
 impl VideoEncoder for WindowsAutoEncoder {
     fn initialize(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
+        if config.force_ffmpeg {
+            log::info!(
+                "FFmpeg encoder backend explicitly requested; skipping native Windows encoders"
+            );
+        }
+
         if Self::should_try_native_nvenc(config) {
             match windows_nvenc::WindowsNvencEncoder::new().and_then(|mut encoder| {
                 encoder.initialize(config)?;
@@ -303,6 +313,44 @@ impl VideoEncoder for WindowsAutoEncoder {
         }
         self.backend = None;
     }
+}
+
+/// Return a human-readable D3D11 adapter description for a borrowed device pointer.
+#[cfg(target_os = "windows")]
+pub fn describe_d3d11_device(device_ptr: Option<usize>) -> Option<String> {
+    use std::mem::ManuallyDrop;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+
+    let device_ptr = device_ptr? as *mut std::ffi::c_void;
+    unsafe {
+        let device = ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
+        let dxgi_device: IDXGIDevice = (*device).cast().ok()?;
+        let adapter = dxgi_device.GetAdapter().ok()?;
+        let desc = adapter.GetDesc().ok()?;
+        let name = String::from_utf16_lossy(&desc.Description)
+            .trim_end_matches(' ')
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            Some(format!(
+                "Unknown GPU (vendor={:#06x}, device={:#06x})",
+                desc.VendorId, desc.DeviceId
+            ))
+        } else {
+            Some(format!(
+                "{} (vendor={:#06x}, device={:#06x})",
+                name, desc.VendorId, desc.DeviceId
+            ))
+        }
+    }
+}
+
+/// Return a human-readable GPU description when the platform exposes one.
+#[cfg(not(target_os = "windows"))]
+pub fn describe_d3d11_device(_device_ptr: Option<usize>) -> Option<String> {
+    None
 }
 
 /// Create the best available [`VideoEncoder`] for the current platform.

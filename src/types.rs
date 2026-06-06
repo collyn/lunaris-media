@@ -87,18 +87,68 @@ impl Default for StreamConfig {
 }
 
 impl StreamConfig {
+    fn normalize_encoder_preference(s: &str) -> String {
+        s.trim().to_ascii_lowercase().replace('-', "_")
+    }
+
     /// Parse an encoder preference string into an HwAccelType.
     pub fn parse_encoder_preference(s: &str) -> Option<HwAccelType> {
-        match s.to_lowercase().as_str() {
-            "nvenc" => Some(HwAccelType::Nvenc),
-            "vaapi" => Some(HwAccelType::Vaapi),
-            "qsv" => Some(HwAccelType::Qsv),
-            "amf" => Some(HwAccelType::Amf),
-            "videotoolbox" => Some(HwAccelType::VideoToolbox),
-            "software" => Some(HwAccelType::Software),
-            "auto" | "" => None,
+        match Self::normalize_encoder_preference(s).as_str() {
+            "nvenc" | "native_nvenc" | "native_nvenc_d3d11" | "ffmpeg_nvenc" | "h264_nvenc"
+            | "hevc_nvenc" | "av1_nvenc" => Some(HwAccelType::Nvenc),
+            "vaapi" | "ffmpeg_vaapi" | "h264_vaapi" | "hevc_vaapi" | "av1_vaapi" => {
+                Some(HwAccelType::Vaapi)
+            }
+            "qsv" | "ffmpeg_qsv" | "h264_qsv" | "hevc_qsv" | "av1_qsv" => Some(HwAccelType::Qsv),
+            "amf" | "native_amf" | "native_amf_d3d11" | "ffmpeg_amf" | "h264_amf" | "hevc_amf"
+            | "av1_amf" => Some(HwAccelType::Amf),
+            "videotoolbox" | "ffmpeg_videotoolbox" | "h264_videotoolbox" | "hevc_videotoolbox" => {
+                Some(HwAccelType::VideoToolbox)
+            }
+            "software" | "ffmpeg_software" | "libx264" | "libx265" | "libsvtav1" | "libaom_av1" => {
+                Some(HwAccelType::Software)
+            }
+            "auto" | "gpu" | "native" | "native_gpu" | "ffmpeg" | "ffmpeg_gpu" | "" => None,
             _ => None,
         }
+    }
+
+    /// Whether the encoder preference explicitly requests the FFmpeg backend.
+    pub fn encoder_prefers_ffmpeg(s: &str) -> bool {
+        let normalized = Self::normalize_encoder_preference(s);
+        normalized == "ffmpeg"
+            || normalized == "ffmpeg_gpu"
+            || normalized.starts_with("ffmpeg_")
+            || matches!(
+                normalized.as_str(),
+                "h264_nvenc"
+                    | "hevc_nvenc"
+                    | "av1_nvenc"
+                    | "h264_amf"
+                    | "hevc_amf"
+                    | "av1_amf"
+                    | "h264_qsv"
+                    | "hevc_qsv"
+                    | "av1_qsv"
+                    | "h264_vaapi"
+                    | "hevc_vaapi"
+                    | "av1_vaapi"
+                    | "h264_videotoolbox"
+                    | "hevc_videotoolbox"
+                    | "libx264"
+                    | "libx265"
+                    | "libsvtav1"
+                    | "libaom_av1"
+            )
+    }
+
+    /// Whether the encoder preference explicitly requests native OS/GPU backend.
+    pub fn encoder_prefers_native(s: &str) -> bool {
+        let normalized = Self::normalize_encoder_preference(s);
+        normalized == "gpu"
+            || normalized == "native"
+            || normalized == "native_gpu"
+            || normalized.starts_with("native_")
     }
 }
 

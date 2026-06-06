@@ -48,6 +48,12 @@ use crate::capture::virtual_display::VirtualDisplay;
 /// Events emitted by the running media pipeline.
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
+    /// The video encoder backend has been initialized.
+    EncoderStarted {
+        encoder: EncoderInfo,
+        gpu_name: Option<String>,
+        requested_encoder: Option<String>,
+    },
     /// A new encoded video frame is available.
     VideoFrame(EncodedVideoFrame),
     /// A new encoded audio frame is available.
@@ -173,9 +179,10 @@ impl MediaPipeline {
         let mut audio_capture = audio::create_audio_capture()?;
         let mut cursor_capture = cursor::create_cursor_capture()?;
 
-        let preferred_hw = StreamConfig::parse_encoder_preference(
-            self.config.preferred_encoder.as_deref().unwrap_or("auto"),
-        );
+        let requested_encoder = self.config.preferred_encoder.clone();
+        let preferred_encoder = requested_encoder.as_deref().unwrap_or("auto");
+        let preferred_hw = StreamConfig::parse_encoder_preference(preferred_encoder);
+        let force_ffmpeg = StreamConfig::encoder_prefers_ffmpeg(preferred_encoder);
 
         let use_gdi_only = std::env::var("LUNARIS_USE_GDI")
             .map(|val| val == "1" || val.to_lowercase() == "true")
@@ -263,10 +270,26 @@ impl MediaPipeline {
             low_latency: true,
             keyframe_interval: 0,
             preferred_hw,
+            force_ffmpeg,
             d3d11_device,
             d3d11_context,
         })?;
-        log::info!("Encoder initialized: {}", encoder.encoder_info().name);
+        let encoder_info = encoder.encoder_info();
+        let gpu_name = encode::describe_d3d11_device(d3d11_device);
+        log::info!(
+            "Encoder initialized: {} ({}) on {}",
+            encoder_info.name,
+            encoder_info.hw_type,
+            gpu_name.as_deref().unwrap_or("unknown GPU")
+        );
+        let _ = self
+            .event_tx
+            .send(MediaEvent::EncoderStarted {
+                encoder: encoder_info,
+                gpu_name,
+                requested_encoder,
+            })
+            .await;
 
         // 4. Start audio on a separate blocking task (cpal is !Send for Stream)
         let mut audio_config = AudioCaptureConfig::default();
