@@ -112,6 +112,10 @@ const AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED: i64 = 1;
 const AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME: i64 = 0;
 const AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR: i64 = 2;
 
+fn align_to(value: u32, alignment: u32) -> u32 {
+    ((value + alignment - 1) / alignment) * alignment
+}
+
 #[repr(C)]
 struct AmfFactory {
     vtbl: *const AmfFactoryVtbl,
@@ -649,9 +653,10 @@ impl WindowsAmfEncoder {
         width: u32,
         height: u32,
     ) -> Result<ID3D11Texture2D, MediaError> {
+        let aligned_height = align_to(height, 16);
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
-            Height: height,
+            Height: aligned_height,
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_NV12,
@@ -660,7 +665,7 @@ impl WindowsAmfEncoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: (D3D11_BIND_DECODER.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
