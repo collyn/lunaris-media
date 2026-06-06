@@ -596,7 +596,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             let mut hw = None;
             #[cfg(target_os = "windows")]
             if let Some(device_ptr) = d3d11_device {
-                if let Some(vendor_id) = get_d3d11_vendor_id(device_ptr) {
+                if let Some(vendor_id) = Self::get_d3d11_vendor_id(device_ptr) {
                     log::info!("Detected GPU Vendor ID: {:#X}", vendor_id);
                     match vendor_id {
                         0x10DE => {
