@@ -386,6 +386,7 @@ impl ScreenCapture for DxgiCapture {
             let gpu_tex = self.gpu_texture.as_ref().unwrap();
             unsafe {
                 context.CopyResource(gpu_tex, &texture);
+                context.Flush();
             }
             unsafe {
                 let _ = duplication.ReleaseFrame();

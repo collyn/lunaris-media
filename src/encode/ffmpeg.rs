@@ -1463,6 +1463,7 @@ impl VideoEncoder for FfmpegEncoder {
                             *array_index,
                             None,
                         );
+                        context.Flush();
                     } else {
                         std::mem::forget(context);
                         std::mem::forget(src_tex);
