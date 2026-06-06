@@ -11,6 +11,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod ffmpeg;
+#[cfg(target_os = "windows")]
+pub mod windows_nvenc;
 
 use crate::capture::gpu_buffer::GpuBuffer;
 use crate::error::MediaError;
@@ -74,7 +76,11 @@ pub trait VideoEncoder: Send {
     /// Encode a single GPU frame.
     ///
     /// Returns zero or more encoded frames (encoders may buffer internally).
-    fn encode(&mut self, buffer: &GpuBuffer, pts_us: u64) -> Result<Vec<EncodedVideoFrame>, MediaError>;
+    fn encode(
+        &mut self,
+        buffer: &GpuBuffer,
+        pts_us: u64,
+    ) -> Result<Vec<EncodedVideoFrame>, MediaError>;
 
     /// Request that the next encoded frame be an IDR/keyframe.
     fn request_keyframe(&mut self);
@@ -92,9 +98,169 @@ pub trait VideoEncoder: Send {
     fn shutdown(&mut self);
 }
 
+#[cfg(target_os = "windows")]
+enum WindowsEncoderBackend {
+    NativeNvenc(windows_nvenc::WindowsNvencEncoder),
+    Ffmpeg(ffmpeg::FfmpegEncoder),
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsAutoEncoder {
+    backend: Option<WindowsEncoderBackend>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsAutoEncoder {
+    fn new() -> Self {
+        Self { backend: None }
+    }
+
+    fn detected_d3d11_hw(config: &EncoderConfig) -> Option<HwAccelType> {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+        use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+
+        let device_ptr = config.d3d11_device? as *mut std::ffi::c_void;
+        unsafe {
+            let device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
+            let dxgi_device: IDXGIDevice = (*device).cast().ok()?;
+            let adapter = dxgi_device.GetAdapter().ok()?;
+            let desc = adapter.GetDesc().ok()?;
+            match desc.VendorId {
+                0x10DE => Some(HwAccelType::Nvenc),
+                0x1002 => Some(HwAccelType::Amf),
+                0x8086 => Some(HwAccelType::Qsv),
+                _ => None,
+            }
+        }
+    }
+
+    fn should_try_native_nvenc(config: &EncoderConfig) -> bool {
+        if config.codec != VideoCodec::H264
+            || config.d3d11_device.is_none()
+            || config.d3d11_context.is_none()
+        {
+            return false;
+        }
+
+        match config.preferred_hw {
+            Some(HwAccelType::Nvenc) => true,
+            Some(_) => false,
+            None => Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Nvenc),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl VideoEncoder for WindowsAutoEncoder {
+    fn initialize(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
+        if Self::should_try_native_nvenc(config) {
+            match windows_nvenc::WindowsNvencEncoder::new().and_then(|mut encoder| {
+                encoder.initialize(config)?;
+                Ok(encoder)
+            }) {
+                Ok(encoder) => {
+                    log::info!("Selected native Windows NVENC D3D11 encoder");
+                    self.backend = Some(WindowsEncoderBackend::NativeNvenc(encoder));
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Native Windows NVENC initialization failed: {}. Falling back to FFmpeg.",
+                        err
+                    );
+                }
+            }
+        }
+
+        if let Some(hw) = Self::detected_d3d11_hw(config) {
+            match hw {
+                HwAccelType::Amf => {
+                    log::info!("Detected AMD D3D11 adapter; using FFmpeg AMF path as in Sunshine")
+                }
+                HwAccelType::Qsv => log::info!(
+                    "Detected Intel D3D11 adapter; using FFmpeg QuickSync path as in Sunshine"
+                ),
+                HwAccelType::Nvenc => {
+                    log::info!("Using FFmpeg NVENC fallback for NVIDIA D3D11 adapter")
+                }
+                _ => {}
+            }
+        }
+
+        let mut encoder = ffmpeg::FfmpegEncoder::new()?;
+        encoder.initialize(config)?;
+        self.backend = Some(WindowsEncoderBackend::Ffmpeg(encoder));
+        Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        buffer: &GpuBuffer,
+        pts_us: u64,
+    ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
+        match self.backend.as_mut() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encode(buffer, pts_us),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encode(buffer, pts_us),
+            None => Err(MediaError::EncoderNotInitialized),
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        match self.backend.as_mut() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.request_keyframe(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.request_keyframe(),
+            None => {}
+        }
+    }
+
+    fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), MediaError> {
+        match self.backend.as_mut() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_bitrate(bitrate_kbps),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_bitrate(bitrate_kbps),
+            None => Err(MediaError::EncoderNotInitialized),
+        }
+    }
+
+    fn encoder_info(&self) -> EncoderInfo {
+        match self.backend.as_ref() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encoder_info(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encoder_info(),
+            None => EncoderInfo {
+                name: "uninitialized".to_string(),
+                hw_type: HwAccelType::Software,
+                supported_codecs: vec![],
+            },
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<EncodedVideoFrame>, MediaError> {
+        match self.backend.as_mut() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.flush(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.flush(),
+            None => Ok(vec![]),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(backend) = self.backend.as_mut() {
+            match backend {
+                WindowsEncoderBackend::NativeNvenc(encoder) => encoder.shutdown(),
+                WindowsEncoderBackend::Ffmpeg(encoder) => encoder.shutdown(),
+            }
+        }
+        self.backend = None;
+    }
+}
+
 /// Create the best available [`VideoEncoder`] for the current platform.
 pub fn create_encoder() -> Result<Box<dyn VideoEncoder>, MediaError> {
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Box::new(WindowsAutoEncoder::new()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return Ok(Box::new(ffmpeg::FfmpegEncoder::new()?));
     }
@@ -107,7 +273,21 @@ pub fn create_encoder() -> Result<Box<dyn VideoEncoder>, MediaError> {
 
 /// List all hardware-accelerated encoders detected on this system.
 pub fn list_available_encoders() -> Vec<EncoderInfo> {
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let mut encoders = Vec::new();
+        if windows_nvenc::WindowsNvencEncoder::is_available() {
+            encoders.push(EncoderInfo {
+                name: "native_nvenc_d3d11".to_string(),
+                hw_type: HwAccelType::Nvenc,
+                supported_codecs: vec![VideoCodec::H264],
+            });
+        }
+        encoders.extend(ffmpeg::FfmpegEncoder::list_available());
+        return encoders;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return ffmpeg::FfmpegEncoder::list_available();
     }
