@@ -615,6 +615,7 @@ impl FfmpegEncoder {
                     // constrained_baseline matches SDP profile-level-id=42e033
                     // AMF encoder: CAVLC entropy coding for CBP compatibility
                     opt_set("profile", "constrained_baseline");
+                    opt_set("level", "3.1");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -975,9 +976,14 @@ impl FfmpegEncoder {
                         "av_buffer_ref for hw_frames_ctx failed".into(),
                     ));
                 }
+                let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
+                log::info!(
+                    "HW frames context initialized: pool_size={} format={:?} sw_format={:?}",
+                    (*frames_ctx).initial_pool_size,
+                    (*frames_ctx).format,
+                    (*frames_ctx).sw_format
+                );
             }
-
-            log::info!("HW frames context initialized: pool_size=4 sw_format=NV12");
         }
 
         Self::set_encoder_options(codec_ctx, hw_type, config.codec, config.low_latency);
@@ -1430,6 +1436,22 @@ impl VideoEncoder for FfmpegEncoder {
                     let context = ID3D11DeviceContext::from_raw(context_ptr);
                     let src_tex = ID3D11Texture2D::from_raw(*texture);
                     let dst_tex = ID3D11Texture2D::from_raw(dst_tex_ptr);
+
+                    static mut COPY_LOG_COUNT: u32 = 0;
+                    COPY_LOG_COUNT += 1;
+                    if COPY_LOG_COUNT == 1 || COPY_LOG_COUNT % 120 == 0 {
+                        let mut src_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+                        let mut dst_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+                        src_tex.GetDesc(&mut src_desc);
+                        dst_tex.GetDesc(&mut dst_desc);
+                        log::info!(
+                            "D3D11 zero-copy textures (copy #{}): src={:?}x{:?} format={} ArraySize={} | dst={:?}x{:?} format={} ArraySize={} dst_idx={}",
+                            COPY_LOG_COUNT,
+                            src_desc.Width, src_desc.Height, src_desc.Format.0, src_desc.ArraySize,
+                            dst_desc.Width, dst_desc.Height, dst_desc.Format.0, dst_desc.ArraySize,
+                            dst_idx
+                        );
+                    }
 
                     // Cast to ID3D11Resource
                     if let (Ok(src_res), Ok(dst_res)) = (src_tex.cast::<ID3D11Resource>(), dst_tex.cast::<ID3D11Resource>()) {
