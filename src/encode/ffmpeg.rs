@@ -256,6 +256,9 @@ pub struct FfmpegEncoder {
     /// The array index used to create the cached output view.
     #[cfg(target_os = "windows")]
     cached_dst_idx: u32,
+    /// Cached Direct3D11 Staging Texture for software fallback.
+    #[cfg(target_os = "windows")]
+    staging_texture: Option<ID3D11Texture2D>,
 }
 
 // SAFETY: The FFmpeg codec context is only accessed through `&mut self` methods,
@@ -302,6 +305,8 @@ impl FfmpegEncoder {
             cached_dst_tex: 0,
             #[cfg(target_os = "windows")]
             cached_dst_idx: 0,
+            #[cfg(target_os = "windows")]
+            staging_texture: None,
         })
     }
 
@@ -1024,7 +1029,7 @@ impl FfmpegEncoder {
                     (*frames_ctx).format = hw_pix_fmt(hw_type);
                 }
                 let sw_format = match hw_type {
-                    HwAccelType::Nvenc if !is_d3d11 => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
                 (*frames_ctx).sw_format = sw_format;
@@ -1139,7 +1144,7 @@ impl FfmpegEncoder {
             (*self.sw_frame).width = config.width as libc::c_int;
             (*self.sw_frame).height = config.height as libc::c_int;
             let sw_format = match hw_type {
-                HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                 HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                 _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
             };
@@ -1490,7 +1495,207 @@ impl VideoEncoder for FfmpegEncoder {
             #[cfg(target_os = "windows")]
             GpuBuffer::D3D11Texture { texture, array_index } => {
                 if self.hw_frames_ctx.is_null() {
-                    return Err(MediaError::EncodeError("hw_frames_ctx is null".into()));
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows::Win32::Graphics::Direct3D11::{
+                            ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11Resource,
+                            D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ,
+                            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+                        };
+                        use windows::core::Interface;
+
+                        let device_ptr = config.d3d11_device.ok_or_else(|| {
+                            MediaError::EncodeError("D3D11 device not available in config".into())
+                        })? as *mut std::ffi::c_void;
+                        let context_ptr = config.d3d11_context.ok_or_else(|| {
+                            MediaError::EncodeError("D3D11 context not available in config".into())
+                        })? as *mut std::ffi::c_void;
+
+                        let device = ID3D11Device::from_raw(device_ptr);
+                        let context = ID3D11DeviceContext::from_raw(context_ptr);
+                        let src_tex = ID3D11Texture2D::from_raw(*texture);
+
+                        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+                        src_tex.GetDesc(&mut src_desc);
+
+                        let w = src_desc.Width as libc::c_int;
+                        let h = src_desc.Height as libc::c_int;
+
+                        let staging = if let Some(stg) = &self.staging_texture {
+                            let mut stg_desc = D3D11_TEXTURE2D_DESC::default();
+                            stg.GetDesc(&mut stg_desc);
+                            if stg_desc.Width != src_desc.Width || stg_desc.Height != src_desc.Height {
+                                let stg_desc_new = D3D11_TEXTURE2D_DESC {
+                                    Width: src_desc.Width,
+                                    Height: src_desc.Height,
+                                    MipLevels: 1,
+                                    ArraySize: 1,
+                                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                                        Count: 1,
+                                        Quality: 0,
+                                    },
+                                    Usage: D3D11_USAGE_STAGING,
+                                    BindFlags: 0,
+                                    CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_READ.0 as u32,
+                                    MiscFlags: 0,
+                                };
+                                let mut stg_new = None;
+                                device.CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
+                                    MediaError::EncodeError(format!("CreateTexture2D staging failed: {e}"))
+                                })?;
+                                let stg_new = stg_new.unwrap();
+                                self.staging_texture = Some(stg_new.clone());
+                                stg_new
+                            } else {
+                                stg.clone()
+                            }
+                        } else {
+                            let stg_desc_new = D3D11_TEXTURE2D_DESC {
+                                Width: src_desc.Width,
+                                Height: src_desc.Height,
+                                MipLevels: 1,
+                                ArraySize: 1,
+                                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                                    Count: 1,
+                                    Quality: 0,
+                                },
+                                Usage: D3D11_USAGE_STAGING,
+                                BindFlags: 0,
+                                CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_READ.0 as u32,
+                                MiscFlags: 0,
+                            };
+                            let mut stg_new = None;
+                            device.CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
+                                MediaError::EncodeError(format!("CreateTexture2D staging failed: {e}"))
+                            })?;
+                            let stg_new = stg_new.unwrap();
+                            self.staging_texture = Some(stg_new.clone());
+                            stg_new
+                        };
+
+                        let src_res = src_tex.cast::<ID3D11Resource>().map_err(|e| {
+                            MediaError::EncodeError(format!("Cast src_tex to ID3D11Resource failed: {e}"))
+                        })?;
+                        let dst_res = staging.cast::<ID3D11Resource>().map_err(|e| {
+                            MediaError::EncodeError(format!("Cast staging to ID3D11Resource failed: {e}"))
+                        })?;
+
+                        context.CopySubresourceRegion(
+                            &dst_res,
+                            0,
+                            0, 0, 0,
+                            &src_res,
+                            *array_index,
+                            None,
+                        );
+                        context.Flush();
+
+                        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                        context.Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| {
+                            MediaError::EncodeError(format!("Map staging failed: {e}"))
+                        })?;
+
+                        let src_stride = mapped.RowPitch as usize;
+                        let src_ptr = mapped.pData as *const u8;
+
+                        let sw_format = match hw_type {
+                            HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                            HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+                            _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                        };
+
+                        let ret = ffi::av_frame_make_writable(self.sw_frame);
+                        if ret < 0 {
+                            ffi::av_frame_unref(self.sw_frame);
+                            (*self.sw_frame).width = w;
+                            (*self.sw_frame).height = h;
+                            (*self.sw_frame).format = sw_format as libc::c_int;
+                            let ret = ffi::av_frame_get_buffer(self.sw_frame, 32);
+                            if ret < 0 {
+                                context.Unmap(&dst_res, 0);
+                                return Err(ff_err(ret));
+                            }
+                        }
+
+                        if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
+                            let dst = (*self.sw_frame).data[0];
+                            let dst_stride = (*self.sw_frame).linesize[0] as usize;
+                            if src_stride == dst_stride {
+                                ptr::copy_nonoverlapping(src_ptr, dst, src_stride * h as usize);
+                            } else {
+                                let w_bytes = w as usize * 4;
+                                for row in 0..h as usize {
+                                    ptr::copy_nonoverlapping(
+                                        src_ptr.add(row * src_stride),
+                                        dst.add(row * dst_stride),
+                                        w_bytes,
+                                    );
+                                }
+                            }
+                        } else {
+                            if self.sws_ctx.is_null() {
+                                self.sws_ctx = ffi::sws_getContext(
+                                    w,
+                                    h,
+                                    ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                                    w,
+                                    h,
+                                    sw_format,
+                                    SWS_FAST_BILINEAR,
+                                    ptr::null_mut(),
+                                    ptr::null_mut(),
+                                    ptr::null(),
+                                );
+                                if self.sws_ctx.is_null() {
+                                    context.Unmap(&dst_res, 0);
+                                    return Err(MediaError::EncodeError("Failed to create SwsContext for BGRA→YUV/NV12".into()));
+                                }
+                                let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
+                                let table = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+                                ffi::sws_setColorspaceDetails(
+                                    self.sws_ctx,
+                                    inv_table,
+                                    1, // srcRange = Full
+                                    table,
+                                    1,       // dstRange = Full
+                                    0,       // brightness
+                                    1 << 16, // contrast
+                                    1 << 16, // saturation
+                                );
+                            }
+
+                            let src_data: [*const u8; 4] = [src_ptr, ptr::null(), ptr::null(), ptr::null()];
+                            let src_linesize: [libc::c_int; 4] = [src_stride as libc::c_int, 0, 0, 0];
+
+                            ffi::sws_scale(
+                                self.sws_ctx,
+                                src_data.as_ptr(),
+                                src_linesize.as_ptr(),
+                                0,
+                                h,
+                                (*self.sw_frame).data.as_ptr() as *const *mut u8,
+                                (*self.sw_frame).linesize.as_ptr(),
+                            );
+                        }
+
+                        context.Unmap(&dst_res, 0);
+                        std::mem::forget(device);
+                        std::mem::forget(context);
+                        std::mem::forget(src_tex);
+
+                        (*self.sw_frame).width = w;
+                        (*self.sw_frame).height = h;
+                        (*self.sw_frame).pts = pts_us as i64;
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        return Err(MediaError::EncodeError("D3D11 zero-copy not supported on non-Windows".into()));
+                    }
+
+                    return self.encode_frame(self.sw_frame, pts_us);
                 }
 
                 unsafe {
@@ -1864,7 +2069,7 @@ impl VideoEncoder for FfmpegEncoder {
                 let src_stride = *stride as usize;
 
                 let sw_format = match hw_type {
-                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
