@@ -92,8 +92,10 @@ struct AVD3D11VADeviceContext {
 #[cfg(target_os = "windows")]
 #[repr(C)]
 struct AVD3D11VAFramesContext {
-    texture: *mut std::ffi::c_void,
-    texture_infos: *mut std::ffi::c_void,
+    textures: *mut *mut std::ffi::c_void,
+    nb_textures: std::ffi::c_int,
+    bind_flags: std::ffi::c_uint,
+    misc_flags: std::ffi::c_uint,
 }
 
 #[cfg(target_os = "linux")]
@@ -701,8 +703,8 @@ impl FfmpegEncoder {
                     opt_set("tune", "zerolatency");
                 }
                 if codec == VideoCodec::H264 {
-                    // Use constrained_baseline to match SDP 42e033 and enable CAVLC
-                    opt_set("profile", "constrained_baseline");
+                    // Use baseline to match SDP 42e033 and enable CAVLC (constrained_baseline is invalid for libx264)
+                    opt_set("profile", "baseline");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 }
@@ -905,7 +907,9 @@ impl FfmpegEncoder {
             let has_hw_frames = matches!(hw_type, HwAccelType::Vaapi | HwAccelType::Nvenc) || is_d3d11;
 
             if is_hw_encoder(hw_type) {
-                if has_hw_frames {
+                if is_d3d11 {
+                    (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+                } else if has_hw_frames {
                     (*codec_ctx).pix_fmt = hw_pix_fmt(hw_type);
                 } else {
                     (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
@@ -1008,9 +1012,19 @@ impl FfmpegEncoder {
 
             unsafe {
                 let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
-                (*frames_ctx).format = hw_pix_fmt(hw_type);
+                if is_d3d11 {
+                    (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+                    #[cfg(target_os = "windows")]
+                    {
+                        let d3d11_frames = (*frames_ctx).hwctx as *mut AVD3D11VAFramesContext;
+                        (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
+                        (*d3d11_frames).misc_flags = 0;
+                    }
+                } else {
+                    (*frames_ctx).format = hw_pix_fmt(hw_type);
+                }
                 let sw_format = match hw_type {
-                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Nvenc if !is_d3d11 => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
                 (*frames_ctx).sw_format = sw_format;
