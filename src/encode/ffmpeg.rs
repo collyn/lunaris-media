@@ -92,6 +92,7 @@ struct AVD3D11VADeviceContext {
 #[cfg(target_os = "windows")]
 #[repr(C)]
 struct AVD3D11VAFramesContext {
+    texture: *mut std::ffi::c_void,
     textures: *mut *mut std::ffi::c_void,
     nb_textures: std::ffi::c_int,
     bind_flags: std::ffi::c_uint,
@@ -1511,12 +1512,12 @@ impl VideoEncoder for FfmpegEncoder {
                             MediaError::EncodeError("D3D11 context not available in config".into())
                         })? as *mut std::ffi::c_void;
 
-                        let device = ID3D11Device::from_raw(device_ptr);
-                        let context = ID3D11DeviceContext::from_raw(context_ptr);
-                        let src_tex = ID3D11Texture2D::from_raw(*texture);
+                        let device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
+                        let context = std::mem::ManuallyDrop::new(ID3D11DeviceContext::from_raw(context_ptr));
+                        let src_tex = std::mem::ManuallyDrop::new(ID3D11Texture2D::from_raw(*texture));
 
                         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
-                        src_tex.GetDesc(&mut src_desc);
+                        (*src_tex).GetDesc(&mut src_desc);
 
                         let w = src_desc.Width as libc::c_int;
                         let h = src_desc.Height as libc::c_int;
@@ -1541,7 +1542,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     MiscFlags: 0,
                                 };
                                 let mut stg_new = None;
-                                device.CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
+                                (*device).CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
                                     MediaError::EncodeError(format!("CreateTexture2D staging failed: {e}"))
                                 })?;
                                 let stg_new = stg_new.unwrap();
@@ -1567,7 +1568,7 @@ impl VideoEncoder for FfmpegEncoder {
                                 MiscFlags: 0,
                             };
                             let mut stg_new = None;
-                            device.CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
+                            (*device).CreateTexture2D(&stg_desc_new, None, Some(&mut stg_new)).map_err(|e| {
                                 MediaError::EncodeError(format!("CreateTexture2D staging failed: {e}"))
                             })?;
                             let stg_new = stg_new.unwrap();
@@ -1575,14 +1576,14 @@ impl VideoEncoder for FfmpegEncoder {
                             stg_new
                         };
 
-                        let src_res = src_tex.cast::<ID3D11Resource>().map_err(|e| {
+                        let src_res = (*src_tex).cast::<ID3D11Resource>().map_err(|e| {
                             MediaError::EncodeError(format!("Cast src_tex to ID3D11Resource failed: {e}"))
                         })?;
                         let dst_res = staging.cast::<ID3D11Resource>().map_err(|e| {
                             MediaError::EncodeError(format!("Cast staging to ID3D11Resource failed: {e}"))
                         })?;
 
-                        context.CopySubresourceRegion(
+                        (*context).CopySubresourceRegion(
                             &dst_res,
                             0,
                             0, 0, 0,
@@ -1590,10 +1591,10 @@ impl VideoEncoder for FfmpegEncoder {
                             *array_index,
                             None,
                         );
-                        context.Flush();
+                        (*context).Flush();
 
                         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                        context.Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| {
+                        (*context).Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| {
                             MediaError::EncodeError(format!("Map staging failed: {e}"))
                         })?;
 
@@ -1614,7 +1615,7 @@ impl VideoEncoder for FfmpegEncoder {
                             (*self.sw_frame).format = sw_format as libc::c_int;
                             let ret = ffi::av_frame_get_buffer(self.sw_frame, 32);
                             if ret < 0 {
-                                context.Unmap(&dst_res, 0);
+                                (*context).Unmap(&dst_res, 0);
                                 return Err(ff_err(ret));
                             }
                         }
@@ -1649,7 +1650,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     ptr::null(),
                                 );
                                 if self.sws_ctx.is_null() {
-                                    context.Unmap(&dst_res, 0);
+                                    (*context).Unmap(&dst_res, 0);
                                     return Err(MediaError::EncodeError("Failed to create SwsContext for BGRA→YUV/NV12".into()));
                                 }
                                 let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
@@ -1680,10 +1681,7 @@ impl VideoEncoder for FfmpegEncoder {
                             );
                         }
 
-                        context.Unmap(&dst_res, 0);
-                        std::mem::forget(device);
-                        std::mem::forget(context);
-                        std::mem::forget(src_tex);
+                        (*context).Unmap(&dst_res, 0);
 
                         (*self.sw_frame).width = w;
                         (*self.sw_frame).height = h;
@@ -1728,15 +1726,15 @@ impl VideoEncoder for FfmpegEncoder {
                         MediaError::EncodeError("D3D11 context not available in config".into())
                     })? as *mut std::ffi::c_void;
 
-                    let context = ID3D11DeviceContext::from_raw(context_ptr);
-                    let src_tex = ID3D11Texture2D::from_raw(*texture);
-                    let dst_tex = ID3D11Texture2D::from_raw(dst_tex_ptr);
+                    let context = std::mem::ManuallyDrop::new(ID3D11DeviceContext::from_raw(context_ptr));
+                    let src_tex = std::mem::ManuallyDrop::new(ID3D11Texture2D::from_raw(*texture));
+                    let dst_tex = std::mem::ManuallyDrop::new(ID3D11Texture2D::from_raw(dst_tex_ptr));
 
                     let res = (|| -> Result<(), MediaError> {
                         let mut src_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
                         let mut dst_desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
-                        src_tex.GetDesc(&mut src_desc);
-                        dst_tex.GetDesc(&mut dst_desc);
+                        (*src_tex).GetDesc(&mut src_desc);
+                        (*dst_tex).GetDesc(&mut dst_desc);
 
                         static mut COPY_LOG_COUNT: u32 = 0;
                         COPY_LOG_COUNT += 1;
@@ -1751,8 +1749,8 @@ impl VideoEncoder for FfmpegEncoder {
                         }
 
                         if src_desc.Format == dst_desc.Format {
-                            if let (Ok(src_res), Ok(dst_res)) = (src_tex.cast::<ID3D11Resource>(), dst_tex.cast::<ID3D11Resource>()) {
-                                context.CopySubresourceRegion(
+                            if let (Ok(src_res), Ok(dst_res)) = ((*src_tex).cast::<ID3D11Resource>(), (*dst_tex).cast::<ID3D11Resource>()) {
+                                (*context).CopySubresourceRegion(
                                     &dst_res,
                                     dst_idx,
                                     0, 0, 0,
@@ -1760,7 +1758,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     *array_index,
                                     None,
                                 );
-                                context.Flush();
+                                (*context).Flush();
                             } else {
                                 return Err(MediaError::EncodeError("Failed to cast textures to ID3D11Resource".into()));
                             }
@@ -1771,17 +1769,16 @@ impl VideoEncoder for FfmpegEncoder {
                             })? as *mut std::ffi::c_void;
 
                             if self.video_device.is_none() {
-                                let d3d_device = ID3D11Device::from_raw(device_ptr);
-                                let v_device = d3d_device.cast::<ID3D11VideoDevice>().map_err(|e| {
+                                let d3d_device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
+                                let v_device = (*d3d_device).cast::<ID3D11VideoDevice>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast ID3D11Device to ID3D11VideoDevice failed: {e}"))
                                 })?;
-                                std::mem::forget(d3d_device);
                                 self.video_device = Some(v_device);
                             }
                             let video_device = self.video_device.as_ref().unwrap();
 
                             if self.video_context.is_none() {
-                                let v_context = context.cast::<ID3D11VideoContext>().map_err(|e| {
+                                let v_context = (*context).cast::<ID3D11VideoContext>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast ID3D11DeviceContext to ID3D11VideoContext failed: {e}"))
                                 })?;
                                 self.video_context = Some(v_context);
@@ -1830,7 +1827,7 @@ impl VideoEncoder for FfmpegEncoder {
                                         },
                                     },
                                 };
-                                let in_res = src_tex.cast::<ID3D11Resource>().map_err(|e| {
+                                let in_res = (*src_tex).cast::<ID3D11Resource>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast src_tex to ID3D11Resource failed: {e}"))
                                 })?;
                                 let mut in_view = None;
@@ -1861,7 +1858,7 @@ impl VideoEncoder for FfmpegEncoder {
                                         },
                                     }
                                 };
-                                let out_res = dst_tex.cast::<ID3D11Resource>().map_err(|e| {
+                                let out_res = (*dst_tex).cast::<ID3D11Resource>().map_err(|e| {
                                     MediaError::EncodeError(format!("Cast dst_tex to ID3D11Resource failed: {e}"))
                                 })?;
                                 let mut out_view = None;
@@ -1884,14 +1881,10 @@ impl VideoEncoder for FfmpegEncoder {
                             video_context.VideoProcessorBlt(video_processor, output_view, 0, &streams).map_err(|e| {
                                 MediaError::EncodeError(format!("VideoProcessorBlt failed: {e}"))
                             })?;
-                            context.Flush();
+                            (*context).Flush();
                         }
                         Ok(())
                     })();
-
-                    std::mem::forget(context);
-                    std::mem::forget(src_tex);
-                    std::mem::forget(dst_tex);
 
                     res?;
 
