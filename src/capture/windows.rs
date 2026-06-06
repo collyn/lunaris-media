@@ -389,7 +389,7 @@ impl ScreenCapture for DxgiCapture {
                 context.Flush();
             }
 
-            let is_black = if self.frame_count < 3 {
+            let is_black = if self.frame_count <= 3 {
                 unsafe {
                     context.CopyResource(staging, &texture);
                     context.Flush();
