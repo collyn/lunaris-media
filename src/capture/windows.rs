@@ -377,6 +377,461 @@ impl ScreenCapture for DxgiCapture {
     }
 }
 
+struct GdiMonitorInfo {
+    name: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    is_primary: bool,
+}
+
+fn enumerate_gdi_monitors_with_coords() -> Result<Vec<GdiMonitorInfo>, MediaError> {
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MONITORINFOEXW};
+    use windows::Win32::Foundation::{RECT, LPARAM, BOOL};
+
+    unsafe extern "system" fn monitor_enum_proc(
+        hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        _hdc: windows::Win32::Graphics::Gdi::HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let monitors = &mut *(lparam.0 as *mut Vec<GdiMonitorInfo>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).is_ok() {
+            let rect = info.monitorInfo.rcMonitor;
+            let x = rect.left;
+            let y = rect.top;
+            let width = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+            
+            let name_chars: Vec<u16> = info.szDevice.iter().take_while(|&&c| c != 0).copied().collect();
+            let name = String::from_utf16_lossy(&name_chars);
+            
+            let is_primary = (info.monitorInfo.dwFlags & 1) != 0; // MONITORINFOF_PRIMARY = 1
+            
+            monitors.push(GdiMonitorInfo {
+                name,
+                x,
+                y,
+                width,
+                height,
+                is_primary,
+            });
+        }
+        true.into()
+    }
+
+    let mut monitors = Vec::new();
+    unsafe {
+        let lparam = LPARAM(&mut monitors as *mut Vec<GdiMonitorInfo> as isize);
+        if !EnumDisplayMonitors(None, None, Some(monitor_enum_proc), lparam).as_bool() {
+            return Err(MediaError::CaptureError("EnumDisplayMonitors failed".into()));
+        }
+    }
+    Ok(monitors)
+}
+
+pub fn list_gdi_displays() -> Result<Vec<DisplayInfo>, MediaError> {
+    let monitors = enumerate_gdi_monitors_with_coords()?;
+    let mut displays = Vec::new();
+    for (i, m) in monitors.into_iter().enumerate() {
+        displays.push(DisplayInfo {
+            id: format!("{}", i),
+            name: m.name,
+            width: m.width,
+            height: m.height,
+            refresh_rate: 60.0,
+            is_primary: m.is_primary,
+        });
+    }
+    Ok(displays)
+}
+
+fn capture_gdi(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(Vec<u8>, u32), MediaError> {
+    use windows::Win32::Graphics::Gdi::*;
+
+    unsafe {
+        let hdc_screen = GetDC(None);
+        if hdc_screen.is_invalid() {
+            return Err(MediaError::CaptureError("GetDC(None) failed".into()));
+        }
+
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        if hdc_mem.is_invalid() {
+            let _ = ReleaseDC(None, hdc_screen);
+            return Err(MediaError::CaptureError("CreateCompatibleDC failed".into()));
+        }
+
+        let h_bitmap = CreateCompatibleBitmap(hdc_screen, width as i32, height as i32);
+        if h_bitmap.is_invalid() {
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(None, hdc_screen);
+            return Err(MediaError::CaptureError("CreateCompatibleBitmap failed".into()));
+        }
+
+        let h_old = SelectObject(hdc_mem, h_bitmap);
+
+        let bitblt_res = BitBlt(
+            hdc_mem,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            hdc_screen,
+            x,
+            y,
+            SRCCOPY,
+        );
+
+        if !bitblt_res.as_bool() {
+            let _ = SelectObject(hdc_mem, h_old);
+            let _ = DeleteObject(h_bitmap);
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(None, hdc_screen);
+            return Err(MediaError::CaptureError("BitBlt failed".into()));
+        }
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32), // Negative height for top-down DIB
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stride = width * 4;
+        let mut buffer = vec![0u8; (stride * height) as usize];
+
+        let get_di_res = GetDIBits(
+            hdc_screen,
+            h_bitmap,
+            0,
+            height,
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        // Cleanup
+        let _ = SelectObject(hdc_mem, h_old);
+        let _ = DeleteObject(h_bitmap);
+        let _ = DeleteDC(hdc_mem);
+        let _ = ReleaseDC(None, hdc_screen);
+
+        if get_di_res == 0 {
+            return Err(MediaError::CaptureError("GetDIBits failed".into()));
+        }
+
+        Ok((buffer, stride))
+    }
+}
+
+pub struct GdiCapture {
+    width: u32,
+    height: u32,
+    x_offset: i32,
+    y_offset: i32,
+    capturing: bool,
+    start_time: Option<Instant>,
+    frame_count: u64,
+    last_frame_data: Option<(Vec<u8>, u32)>,
+    last_returned_time: Option<Instant>,
+}
+
+impl GdiCapture {
+    pub fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            x_offset: 0,
+            y_offset: 0,
+            capturing: false,
+            start_time: None,
+            frame_count: 0,
+            last_frame_data: None,
+            last_returned_time: None,
+        }
+    }
+
+    pub fn is_capturing(&self) -> bool {
+        self.capturing
+    }
+}
+
+#[async_trait::async_trait]
+impl ScreenCapture for GdiCapture {
+    async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError> {
+        list_gdi_displays()
+    }
+
+    async fn start(&mut self, display_id: &str, _config: &StreamConfig) -> Result<(), MediaError> {
+        if self.capturing {
+            return Err(MediaError::CaptureAlreadyStarted);
+        }
+
+        let displays = enumerate_gdi_monitors_with_coords()?;
+        let display_index: usize = display_id.parse().unwrap_or(0);
+        let display = displays
+            .into_iter()
+            .nth(display_index)
+            .ok_or_else(|| MediaError::CaptureError(format!("Display {} not found", display_id)))?;
+
+        self.width = display.width;
+        self.height = display.height;
+        self.x_offset = display.x;
+        self.y_offset = display.y;
+        self.capturing = true;
+        self.start_time = Some(Instant::now());
+        self.frame_count = 0;
+        self.last_returned_time = None;
+        self.last_frame_data = None;
+
+        log::info!(
+            "GDI screen capture started on display {} ({}x{} at {},{})",
+            display_id,
+            self.width,
+            self.height,
+            self.x_offset,
+            self.y_offset
+        );
+        Ok(())
+    }
+
+    async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
+        if !self.capturing {
+            return Err(MediaError::CaptureError("Not capturing".into()));
+        }
+
+        let timestamp = self
+            .start_time
+            .as_ref()
+            .map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        let (mut data, stride) = capture_gdi(
+            self.x_offset,
+            self.y_offset,
+            self.width,
+            self.height,
+        )?;
+
+        // Overlay Windows cursor directly on the captured buffer
+        if std::env::var("LUNARIS_HIDE_HOST_CURSOR").is_err() {
+            unsafe {
+                draw_cursor_onto_buffer(
+                    &mut data,
+                    self.width,
+                    self.height,
+                    stride,
+                    self.x_offset,
+                    self.y_offset,
+                );
+            }
+        }
+
+        self.frame_count += 1;
+        self.last_frame_data = Some((data.clone(), stride));
+        self.last_returned_time = Some(Instant::now());
+
+        Ok(CapturedFrame {
+            buffer: GpuBuffer::CpuBuffer {
+                data,
+                stride,
+                format: PixelFormat::BGRA,
+                width: self.width,
+                height: self.height,
+            },
+            timestamp_us: timestamp,
+            width: self.width,
+            height: self.height,
+            format: PixelFormat::BGRA,
+            is_new_frame: true,
+        })
+    }
+
+    async fn stop(&mut self) -> Result<(), MediaError> {
+        self.capturing = false;
+        self.last_frame_data = None;
+        log::info!(
+            "GDI screen capture stopped ({} frames captured)",
+            self.frame_count
+        );
+        Ok(())
+    }
+
+    fn is_capturing(&self) -> bool {
+        self.capturing
+    }
+}
+
+fn is_buffer_black(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    for i in (0..data.len()).step_by(256) {
+        if data[i] != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub struct WindowsScreenCapture {
+    dxgi: Option<DxgiCapture>,
+    gdi: Option<GdiCapture>,
+    use_gdi_only: bool,
+    active_is_gdi: bool,
+    display_id: String,
+    config: Option<StreamConfig>,
+    black_frame_count: u32,
+}
+
+impl WindowsScreenCapture {
+    pub fn new() -> Result<Self, MediaError> {
+        let use_gdi_only = std::env::var("LUNARIS_USE_GDI")
+            .map(|val| val == "1" || val.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        Ok(Self {
+            dxgi: Some(DxgiCapture::new()?),
+            gdi: Some(GdiCapture::new()),
+            use_gdi_only,
+            active_is_gdi: use_gdi_only,
+            display_id: String::new(),
+            config: None,
+            black_frame_count: 0,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ScreenCapture for WindowsScreenCapture {
+    async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError> {
+        if let Some(dxgi) = &self.dxgi {
+            if let Ok(displays) = dxgi.list_displays().await {
+                return Ok(displays);
+            }
+        }
+        list_gdi_displays()
+    }
+
+    async fn start(&mut self, display_id: &str, config: &StreamConfig) -> Result<(), MediaError> {
+        self.display_id = display_id.to_string();
+        self.config = Some(config.clone());
+        self.black_frame_count = 0;
+
+        if self.use_gdi_only {
+            log::info!("LUNARIS_USE_GDI is set. Starting directly with GDI capture.");
+            self.active_is_gdi = true;
+            if let Some(gdi) = &mut self.gdi {
+                gdi.start(display_id, config).await?;
+            }
+            return Ok(());
+        }
+
+        log::info!("Starting screen capture with DXGI backend...");
+        if let Some(dxgi) = &mut self.dxgi {
+            match dxgi.start(display_id, config).await {
+                Ok(()) => {
+                    self.active_is_gdi = false;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("Failed to start DXGI capture: {}. Falling back to GDI capture.", e);
+                }
+            }
+        }
+
+        self.active_is_gdi = true;
+        if let Some(gdi) = &mut self.gdi {
+            gdi.start(display_id, config).await?;
+        }
+        Ok(())
+    }
+
+    async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
+        if self.active_is_gdi {
+            if let Some(gdi) = &mut self.gdi {
+                return gdi.next_frame().await;
+            }
+            return Err(MediaError::CaptureError("GDI capture backend not initialized".into()));
+        }
+
+        let dxgi = self
+            .dxgi
+            .as_mut()
+            .ok_or_else(|| MediaError::CaptureError("DXGI capture backend not initialized".into()))?;
+
+        let frame = dxgi.next_frame().await?;
+
+        if frame.is_new_frame {
+            if let GpuBuffer::CpuBuffer { data, .. } = &frame.buffer {
+                if is_buffer_black(data) {
+                    self.black_frame_count += 1;
+                    if self.black_frame_count >= 3 {
+                        log::warn!(
+                            "DXGI capture returned black frames for 3 consecutive frames. \
+                             Possibly in an RDP session, VM, or hybrid GPU environment. \
+                             Switching capture backend to GDI."
+                        );
+                        let _ = dxgi.stop().await;
+
+                        if let Some(gdi) = &mut self.gdi {
+                            if let Some(config) = &self.config {
+                                match gdi.start(&self.display_id, config).await {
+                                    Ok(()) => {
+                                        self.active_is_gdi = true;
+                                        return gdi.next_frame().await;
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to start GDI capture fallback: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.black_frame_count = 0;
+                }
+            }
+        }
+
+        Ok(frame)
+    }
+
+    async fn stop(&mut self) -> Result<(), MediaError> {
+        if self.active_is_gdi {
+            if let Some(gdi) = &mut self.gdi {
+                gdi.stop().await?;
+            }
+        } else {
+            if let Some(dxgi) = &mut self.dxgi {
+                dxgi.stop().await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_capturing(&self) -> bool {
+        if self.active_is_gdi {
+            self.gdi.as_ref().map_or(false, |gdi| gdi.is_capturing())
+        } else {
+            self.dxgi.as_ref().map_or(false, |dxgi| dxgi.is_capturing())
+        }
+    }
+}
+
 unsafe fn draw_cursor_onto_buffer(
     frame_buffer: &mut [u8],
     frame_width: u32,

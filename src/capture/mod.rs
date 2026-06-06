@@ -125,7 +125,7 @@ pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
 
     #[cfg(target_os = "windows")]
     {
-        return Ok(Box::new(windows::DxgiCapture::new()?));
+        return Ok(Box::new(windows::WindowsScreenCapture::new()?));
     }
 
     #[cfg(target_os = "macos")]
