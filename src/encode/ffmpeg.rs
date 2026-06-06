@@ -1044,7 +1044,7 @@ impl FfmpegEncoder {
                     (*frames_ctx).format = hw_pix_fmt(hw_type);
                 }
                 let sw_format = match hw_type {
-                    HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
                 (*frames_ctx).sw_format = sw_format;
@@ -1159,7 +1159,7 @@ impl FfmpegEncoder {
             (*self.sw_frame).width = config.width as libc::c_int;
             (*self.sw_frame).height = config.height as libc::c_int;
             let sw_format = match hw_type {
-                HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                 HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                 _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
             };
@@ -1616,7 +1616,7 @@ impl VideoEncoder for FfmpegEncoder {
                         let src_ptr = mapped.pData as *const u8;
 
                         let sw_format = match hw_type {
-                            HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                            HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                             HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                             _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                         };
@@ -2074,7 +2074,7 @@ impl VideoEncoder for FfmpegEncoder {
                 let src_stride = *stride as usize;
 
                 let sw_format = match hw_type {
-                    HwAccelType::Nvenc | HwAccelType::Amf => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                     HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };
