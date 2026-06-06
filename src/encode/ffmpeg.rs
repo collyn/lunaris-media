@@ -1696,9 +1696,7 @@ impl VideoEncoder for FfmpegEncoder {
                     }
 
                     self.sw_frame
-                }
-
-                unsafe {
+                } else { unsafe {
                     ffi::av_frame_unref(self.frame);
                     let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);
                     if ret < 0 {
@@ -1899,8 +1897,8 @@ impl VideoEncoder for FfmpegEncoder {
 
                     (*self.frame).width = config.width as libc::c_int;
                     (*self.frame).height = config.height as libc::c_int;
-                }
-                self.frame
+                    self.frame
+                } }
             }
 
             #[cfg(target_os = "linux")]
