@@ -2198,6 +2198,7 @@ impl VideoEncoder for FfmpegEncoder {
             #[cfg(target_os = "linux")]
             GpuBuffer::CudaPointer {
                 ptr,
+                cuda_context,
                 width,
                 height,
                 stride,
@@ -2234,6 +2235,38 @@ impl VideoEncoder for FfmpegEncoder {
                                 return Err(MediaError::EncodeError("P010 CUDA software fallback not supported".into()));
                             }
                         };
+
+                        let mut old_ctx: *mut std::ffi::c_void = ptr::null_mut();
+                        if *cuda_context != 0 {
+                            (copier.cu_ctx_get_current)(&mut old_ctx);
+                            let res = (copier.cu_ctx_set_current)(*cuda_context as *mut std::ffi::c_void);
+                            if res != 0 {
+                                return Err(MediaError::EncodeError(format!(
+                                    "cuCtxSetCurrent capture context failed: {}",
+                                    res
+                                )));
+                            }
+                        }
+                        struct SoftwareCudaContextRestorer<'a> {
+                            copier: &'a CudaCopier,
+                            old_ctx: *mut std::ffi::c_void,
+                            should_restore: bool,
+                        }
+                        impl<'a> Drop for SoftwareCudaContextRestorer<'a> {
+                            fn drop(&mut self) {
+                                if self.should_restore {
+                                    unsafe {
+                                        (self.copier.cu_ctx_set_current)(self.old_ctx);
+                                    }
+                                }
+                            }
+                        }
+                        let _ctx_restorer = SoftwareCudaContextRestorer {
+                            copier,
+                            old_ctx,
+                            should_restore: *cuda_context != 0,
+                        };
+
                         let mut host_data = vec![0u8; host_len];
                         let res = (copier.cu_memcpy_dtoh)(
                             host_data.as_mut_ptr() as *mut libc::c_void,

@@ -39,6 +39,8 @@ pub enum GpuBuffer {
     CudaPointer {
         /// Address of the CUDA buffer.
         ptr: usize,
+        /// CUDA context that owns this pointer, if known.
+        cuda_context: usize,
         /// Total buffer size in bytes.
         size: usize,
         /// Image width in pixels.

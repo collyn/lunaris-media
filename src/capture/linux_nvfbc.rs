@@ -462,7 +462,7 @@ impl NvfbcCapture {
         let thread_handle = std::thread::Builder::new()
             .name("lunaris-nvfbc".into())
             .spawn(move || {
-                let (mut capturer, _cuda_guard) = match init_capturer() {
+                let (mut capturer, cuda_guard) = match init_capturer() {
                     Ok(res) => {
                         let _ = init_tx.send(Ok(()));
                         res
@@ -556,6 +556,7 @@ impl NvfbcCapture {
                                 ).map(|frame_info| CapturedFrame {
                                     buffer: GpuBuffer::CudaPointer {
                                         ptr: frame_info.device_buffer,
+                                        cuda_context: cuda_guard.as_ref().map(|g| g.context as usize).unwrap_or(0),
                                         size: frame_info.device_buffer_len as usize,
                                         width: frame_info.width,
                                         height: frame_info.height,
