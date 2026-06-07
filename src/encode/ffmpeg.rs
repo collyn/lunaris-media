@@ -666,6 +666,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
     /// This applies tuning parameters that differ per encoder backend.
     fn set_encoder_options(
         codec_ctx: *mut ffi::AVCodecContext,
+        encoder_name: &str,
         hw_type: HwAccelType,
         codec: VideoCodec,
         low_latency: bool,
@@ -762,17 +763,34 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 log::info!("Applied VideoToolbox encoder options");
             }
             HwAccelType::Software => {
-                opt_set("preset", "ultrafast");
-                if low_latency {
-                    opt_set("tune", "zerolatency");
+                if codec == VideoCodec::AV1 {
+                    match encoder_name {
+                        "libsvtav1" => {
+                            // SVT-AV1 expects a numeric preset; 13 is the fastest.
+                            opt_set("preset", "13");
+                            opt_set("svtav1-params", "lp=1");
+                        }
+                        "libaom-av1" => {
+                            opt_set("usage", "realtime");
+                            opt_set("cpu-used", "8");
+                            opt_set("lag-in-frames", "0");
+                            opt_set("row-mt", "1");
+                        }
+                        _ => {}
+                    }
+                } else {
+                    opt_set("preset", "ultrafast");
+                    if low_latency {
+                        opt_set("tune", "zerolatency");
+                    }
+                    if codec == VideoCodec::H264 {
+                        // Use baseline to match SDP 42e033 and enable CAVLC (constrained_baseline is invalid for libx264)
+                        opt_set("profile", "baseline");
+                    } else if codec == VideoCodec::H265 {
+                        opt_set("profile", "main");
+                    }
                 }
-                if codec == VideoCodec::H264 {
-                    // Use baseline to match SDP 42e033 and enable CAVLC (constrained_baseline is invalid for libx264)
-                    opt_set("profile", "baseline");
-                } else if codec == VideoCodec::H265 {
-                    opt_set("profile", "main");
-                }
-                log::info!("Applied software encoder options");
+                log::info!("Applied software encoder options for {}", encoder_name);
             }
         }
     }
@@ -1169,7 +1187,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
         }
 
-        Self::set_encoder_options(codec_ctx, hw_type, config.codec, config.low_latency);
+        Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency);
 
         let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, ptr::null_mut()) };
         if ret < 0 {
