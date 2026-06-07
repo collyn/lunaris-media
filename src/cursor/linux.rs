@@ -281,6 +281,12 @@ fn infer_cursor_kind_from_unnamed_image(
         return Some(CursorKind::Move);
     }
 
+    let top_left_hotspot =
+        hotspot_x <= width.saturating_div(3) && hotspot_y <= height.saturating_div(3);
+    if top_left_hotspot {
+        return Some(CursorKind::Arrow);
+    }
+
     None
 }
 
