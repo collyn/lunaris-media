@@ -1092,6 +1092,19 @@ impl VideoEncoder for WindowsNvencEncoder {
         Ok(())
     }
 
+    fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        if !self.initialized {
+            return Err(MediaError::EncoderNotInitialized);
+        }
+        let fps = fps.max(1);
+        if let Some(config) = &mut self.config {
+            config.fps = fps;
+        }
+        self.force_keyframe = true;
+        log::debug!("Native NVENC target FPS updated to {}", fps);
+        Ok(())
+    }
+
     fn encoder_info(&self) -> EncoderInfo {
         self.info.clone()
     }

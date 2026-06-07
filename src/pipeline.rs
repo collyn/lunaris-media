@@ -492,7 +492,7 @@ impl MediaPipeline {
                             0.0
                         };
                         let queue_len = event_capacity - self.event_tx.capacity();
-                        log::info!(
+                        log::debug!(
                             "Pipeline metrics: ticks={:.1}/s capture_new={:.1}/s encode_attempts={:.1}/s encoded={:.1}/s sent={:.1}/s dropped={} bitrate={:.2}Mbps queue={} avg_encode={:.2}ms constant_fps={}",
                             metrics_ticks as f64 / secs,
                             metrics_new_captures as f64 / secs,
@@ -537,6 +537,9 @@ impl MediaPipeline {
                             let new_fps = new_fps.clamp(1, 240);
                             log::info!("Changing target FPS from {} to {}", self.config.fps, new_fps);
                             self.config.fps = new_fps;
+                            if let Err(e) = encoder.set_fps(new_fps) {
+                                log::warn!("Failed to update encoder FPS: {}", e);
+                            }
                             target_interval = Duration::from_nanos(1_000_000_000 / new_fps as u64);
                             frame_ticker = tokio::time::interval(target_interval);
                             frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -93,6 +93,12 @@ pub trait VideoEncoder: Send {
     /// Dynamically change the target bitrate.
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), MediaError>;
 
+    /// Dynamically change the target frame rate.
+    fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        let _ = fps;
+        Ok(())
+    }
+
     /// Return metadata about this encoder instance.
     fn encoder_info(&self) -> EncoderInfo;
 
@@ -282,6 +288,15 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_bitrate(bitrate_kbps),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_bitrate(bitrate_kbps),
             Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_bitrate(bitrate_kbps),
+            None => Err(MediaError::EncoderNotInitialized),
+        }
+    }
+
+    fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        match self.backend.as_mut() {
+            Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_fps(fps),
+            Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_fps(fps),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_fps(fps),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }

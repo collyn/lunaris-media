@@ -1213,6 +1213,22 @@ impl VideoEncoder for WindowsAmfEncoder {
         Ok(())
     }
 
+    fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        if !self.initialized {
+            return Err(MediaError::EncoderNotInitialized);
+        }
+        let fps = fps.max(1);
+        if let Some(config) = &mut self.config {
+            config.fps = fps;
+        }
+        if !self.component.is_null() {
+            self.try_set_component_property(self.component, "FrameRate", amf_variant_rate(fps, 1));
+        }
+        self.force_keyframe = true;
+        log::debug!("Native AMF target FPS updated to {}", fps);
+        Ok(())
+    }
+
     fn encoder_info(&self) -> EncoderInfo {
         self.info.clone()
     }

@@ -833,7 +833,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 // Annex-B: starts with 00 00 00 01 or 00 00 01 (start code)
                 // AVCC: starts with 4-byte big-endian NAL length
                 let raw_prefix: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-                log::info!(
+                log::debug!(
                     "IDR frame from encoder: {} bytes, first 16 bytes: [{}] ({})",
                     data.len(),
                     raw_prefix.join(" "),
@@ -851,7 +851,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 if self.sps_pps_cache.is_none() && already_has_headers {
                     let extracted = extract_sps_pps(&data[..slice_offset], codec);
                     if !extracted.is_empty() {
-                        log::info!("Dynamically cached SPS/PPS/VPS headers from first keyframe: {} bytes", extracted.len());
+                        log::debug!("Dynamically cached SPS/PPS/VPS headers from first keyframe: {} bytes", extracted.len());
                         self.sps_pps_cache = Some(extracted);
                     }
                 }
@@ -862,13 +862,13 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                         combined.extend_from_slice(&data[..slice_offset]);
                         combined.extend_from_slice(headers);
                         combined.extend_from_slice(&data[slice_offset..]);
-                        log::info!("IDR combined with SPS/PPS at offset {}: {} bytes total", slice_offset, combined.len());
+                        log::debug!("IDR combined with SPS/PPS at offset {}: {} bytes total", slice_offset, combined.len());
                         combined
                     } else {
                         data
                     }
                 } else {
-                    log::info!("IDR frame already has SPS/PPS prepended, using as-is");
+                    log::debug!("IDR frame already has SPS/PPS prepended, using as-is");
                     data
                 }
             } else {
@@ -2332,7 +2332,7 @@ impl VideoEncoder for FfmpegEncoder {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
                 (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
             }
-            log::info!("Forcing keyframe at frame #{}", self.frame_count);
+            log::debug!("Forcing keyframe at frame #{}", self.frame_count);
         } else {
             unsafe {
                 (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
@@ -2387,7 +2387,7 @@ impl VideoEncoder for FfmpegEncoder {
             return Err(MediaError::EncoderNotInitialized);
         }
 
-        log::info!("Setting bitrate to {} kbps", bitrate_kbps);
+        log::debug!("Setting bitrate to {} kbps", bitrate_kbps);
 
         unsafe {
             let bitrate = (bitrate_kbps as i64) * 1000;
@@ -2406,6 +2406,29 @@ impl VideoEncoder for FfmpegEncoder {
         // Force a keyframe after bitrate change so the decoder can recover cleanly
         self.force_keyframe = true;
 
+        Ok(())
+    }
+
+    fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        if !self.initialized {
+            return Err(MediaError::EncoderNotInitialized);
+        }
+        let fps = fps.max(1);
+        if let Some(config) = &mut self.config {
+            config.fps = fps;
+            if config.keyframe_interval == 0 {
+                unsafe {
+                    (*self.codec_ctx).gop_size = (fps * 2) as libc::c_int;
+                    (*self.codec_ctx).keyint_min = fps as libc::c_int;
+                }
+            }
+        }
+        unsafe {
+            (*self.codec_ctx).time_base = ffi::AVRational { num: 1, den: fps as libc::c_int };
+            (*self.codec_ctx).framerate = ffi::AVRational { num: fps as libc::c_int, den: 1 };
+        }
+        self.force_keyframe = true;
+        log::debug!("FFmpeg target FPS updated to {}", fps);
         Ok(())
     }
 
