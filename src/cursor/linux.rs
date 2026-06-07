@@ -138,10 +138,10 @@ impl LinuxCursorCapture {
         self.last_state.x = image.x as i32;
         self.last_state.y = image.y as i32;
         let cursor_name = xfixes_cursor_name(image.name);
-        if let Some(kind) = cursor_name
+        let named_kind = cursor_name
             .as_deref()
-            .and_then(cursor_kind_from_xfixes_name)
-        {
+            .and_then(cursor_kind_from_xfixes_name);
+        if let Some(kind) = named_kind {
             self.last_state.kind = kind;
         }
         let serial = image.cursor_serial as u64;
@@ -151,12 +151,19 @@ impl LinuxCursorCapture {
 
         let cursor_image = if width > 0 && height > 0 && !image.pixels.is_null() {
             let pixels = unsafe { std::slice::from_raw_parts(image.pixels, pixels_len) };
+            let hotspot_x = image.xhot as u32;
+            let hotspot_y = image.yhot as u32;
+            if named_kind.is_none() {
+                self.last_state.kind =
+                    infer_cursor_kind_from_unnamed_image(width, height, hotspot_x, hotspot_y)
+                        .unwrap_or(CursorKind::Unknown);
+            }
             let shape_key = CursorShapeKey::from_xfixes_image(
                 cursor_name.clone(),
                 width,
                 height,
-                image.xhot as u32,
-                image.yhot as u32,
+                hotspot_x,
+                hotspot_y,
                 pixels,
             );
             if self.last_cursor_shape.as_ref() == Some(&shape_key) {
@@ -184,16 +191,16 @@ impl LinuxCursorCapture {
                     serial,
                     width,
                     height,
-                    image.xhot,
-                    image.yhot,
+                    hotspot_x,
+                    hotspot_y,
                     shape_key.pixel_hash
                 );
             }
             Some(CursorImage {
                 width,
                 height,
-                hotspot_x: image.xhot as u32,
-                hotspot_y: image.yhot as u32,
+                hotspot_x: hotspot_x,
+                hotspot_y: hotspot_y,
                 rgba_data: rgba,
             })
         } else {
@@ -262,17 +269,31 @@ impl CursorShapeKey {
     }
 }
 
+fn infer_cursor_kind_from_unnamed_image(
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+) -> Option<CursorKind> {
+    let centered_hotspot =
+        hotspot_x.abs_diff(width / 2) <= 2 && hotspot_y.abs_diff(height / 2) <= 2;
+    if width >= 30 && height >= 30 && centered_hotspot {
+        return Some(CursorKind::Move);
+    }
+
+    None
+}
+
 fn xfixes_cursor_name(name: *const libc::c_char) -> Option<String> {
     if name.is_null() {
         return None;
     }
 
-    Some(
-        unsafe { CStr::from_ptr(name) }
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .replace(['-', '_'], ""),
-    )
+    let normalized = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn cursor_kind_from_xfixes_name(name: &str) -> Option<CursorKind> {
