@@ -40,8 +40,8 @@ pub struct LinuxCursorCapture {
     last_state: CursorState,
     /// Open X11 display for pointer and cursor image queries.
     x11_display: Option<*mut xlib::Display>,
-    /// Last XFixes cursor serial sent to consumers.
-    last_cursor_serial: Option<u64>,
+    /// Last XFixes cursor shape key sent to consumers.
+    last_cursor_shape: Option<(u64, Option<String>)>,
     /// Whether cursor tracking is currently active.
     active: bool,
 }
@@ -63,7 +63,7 @@ impl LinuxCursorCapture {
                 image: None,
             },
             x11_display: None,
-            last_cursor_serial: None,
+            last_cursor_shape: None,
             active: false,
         })
     }
@@ -132,10 +132,15 @@ impl LinuxCursorCapture {
         let image = unsafe { *image_ptr };
         self.last_state.x = image.x as i32;
         self.last_state.y = image.y as i32;
-        if let Some(kind) = cursor_kind_from_xfixes_name(image.name) {
+        let cursor_name = xfixes_cursor_name(image.name);
+        if let Some(kind) = cursor_name
+            .as_deref()
+            .and_then(cursor_kind_from_xfixes_name)
+        {
             self.last_state.kind = kind;
         }
         let serial = image.cursor_serial as u64;
+        let shape_key = (serial, cursor_name.clone());
         let width = image.width as u32;
         let height = image.height as u32;
         let pixels_len = width.checked_mul(height)? as usize;
@@ -143,7 +148,7 @@ impl LinuxCursorCapture {
         let cursor_image = if width > 0
             && height > 0
             && !image.pixels.is_null()
-            && self.last_cursor_serial != Some(serial)
+            && self.last_cursor_shape.as_ref() != Some(&shape_key)
         {
             let pixels = unsafe { std::slice::from_raw_parts(image.pixels, pixels_len) };
             let mut rgba = Vec::with_capacity(pixels_len * 4);
@@ -156,7 +161,7 @@ impl LinuxCursorCapture {
                     ((argb >> 24) & 0xff) as u8,
                 ]);
             }
-            self.last_cursor_serial = Some(serial);
+            self.last_cursor_shape = Some(shape_key);
             Some(CursorImage {
                 width,
                 height,
@@ -190,24 +195,38 @@ impl LinuxCursorCapture {
     }
 }
 
-fn cursor_kind_from_xfixes_name(name: *const libc::c_char) -> Option<CursorKind> {
+fn xfixes_cursor_name(name: *const libc::c_char) -> Option<String> {
     if name.is_null() {
         return None;
     }
 
-    let name = unsafe { CStr::from_ptr(name) }
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .replace(['-', '_'], "");
+    Some(
+        unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], ""),
+    )
+}
 
-    let kind = match name.as_str() {
+fn cursor_kind_from_xfixes_name(name: &str) -> Option<CursorKind> {
+    let kind = match name {
         "xterm" | "text" | "ibeam" => CursorKind::IBeam,
         "hand" | "hand1" | "hand2" | "pointer" | "openhand" | "dndcopy" | "dndlink" | "dndask" => {
             CursorKind::Hand
         }
-        "cross" | "crosshair" | "tcross" => CursorKind::Cross,
-        "fleur" | "move" | "allscroll" | "sizeall" | "grab" | "grabbed" | "grabbing" | "drag"
-        | "dragging" | "closedhand" | "dndmove" => CursorKind::Move,
+        "cross" | "crosshair" | "tcross" | "diamondcross" => CursorKind::Cross,
+        "fleur"
+        | "4498f0e0c1937ffe01fd06f973665830"
+        | "move"
+        | "allscroll"
+        | "sizeall"
+        | "grab"
+        | "grabbed"
+        | "grabbing"
+        | "drag"
+        | "dragging"
+        | "closedhand"
+        | "dndmove" => CursorKind::Move,
         "sbvdoublearrow" | "sizens" | "nsresize" | "rowresize" | "nresize" | "sresize" => {
             CursorKind::ResizeNs
         }
