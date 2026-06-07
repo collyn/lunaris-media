@@ -230,6 +230,9 @@ pub struct FfmpegEncoder {
     /// Prepended to every IDR keyframe to guarantee the browser has codec parameters,
     /// regardless of whether the encoder supports the `repeat-headers` option.
     sps_pps_cache: Option<Vec<u8>>,
+    /// NAL length prefix size from AVCC/hvcC extradata, used to normalize
+    /// length-prefixed encoder packets to Annex-B.
+    nal_length_size: usize,
     /// Cached Direct3D11 Video Device for zero-copy format conversion.
     #[cfg(target_os = "windows")]
     video_device: Option<ID3D11VideoDevice>,
@@ -288,6 +291,7 @@ impl FfmpegEncoder {
             info: None,
             initialized: false,
             sps_pps_cache: None,
+            nal_length_size: 4,
             #[cfg(target_os = "windows")]
             video_device: None,
             #[cfg(target_os = "windows")]
@@ -807,7 +811,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
 
             // SAFETY: If avcodec_receive_packet returned 0, the packet data
             // pointer and size are valid. We copy the data out immediately.
-            let data = unsafe {
+            let mut data = unsafe {
                 let pkt = &*self.packet;
                 if pkt.data.is_null() || pkt.size <= 0 {
                     Vec::new()
@@ -815,6 +819,18 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                     std::slice::from_raw_parts(pkt.data, pkt.size as usize).to_vec()
                 }
             };
+
+            if codec_needs_parameter_sets(codec) && !starts_with_annexb(&data) {
+                if let Some(annexb) = length_prefixed_packet_to_annexb(&data, self.nal_length_size) {
+                    log::debug!(
+                        "Converted {} length-prefixed packet to Annex-B ({} -> {} bytes)",
+                        codec,
+                        data.len(),
+                        annexb.len(),
+                    );
+                    data = annexb;
+                }
+            }
 
             let is_key = unsafe { (*self.packet).flags & ffi::AV_PKT_FLAG_KEY != 0 };
             let frame_type = if is_key {
@@ -1248,6 +1264,9 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 None
             } else if !ctx.extradata.is_null() && ctx.extradata_size > 0 {
                 let extra = std::slice::from_raw_parts(ctx.extradata, ctx.extradata_size as usize);
+                if let Some(length_size) = nal_length_size_from_extradata(extra, config.codec) {
+                    self.nal_length_size = length_size;
+                }
                 let annexb = parameter_sets_to_annexb(extra, config.codec);
                 if !annexb.is_empty() {
                     if config.codec == VideoCodec::H264 {
@@ -1409,6 +1428,45 @@ fn h265_hvcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
 fn starts_with_annexb(data: &[u8]) -> bool {
     (data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
         || (data.len() >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+}
+
+fn nal_length_size_from_extradata(extra: &[u8], codec: VideoCodec) -> Option<usize> {
+    if starts_with_annexb(extra) {
+        return None;
+    }
+    match codec {
+        VideoCodec::H264 if extra.len() >= 5 && extra[0] == 1 => Some(((extra[4] & 0x03) + 1) as usize),
+        VideoCodec::H265 if extra.len() >= 22 && extra[0] == 1 => Some(((extra[21] & 0x03) + 1) as usize),
+        _ => None,
+    }
+}
+
+fn length_prefixed_packet_to_annexb(data: &[u8], length_size: usize) -> Option<Vec<u8>> {
+    if !(1..=4).contains(&length_size) || data.len() <= length_size {
+        return None;
+    }
+
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(data.len() + 16);
+    while pos + length_size <= data.len() {
+        let mut len = 0usize;
+        for byte in &data[pos..pos + length_size] {
+            len = (len << 8) | (*byte as usize);
+        }
+        pos += length_size;
+        if len == 0 || pos + len > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+
+    if pos == data.len() && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn describe_h264_profile(annexb: &[u8]) -> String {
@@ -1621,6 +1679,24 @@ mod tests {
     fn av1_does_not_use_parameter_set_cache() {
         assert!(!codec_needs_parameter_sets(VideoCodec::AV1));
         assert!(parameter_sets_to_annexb(&[1, 2, 3], VideoCodec::AV1).is_empty());
+    }
+
+    #[test]
+    fn converts_length_prefixed_packets_to_annexb() {
+        let packet = [0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 3, 0x41, 0x9a, 0xbc];
+        let annexb = length_prefixed_packet_to_annexb(&packet, 4).unwrap();
+        assert_eq!(
+            annexb,
+            vec![0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x41, 0x9a, 0xbc]
+        );
+    }
+
+    #[test]
+    fn reads_nal_length_size_from_hvcc() {
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1;
+        hvcc[21] = 0xfc | 3;
+        assert_eq!(nal_length_size_from_extradata(&hvcc, VideoCodec::H265), Some(4));
     }
 }
 
