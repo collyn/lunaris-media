@@ -191,6 +191,13 @@ fn is_hw_encoder(hw_type: HwAccelType) -> bool {
     !matches!(hw_type, HwAccelType::Software)
 }
 
+fn software_av1_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 16)
+}
+
 // ---------------------------------------------------------------------------
 // FfmpegEncoder
 // ---------------------------------------------------------------------------
@@ -771,7 +778,10 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                         "libsvtav1" => {
                             // SVT-AV1 expects a numeric preset; 13 is the fastest.
                             opt_set("preset", "13");
-                            opt_set("svtav1-params", "lp=1");
+                            opt_set("la_depth", "0");
+                            opt_set("sc_detection", "0");
+                            let params = format!("lp={}:enable-tf=0", software_av1_threads());
+                            opt_set("svtav1-params", &params);
                         }
                         "libaom-av1" => {
                             opt_set("usage", "realtime");
@@ -978,7 +988,11 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             (*codec_ctx).width = config.width as libc::c_int;
             (*codec_ctx).height = config.height as libc::c_int;
             (*codec_ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-            (*codec_ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
+            (*codec_ctx).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                ffi::AVColorRange::AVCOL_RANGE_MPEG
+            } else {
+                ffi::AVColorRange::AVCOL_RANGE_JPEG
+            };
             (*codec_ctx).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
             (*codec_ctx).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             (*codec_ctx).time_base = ffi::AVRational {
@@ -991,11 +1005,22 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             };
             (*codec_ctx).gop_size = if config.keyframe_interval > 0 {
                 config.keyframe_interval as libc::c_int
+            } else if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                config.fps.max(1) as libc::c_int
             } else {
                 (config.fps * 5) as libc::c_int // 5 seconds GOP (allows dynamic keyframe insertion on HW encoders)
             };
+            (*codec_ctx).keyint_min = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                config.fps.max(1) as libc::c_int
+            } else {
+                0
+            };
             (*codec_ctx).max_b_frames = 0;
-            (*codec_ctx).thread_count = 1;
+            (*codec_ctx).thread_count = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                software_av1_threads() as libc::c_int
+            } else {
+                1
+            };
 
             if config.codec == VideoCodec::H264 {
                 (*codec_ctx).level = 31; // Match SDP profile-level-id=42001f (Level 3.1)
@@ -2310,6 +2335,18 @@ impl VideoEncoder for FfmpegEncoder {
                             if self.sws_ctx.is_null() {
                                 return Err(MediaError::EncodeError("Failed to create SwsContext for CUDA software fallback".into()));
                             }
+                            let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
+                            let table = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+                            ffi::sws_setColorspaceDetails(
+                                self.sws_ctx,
+                                inv_table,
+                                1, // RGB/BGRA source is full range.
+                                table,
+                                0,       // WebRTC decoders expect limited-range YUV by default.
+                                0,       // brightness
+                                1 << 16, // contrast
+                                1 << 16, // saturation
+                            );
                             log::info!(
                                 "Created CUDA software fallback SwsContext {:?}->{:?} {}x{}",
                                 src_pix_fmt,
@@ -2651,7 +2688,11 @@ impl VideoEncoder for FfmpegEncoder {
         unsafe {
             (*send_frame).pts = self.frame_count as i64;
             (*send_frame).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-            (*send_frame).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
+            (*send_frame).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                ffi::AVColorRange::AVCOL_RANGE_MPEG
+            } else {
+                ffi::AVColorRange::AVCOL_RANGE_JPEG
+            };
             (*send_frame).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
             (*send_frame).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         }
@@ -2722,11 +2763,24 @@ impl VideoEncoder for FfmpegEncoder {
         unsafe {
             let bitrate = (bitrate_kbps as i64) * 1000;
             (*self.codec_ctx).bit_rate = bitrate;
-            (*self.codec_ctx).rc_max_rate = bitrate;
+            let is_svt_av1 = self
+                .info
+                .as_ref()
+                .map(|info| info.name == "libsvtav1")
+                .unwrap_or(false);
+            (*self.codec_ctx).rc_max_rate = if is_svt_av1 {
+                bitrate.saturating_mul(2)
+            } else {
+                bitrate
+            };
             // Use 1 second of video data as buffer size (same as initial encoder setup).
             // The old formula `(bitrate * 2) / fps` was far too small and caused
             // NVENC to produce corrupted output after bitrate changes.
-            (*self.codec_ctx).rc_buffer_size = bitrate as libc::c_int;
+            (*self.codec_ctx).rc_buffer_size = if is_svt_av1 {
+                bitrate.saturating_mul(2).min(libc::c_int::MAX as i64) as libc::c_int
+            } else {
+                bitrate.min(libc::c_int::MAX as i64) as libc::c_int
+            };
         }
 
         if let Some(config) = &mut self.config {
