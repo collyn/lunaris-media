@@ -969,6 +969,12 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             (*codec_ctx).bit_rate = bitrate;
             (*codec_ctx).rc_max_rate = bitrate;
             (*codec_ctx).rc_buffer_size = ((bitrate * 2) / config.fps as i64) as libc::c_int;
+            if config.codec == VideoCodec::AV1 && encoder_name == "libsvtav1" {
+                (*codec_ctx).rc_max_rate = bitrate.saturating_mul(2);
+                (*codec_ctx).rc_buffer_size = bitrate
+                    .saturating_mul(2)
+                    .min(libc::c_int::MAX as i64) as libc::c_int;
+            }
             (*codec_ctx).width = config.width as libc::c_int;
             (*codec_ctx).height = config.height as libc::c_int;
             (*codec_ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
