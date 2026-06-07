@@ -9,16 +9,11 @@
 //! cargo run --example capture_encode
 //! ```
 //!
-//! To write the raw H.264 bitstream to a file:
+//! To write a raw bitstream to a file and choose a codec/backend:
 //!
 //! ```bash
-//! cargo run --example capture_encode -- --output capture.h264
-//! ```
-//!
-//! The resulting file can be played with:
-//!
-//! ```bash
-//! ffplay capture.h264
+//! cargo run --example capture_encode -- --codec h265 --encoder hevc_vaapi --output capture.h265
+//! cargo run --example capture_encode -- --codec av1 --output capture.obu
 //! ```
 
 use std::io::Write;
@@ -27,8 +22,7 @@ use std::time::{Duration, Instant};
 use lunaris_media::pipeline::{MediaEvent, MediaPipeline, PipelineCommand};
 use lunaris_media::types::{FrameType, PixelFormat, StreamConfig, VideoCodec};
 
-/// How long to capture for.
-const CAPTURE_DURATION: Duration = Duration::from_secs(5);
+const DEFAULT_CAPTURE_SECONDS: u64 = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,20 +30,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Parse simple CLI args ───────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    let output_path = args
-        .windows(2)
-        .find(|w| w[0] == "--output")
-        .map(|w| w[1].clone());
+    let codec = arg_value(&args, "--codec")
+        .map(|value| parse_codec(&value))
+        .transpose()?
+        .unwrap_or(VideoCodec::H264);
+    let fps = parse_u32_arg(&args, "--fps", 60)?;
+    let bitrate_kbps = parse_u32_arg(&args, "--bitrate", 10_000)?;
+    let duration =
+        Duration::from_secs(parse_u64_arg(&args, "--duration", DEFAULT_CAPTURE_SECONDS)?);
+    let output_path = arg_value(&args, "--output");
+    let preferred_encoder = arg_value(&args, "--encoder");
 
     // ── Configure the pipeline ──────────────────────────────────────
     let config = StreamConfig {
         width: 1920,
         height: 1080,
-        fps: 60,
-        codec: VideoCodec::H264,
-        bitrate_kbps: 10_000,
+        fps,
+        codec,
+        bitrate_kbps,
         pixel_format: PixelFormat::NV12,
-        preferred_encoder: None,
+        preferred_encoder,
         virtual_display: false,
     };
 
@@ -60,11 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  FPS:         {:<36}║", config.fps);
     println!("║  Codec:       {:<36}║", config.codec);
     println!("║  Bitrate:     {} kbps{:<25}║", config.bitrate_kbps, "");
-    println!(
-        "║  Duration:    {} seconds{:<24}║",
-        CAPTURE_DURATION.as_secs(),
-        ""
-    );
+    println!("║  Duration:    {} seconds{:<24}║", duration.as_secs(), "");
     if let Some(ref path) = output_path {
         println!("║  Output:      {:<36}║", path);
     }
@@ -96,10 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
 
-    // ── Schedule stop after CAPTURE_DURATION ────────────────────────
+    // ── Schedule stop after duration ────────────────────────
     let stop_commands = commands.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(CAPTURE_DURATION).await;
+        tokio::time::sleep(duration).await;
         log::info!("Capture duration elapsed — sending Stop command");
         let _ = stop_commands.send(PipelineCommand::Stop).await;
     });
@@ -156,10 +152,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::warn!("Pipeline error: {e}");
             }
 
+            MediaEvent::EncoderStarted {
+                encoder,
+                gpu_name,
+                requested_encoder,
+            } => {
+                log::info!(
+                    "Encoder active: {} ({}) on {} requested={}",
+                    encoder.name,
+                    encoder.hw_type,
+                    gpu_name.as_deref().unwrap_or("unknown GPU"),
+                    requested_encoder.as_deref().unwrap_or("auto"),
+                );
+            }
+
             MediaEvent::Started => {
                 println!(
                     "✓ Pipeline started — capturing for {} seconds...",
-                    CAPTURE_DURATION.as_secs()
+                    duration.as_secs()
                 );
             }
 
@@ -231,6 +241,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Format a byte count in a human-readable way.
+fn arg_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+fn parse_codec(value: &str) -> Result<VideoCodec, Box<dyn std::error::Error>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "h264" | "h.264" | "avc" => Ok(VideoCodec::H264),
+        "h265" | "h.265" | "hevc" => Ok(VideoCodec::H265),
+        "av1" => Ok(VideoCodec::AV1),
+        other => Err(format!("unsupported codec '{other}' (expected h264, h265, or av1)").into()),
+    }
+}
+
+fn parse_u32_arg(
+    args: &[String],
+    name: &str,
+    default: u32,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    arg_value(args, name)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|e| format!("invalid value for {name}: {value} ({e})").into())
+        })
+        .unwrap_or(Ok(default))
+}
+
+fn parse_u64_arg(
+    args: &[String],
+    name: &str,
+    default: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    arg_value(args, name)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|e| format!("invalid value for {name}: {value} ({e})").into())
+        })
+        .unwrap_or(Ok(default))
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")

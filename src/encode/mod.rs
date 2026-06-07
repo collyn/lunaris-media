@@ -155,6 +155,9 @@ impl WindowsAutoEncoder {
         if config.force_ffmpeg {
             return false;
         }
+        if config.codec != VideoCodec::H264 {
+            return false;
+        }
         match config.preferred_hw {
             Some(HwAccelType::Amf) => true,
             Some(_) => false,

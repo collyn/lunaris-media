@@ -226,7 +226,7 @@ pub struct FfmpegEncoder {
     info: Option<EncoderInfo>,
     /// Whether the encoder has been initialized.
     initialized: bool,
-    /// Cached SPS/PPS extradata in Annex-B format, extracted from codec_ctx after init.
+    /// Cached H.264 SPS/PPS or H.265 VPS/SPS/PPS in Annex-B format.
     /// Prepended to every IDR keyframe to guarantee the browser has codec parameters,
     /// regardless of whether the encoder supports the `repeat-headers` option.
     sps_pps_cache: Option<Vec<u8>>,
@@ -828,7 +828,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             // 1. The `repeat-headers` AVOption fails silently for some encoders (AMF on Windows).
             // 2. Without inline SPS/PPS, the browser's H264 decoder fails on every IDR
             //    and continuously sends PLI requests, preventing video from displaying.
-            let final_data = if is_key && prepend_headers {
+            let final_data = if is_key && prepend_headers && codec_needs_parameter_sets(codec) {
                 // Diagnostic: log first 16 bytes of raw encoder output to confirm Annex-B vs AVCC.
                 // Annex-B: starts with 00 00 00 01 or 00 00 01 (start code)
                 // AVCC: starts with 4-byte big-endian NAL length
@@ -1239,57 +1239,42 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
         }
 
-        // Extract SPS/PPS extradata from the codec context and cache it in Annex-B format.
-        // Prepended to every IDR keyframe so the browser always has codec parameters,
-        // regardless of whether the encoder supports `repeat-headers` (AMF does not).
+        // Extract codec parameter sets from extradata and cache them in Annex-B format.
+        // H.264/H.265 need these near IDR frames for WebRTC decoder recovery. AV1
+        // carries sequence headers as OBUs and must not use NAL/SPS/PPS handling.
         self.sps_pps_cache = unsafe {
             let ctx = &*codec_ctx;
-            if !ctx.extradata.is_null() && ctx.extradata_size > 0 {
+            if !codec_needs_parameter_sets(config.codec) {
+                None
+            } else if !ctx.extradata.is_null() && ctx.extradata_size > 0 {
                 let extra = std::slice::from_raw_parts(ctx.extradata, ctx.extradata_size as usize);
-                let annexb = avcc_extradata_to_annexb(extra);
+                let annexb = parameter_sets_to_annexb(extra, config.codec);
                 if !annexb.is_empty() {
-                    // Log the actual H264 profile from the SPS for verification.
-                    // SPS Annex-B layout: [00 00 00 01] [NAL_header=0x67] [profile_idc] [constraint_flags] [level_idc]
-                    // Bytes 4,5,6,7 (0-indexed) = start_code(4) + NAL_header(1) + profile_idc + constraints + level
-                    let profile_desc = if annexb.len() >= 8 {
-                        let profile_idc = annexb[5];
-                        let constraints = annexb[6];
-                        let level_idc = annexb[7];
-                        let profile_name = match profile_idc {
-                            66 if constraints & 0xE0 == 0xE0 => "Constrained Baseline (CBP)",
-                            66 => "Baseline",
-                            77 => "Main",
-                            88 => "Extended",
-                            100 if constraints & 0x0C == 0x0C => "Constrained High",
-                            100 => "High",
-                            110 => "High 10",
-                            122 => "High 4:2:2",
-                            244 => "High 4:4:4",
-                            _ => "Unknown",
-                        };
-                        format!(
-                            "{} (profile_idc={}, constraints=0x{:02x}, level={}.{})",
-                            profile_name,
-                            profile_idc,
-                            constraints,
-                            level_idc / 10,
-                            level_idc % 10,
-                        )
+                    if config.codec == VideoCodec::H264 {
+                        log::info!(
+                            "Cached H.264 SPS/PPS extradata: {} bytes (Annex-B). {}",
+                            annexb.len(),
+                            describe_h264_profile(&annexb),
+                        );
                     } else {
-                        "Unknown (SPS too short)".to_string()
-                    };
-                    log::info!(
-                        "Cached SPS/PPS extradata: {} bytes (Annex-B). Actual H264 profile: {}",
-                        annexb.len(),
-                        profile_desc,
-                    );
+                        log::info!(
+                            "Cached H.265 VPS/SPS/PPS extradata: {} bytes (Annex-B)",
+                            annexb.len(),
+                        );
+                    }
                     Some(annexb)
                 } else {
-                    log::warn!("extradata present but AVCC→Annex-B conversion produced empty output");
+                    log::warn!(
+                        "{} extradata present but parameter-set conversion produced empty output",
+                        config.codec,
+                    );
                     None
                 }
             } else {
-                log::warn!("No extradata in codec context after init; IDR frames may lack SPS/PPS");
+                log::warn!(
+                    "No {} extradata in codec context after init; IDR frames may lack parameter sets",
+                    config.codec,
+                );
                 None
             }
         };
@@ -1307,48 +1292,44 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
     }
 }
 
-/// Normalize encoder extradata to Annex-B format for prepending to IDR keyframes.
-///
-/// Handles two common extradata formats from FFmpeg encoders:
-///
-/// **Annex-B format** (AMF, some software encoders): starts with `00 00 00 01` or `00 00 01`.
-///   Used directly as-is — already the correct format.
-///
-/// **AVCC format** (NVENC, most encoders): starts with configurationVersion byte `0x01`,
-///   followed by length-prefixed SPS/PPS NAL units. Converted to Annex-B by replacing
-///   length prefixes with `00 00 00 01` start codes.
-fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
+/// Normalize encoder extradata to Annex-B parameter sets for prepending to IDR keyframes.
+fn parameter_sets_to_annexb(extra: &[u8], codec: VideoCodec) -> Vec<u8> {
+    match codec {
+        VideoCodec::H264 => h264_avcc_extradata_to_annexb(extra),
+        VideoCodec::H265 => h265_hvcc_extradata_to_annexb(extra),
+        VideoCodec::AV1 => Vec::new(),
+    }
+}
+
+fn codec_needs_parameter_sets(codec: VideoCodec) -> bool {
+    matches!(codec, VideoCodec::H264 | VideoCodec::H265)
+}
+
+/// Handles two common H.264 extradata formats from FFmpeg encoders:
+/// Annex-B and AVCC. AVCC is converted by replacing length prefixes with
+/// `00 00 00 01` start codes.
+fn h264_avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
     if extra.is_empty() {
         return Vec::new();
     }
 
-    // Detect Annex-B format: starts with 4-byte start code 00 00 00 01
-    if extra.len() >= 4 && extra[0] == 0 && extra[1] == 0 && extra[2] == 0 && extra[3] == 1 {
-        log::debug!("Extradata is already in Annex-B format (4-byte start code), using directly");
-        return extra.to_vec();
+    if starts_with_annexb(extra) {
+        log::debug!("H.264 extradata is already Annex-B, using SPS/PPS directly");
+        return extract_sps_pps(extra, VideoCodec::H264);
     }
 
-    // Detect Annex-B with 3-byte start code 00 00 01
-    if extra.len() >= 3 && extra[0] == 0 && extra[1] == 0 && extra[2] == 1 {
-        log::debug!("Extradata is already in Annex-B format (3-byte start code), using directly");
-        return extra.to_vec();
-    }
-
-    // Try AVCC format: configurationVersion must be 1, minimum 7 bytes
     if extra.len() < 7 || extra[0] != 1 {
         log::warn!(
-            "Extradata is neither Annex-B nor valid AVCC (first bytes: {:02x?}); cannot extract SPS/PPS",
+            "H.264 extradata is neither Annex-B nor valid AVCC (first bytes: {:02x?})",
             &extra[..extra.len().min(8)]
         );
         return Vec::new();
     }
 
-    // Parse AVCC and convert each NAL unit to Annex-B
     let mut out = Vec::new();
     let annexb_start_code = &[0u8, 0, 0, 1];
-    let mut pos = 5; // skip version, profile, compat, level, lengthSizeMinusOne
+    let mut pos = 5;
 
-    // SPS NAL units
     if pos >= extra.len() { return out; }
     let num_sps = (extra[pos] & 0x1F) as usize;
     pos += 1;
@@ -1362,9 +1343,8 @@ fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
         pos += len;
     }
 
-    // PPS NAL units
     if pos >= extra.len() { return out; }
-    let num_pps = (extra[pos] & 0xFF) as usize;
+    let num_pps = extra[pos] as usize;
     pos += 1;
     for _ in 0..num_pps {
         if pos + 2 > extra.len() { break; }
@@ -1377,6 +1357,87 @@ fn avcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
     }
 
     out
+}
+
+/// Convert HEVCDecoderConfigurationRecord (`hvcC`) to Annex-B VPS/SPS/PPS.
+fn h265_hvcc_extradata_to_annexb(extra: &[u8]) -> Vec<u8> {
+    if extra.is_empty() {
+        return Vec::new();
+    }
+
+    if starts_with_annexb(extra) {
+        log::debug!("H.265 extradata is already Annex-B, extracting VPS/SPS/PPS");
+        return extract_sps_pps(extra, VideoCodec::H265);
+    }
+
+    if extra.len() < 23 || extra[0] != 1 {
+        log::warn!(
+            "H.265 extradata is neither Annex-B nor valid hvcC (first bytes: {:02x?})",
+            &extra[..extra.len().min(8)]
+        );
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let annexb_start_code = &[0u8, 0, 0, 1];
+    let num_arrays = extra[22] as usize;
+    let mut pos = 23;
+
+    for _ in 0..num_arrays {
+        if pos + 3 > extra.len() { break; }
+        let nal_unit_type = extra[pos] & 0x3F;
+        pos += 1;
+        let num_nalus = u16::from_be_bytes([extra[pos], extra[pos + 1]]) as usize;
+        pos += 2;
+
+        for _ in 0..num_nalus {
+            if pos + 2 > extra.len() { break; }
+            let len = u16::from_be_bytes([extra[pos], extra[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > extra.len() { break; }
+            if matches!(nal_unit_type, 32 | 33 | 34) {
+                out.extend_from_slice(annexb_start_code);
+                out.extend_from_slice(&extra[pos..pos + len]);
+            }
+            pos += len;
+        }
+    }
+
+    out
+}
+
+fn starts_with_annexb(data: &[u8]) -> bool {
+    (data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        || (data.len() >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+}
+
+fn describe_h264_profile(annexb: &[u8]) -> String {
+    if annexb.len() < 8 {
+        return "Actual H264 profile: Unknown (SPS too short)".to_string();
+    }
+    let profile_idc = annexb[5];
+    let constraints = annexb[6];
+    let level_idc = annexb[7];
+    let profile_name = match profile_idc {
+        66 if constraints & 0xE0 == 0xE0 => "Constrained Baseline (CBP)",
+        66 => "Baseline",
+        77 => "Main",
+        88 => "Extended",
+        100 if constraints & 0x0C == 0x0C => "Constrained High",
+        100 => "High",
+        110 => "High 10",
+        122 => "High 4:2:2",
+        244 => "High 4:4:4",
+        _ => "Unknown",
+    };
+    format!(
+        "Actual H264 profile: {} (profile_idc={}, constraints=0x{:02x}, level={}.{})",
+        profile_name,
+        profile_idc,
+        constraints,
+        level_idc / 10,
+        level_idc % 10,
+    )
 }
 
 /// Find the byte offset in an Annex-B stream where the first actual coded slice NAL unit starts.
@@ -1518,6 +1579,49 @@ fn extract_sps_pps(data: &[u8], codec: VideoCodec) -> Vec<u8> {
         }
     }
     extracted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_h264_avcc_extradata_to_annexb() {
+        let avcc = [
+            1, 66, 0, 31, 0xff, 0xe1, 0, 3, 0x67, 0x42, 0x1f, 1, 0, 2, 0x68, 0xce,
+        ];
+        let annexb = parameter_sets_to_annexb(&avcc, VideoCodec::H264);
+        assert_eq!(
+            annexb,
+            vec![0, 0, 0, 1, 0x67, 0x42, 0x1f, 0, 0, 0, 1, 0x68, 0xce]
+        );
+    }
+
+    #[test]
+    fn converts_h265_hvcc_extradata_to_annexb_parameter_sets() {
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1;
+        hvcc[21] = 0xfc | 3;
+        hvcc[22] = 3;
+        hvcc.extend_from_slice(&[0x80 | 32, 0, 1, 0, 2, 0x40, 0x01]);
+        hvcc.extend_from_slice(&[0x80 | 33, 0, 1, 0, 2, 0x42, 0x01]);
+        hvcc.extend_from_slice(&[0x80 | 34, 0, 1, 0, 2, 0x44, 0x01]);
+
+        let annexb = parameter_sets_to_annexb(&hvcc, VideoCodec::H265);
+        assert_eq!(
+            annexb,
+            vec![
+                0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x42, 0x01, 0, 0, 0, 1, 0x44,
+                0x01,
+            ]
+        );
+    }
+
+    #[test]
+    fn av1_does_not_use_parameter_set_cache() {
+        assert!(!codec_needs_parameter_sets(VideoCodec::AV1));
+        assert!(parameter_sets_to_annexb(&[1, 2, 3], VideoCodec::AV1).is_empty());
+    }
 }
 
 impl VideoEncoder for FfmpegEncoder {
