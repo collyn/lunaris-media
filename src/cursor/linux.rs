@@ -16,7 +16,9 @@
 //! Proper cursor tracking via X11/XFixes or PipeWire metadata will be added
 //! in a future phase.
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 use std::ptr;
 
 use crate::cursor::CursorCapture;
@@ -41,7 +43,9 @@ pub struct LinuxCursorCapture {
     /// Open X11 display for pointer and cursor image queries.
     x11_display: Option<*mut xlib::Display>,
     /// Last XFixes cursor shape key sent to consumers.
-    last_cursor_shape: Option<(u64, Option<String>)>,
+    last_cursor_shape: Option<CursorShapeKey>,
+    /// Emit sparse cursor shape diagnostics when `LUNARIS_CURSOR_DEBUG=1`.
+    debug_cursor_shapes: bool,
     /// Whether cursor tracking is currently active.
     active: bool,
 }
@@ -64,6 +68,7 @@ impl LinuxCursorCapture {
             },
             x11_display: None,
             last_cursor_shape: None,
+            debug_cursor_shapes: std::env::var_os("LUNARIS_CURSOR_DEBUG").is_some(),
             active: false,
         })
     }
@@ -140,17 +145,26 @@ impl LinuxCursorCapture {
             self.last_state.kind = kind;
         }
         let serial = image.cursor_serial as u64;
-        let shape_key = (serial, cursor_name.clone());
         let width = image.width as u32;
         let height = image.height as u32;
         let pixels_len = width.checked_mul(height)? as usize;
 
-        let cursor_image = if width > 0
-            && height > 0
-            && !image.pixels.is_null()
-            && self.last_cursor_shape.as_ref() != Some(&shape_key)
-        {
+        let cursor_image = if width > 0 && height > 0 && !image.pixels.is_null() {
             let pixels = unsafe { std::slice::from_raw_parts(image.pixels, pixels_len) };
+            let shape_key = CursorShapeKey::from_xfixes_image(
+                cursor_name.clone(),
+                width,
+                height,
+                image.xhot as u32,
+                image.yhot as u32,
+                pixels,
+            );
+            if self.last_cursor_shape.as_ref() == Some(&shape_key) {
+                unsafe {
+                    xlib::XFree(image_ptr.cast());
+                }
+                return None;
+            }
             let mut rgba = Vec::with_capacity(pixels_len * 4);
             for &pixel in pixels {
                 let argb = pixel as u32;
@@ -161,7 +175,20 @@ impl LinuxCursorCapture {
                     ((argb >> 24) & 0xff) as u8,
                 ]);
             }
-            self.last_cursor_shape = Some(shape_key);
+            self.last_cursor_shape = Some(shape_key.clone());
+            if self.debug_cursor_shapes {
+                log::info!(
+                    "Linux XFixes cursor shape changed: name={} kind={} serial={} size={}x{} hotspot={},{} hash={:016x}",
+                    cursor_name.as_deref().unwrap_or("<unnamed>"),
+                    self.last_state.kind.as_str(),
+                    serial,
+                    width,
+                    height,
+                    image.xhot,
+                    image.yhot,
+                    shape_key.pixel_hash
+                );
+            }
             Some(CursorImage {
                 width,
                 height,
@@ -192,6 +219,46 @@ impl LinuxCursorCapture {
         // metadata (position, visibility, RGBA bitmap) can be extracted
         // from the `SPA_META_Cursor` metadata attached to each buffer.
         None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorShapeKey {
+    name: Option<String>,
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    pixel_hash: u64,
+}
+
+impl CursorShapeKey {
+    fn from_xfixes_image(
+        name: Option<String>,
+        width: u32,
+        height: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+        pixels: &[libc::c_ulong],
+    ) -> Self {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        hotspot_x.hash(&mut hasher);
+        hotspot_y.hash(&mut hasher);
+        for &pixel in pixels {
+            (pixel as u64).hash(&mut hasher);
+        }
+
+        Self {
+            name,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            pixel_hash: hasher.finish(),
+        }
     }
 }
 
