@@ -68,6 +68,7 @@ use crate::types::*;
 #[cfg(target_os = "linux")]
 struct CudaCopier {
     cu_memcpy_dtod: unsafe extern "C" fn(u64, u64, usize) -> i32,
+    cu_memcpy_dtoh: unsafe extern "C" fn(*mut libc::c_void, u64, usize) -> i32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut libc::c_void) -> i32,
     cu_ctx_get_current: unsafe extern "C" fn(*mut *mut libc::c_void) -> i32,
     _lib: *mut libc::c_void,
@@ -120,16 +121,18 @@ fn get_cuda_copier() -> Option<&'static CudaCopier> {
                 return None;
             }
             let sym_memcpy = libc::dlsym(lib, b"cuMemcpyDtoD_v2\0".as_ptr() as *const libc::c_char);
+            let sym_memcpy_dtoh = libc::dlsym(lib, b"cuMemcpyDtoH_v2\0".as_ptr() as *const libc::c_char);
             let sym_set_cur =
                 libc::dlsym(lib, b"cuCtxSetCurrent\0".as_ptr() as *const libc::c_char);
             let sym_get_cur =
                 libc::dlsym(lib, b"cuCtxGetCurrent\0".as_ptr() as *const libc::c_char);
-            if sym_memcpy.is_null() || sym_set_cur.is_null() || sym_get_cur.is_null() {
+            if sym_memcpy.is_null() || sym_memcpy_dtoh.is_null() || sym_set_cur.is_null() || sym_get_cur.is_null() {
                 libc::dlclose(lib);
                 return None;
             }
             Some(CudaCopier {
                 cu_memcpy_dtod: std::mem::transmute(sym_memcpy),
+                cu_memcpy_dtoh: std::mem::transmute(sym_memcpy_dtoh),
                 cu_ctx_set_current: std::mem::transmute(sym_set_cur),
                 cu_ctx_get_current: std::mem::transmute(sym_get_cur),
                 _lib: lib,
@@ -2203,7 +2206,96 @@ impl VideoEncoder for FfmpegEncoder {
                 let src_stride = *stride as usize;
                 let h = *height as usize;
 
-                unsafe {
+                if !use_hw {
+                    unsafe {
+                        let sw_format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+                        let ret = ffi::av_frame_make_writable(self.sw_frame);
+                        if ret < 0 {
+                            ffi::av_frame_unref(self.sw_frame);
+                            (*self.sw_frame).width = *width as libc::c_int;
+                            (*self.sw_frame).height = *height as libc::c_int;
+                            (*self.sw_frame).format = sw_format as libc::c_int;
+                            let ret = ffi::av_frame_get_buffer(self.sw_frame, 32);
+                            if ret < 0 {
+                                return Err(ff_err(ret));
+                            }
+                        }
+
+                        let host_len = match format {
+                            PixelFormat::BGRA => src_stride * h,
+                            PixelFormat::NV12 => src_stride * h + src_stride * (h / 2),
+                            PixelFormat::P010 => {
+                                return Err(MediaError::EncodeError("P010 CUDA software fallback not supported".into()));
+                            }
+                        };
+                        let mut host_data = vec![0u8; host_len];
+                        let res = (copier.cu_memcpy_dtoh)(
+                            host_data.as_mut_ptr() as *mut libc::c_void,
+                            src_y,
+                            host_len,
+                        );
+                        if res != 0 {
+                            return Err(MediaError::EncodeError(format!(
+                                "cuMemcpyDtoH CUDA software fallback failed: {}",
+                                res
+                            )));
+                        }
+
+                        let (src_pix_fmt, src_data, src_linesize): (ffi::AVPixelFormat, [*const u8; 4], [libc::c_int; 4]) = match format {
+                            PixelFormat::BGRA => (
+                                ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                                [host_data.as_ptr(), ptr::null(), ptr::null(), ptr::null()],
+                                [src_stride as libc::c_int, 0, 0, 0],
+                            ),
+                            PixelFormat::NV12 => (
+                                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                                [host_data.as_ptr(), host_data.as_ptr().add(src_stride * h), ptr::null(), ptr::null()],
+                                [src_stride as libc::c_int, src_stride as libc::c_int, 0, 0],
+                            ),
+                            PixelFormat::P010 => unreachable!(),
+                        };
+
+                        if self.sws_ctx.is_null() {
+                            self.sws_ctx = ffi::sws_getContext(
+                                *width as libc::c_int,
+                                *height as libc::c_int,
+                                src_pix_fmt,
+                                *width as libc::c_int,
+                                *height as libc::c_int,
+                                sw_format,
+                                SWS_FAST_BILINEAR,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                                ptr::null(),
+                            );
+                            if self.sws_ctx.is_null() {
+                                return Err(MediaError::EncodeError("Failed to create SwsContext for CUDA software fallback".into()));
+                            }
+                            log::info!(
+                                "Created CUDA software fallback SwsContext {:?}->{:?} {}x{}",
+                                src_pix_fmt,
+                                sw_format,
+                                width,
+                                height
+                            );
+                        }
+
+                        ffi::sws_scale(
+                            self.sws_ctx,
+                            src_data.as_ptr(),
+                            src_linesize.as_ptr(),
+                            0,
+                            *height as libc::c_int,
+                            (*self.sw_frame).data.as_ptr() as *const *mut u8,
+                            (*self.sw_frame).linesize.as_ptr(),
+                        );
+                        (*self.sw_frame).width = *width as libc::c_int;
+                        (*self.sw_frame).height = *height as libc::c_int;
+                    }
+
+                    self.sw_frame
+                } else {
+                    unsafe {
                     // Extract FFmpeg's CUDA context
                     if self.hw_device_ctx.is_null() {
                         return Err(MediaError::EncodeError("hw_device_ctx is null".into()));
@@ -2325,8 +2417,9 @@ impl VideoEncoder for FfmpegEncoder {
                             }
                         }
                     }
+                    }
+                    self.frame
                 }
-                self.frame
             }
 
             GpuBuffer::CpuBuffer {
