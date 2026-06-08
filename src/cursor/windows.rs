@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub struct WindowsCursorCapture {
     active: bool,
     last_image_hash: Option<u64>,
+    logged_image_failure: bool,
 }
 
 impl WindowsCursorCapture {
@@ -31,6 +32,7 @@ impl WindowsCursorCapture {
         Ok(Self {
             active: false,
             last_image_hash: None,
+            logged_image_failure: false,
         })
     }
 }
@@ -457,12 +459,37 @@ impl CursorCapture for WindowsCursorCapture {
         let kind = cursor_kind_from_handle(cursor_info.hCursor);
         let mut image = None;
         if visible {
-            if let Some(cursor_image) = cursor_image_from_handle(cursor_info.hCursor) {
-                let hash = cursor_image_hash(&cursor_image);
-                if self.last_image_hash != Some(hash) {
-                    self.last_image_hash = Some(hash);
-                    image = Some(cursor_image);
+            match cursor_image_from_handle(cursor_info.hCursor) {
+                Some(cursor_image) => {
+                    let hash = cursor_image_hash(&cursor_image);
+                    if self.last_image_hash != Some(hash) {
+                        let visible_pixels = cursor_image
+                            .rgba_data
+                            .chunks_exact(4)
+                            .filter(|px| px[3] != 0)
+                            .count();
+                        log::info!(
+                            "Windows cursor native image changed: kind={} size={}x{} hotspot={},{} visible_pixels={} bytes={}",
+                            kind.as_str(),
+                            cursor_image.width,
+                            cursor_image.height,
+                            cursor_image.hotspot_x,
+                            cursor_image.hotspot_y,
+                            visible_pixels,
+                            cursor_image.rgba_data.len()
+                        );
+                        self.last_image_hash = Some(hash);
+                        image = Some(cursor_image);
+                    }
+                    self.logged_image_failure = false;
                 }
+                None if !self.logged_image_failure => {
+                    self.logged_image_failure = true;
+                    log::warn!(
+                        "Windows cursor capture could not extract native cursor image; sending kind-only cursor updates"
+                    );
+                }
+                None => {}
             }
         }
 
