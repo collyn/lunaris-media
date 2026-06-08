@@ -112,6 +112,39 @@ fn bitmap_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     rgba
 }
 
+fn bitmap_bgra_to_rgba_with_mask(
+    bgra: &[u8],
+    mask_bgra: Option<&[u8]>,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut rgba = bitmap_bgra_to_rgba(bgra);
+    if rgba.chunks_exact(4).any(|px| px[3] != 0) {
+        return rgba;
+    }
+
+    // Some Win32 color cursor bitmaps carry RGB in hbmColor but leave alpha at 0;
+    // hbmMask's AND plane then defines visibility: 0 = opaque, 1 = transparent.
+    if let Some(mask) = mask_bgra {
+        let pixels = (width * height) as usize;
+        if mask.len() >= pixels * 4 {
+            for i in 0..pixels {
+                let and_value = mask[i * 4];
+                rgba[i * 4 + 3] = if and_value == 0 { 255 } else { 0 };
+            }
+            return rgba;
+        }
+    }
+
+    // Avoid sending a fully transparent native cursor if the platform omits hbmMask.
+    for px in rgba.chunks_exact_mut(4) {
+        if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+            px[3] = 255;
+        }
+    }
+    rgba
+}
+
 fn mask_bitmap_to_rgba(mask_bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
     let cursor_height = height / 2;
     let row_len = (width * 4) as usize;
@@ -154,12 +187,19 @@ fn cursor_image_from_handle(handle: HCURSOR) -> Option<CursorImage> {
     }
 
     let image = if !icon_info.hbmColor.is_invalid() {
-        read_bitmap_bgra(icon_info.hbmColor).map(|(width, height, bgra)| CursorImage {
-            width,
-            height,
-            hotspot_x: icon_info.xHotspot,
-            hotspot_y: icon_info.yHotspot,
-            rgba_data: bitmap_bgra_to_rgba(&bgra),
+        read_bitmap_bgra(icon_info.hbmColor).map(|(width, height, bgra)| {
+            let mask = if !icon_info.hbmMask.is_invalid() {
+                read_bitmap_bgra(icon_info.hbmMask).map(|(_, _, mask_bgra)| mask_bgra)
+            } else {
+                None
+            };
+            CursorImage {
+                width,
+                height,
+                hotspot_x: icon_info.xHotspot,
+                hotspot_y: icon_info.yHotspot,
+                rgba_data: bitmap_bgra_to_rgba_with_mask(&bgra, mask.as_deref(), width, height),
+            }
         })
     } else {
         read_bitmap_bgra(icon_info.hbmMask).and_then(|(width, height, bgra)| {
