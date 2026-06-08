@@ -15,10 +15,9 @@ opus = "0.3"
 cpal = "0.15"
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
 # FFmpeg raw FFI for hardware contexts
 ffmpeg-next = "8"
-
-[target.'cfg(target_os = "linux")'.dependencies]
 pipewire = "0.8"
 ashpd = { version = "0.9", default-features = false, features = ["tokio", "pipewire"] }
 enumflags2 = "0.7"
@@ -45,6 +44,8 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# FFmpeg raw FFI for hardware contexts
+ffmpeg-next = "8"
 screencapturekit = "0.3"
 
 [dev-dependencies]

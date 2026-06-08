@@ -9,7 +9,7 @@
 //! platform, or [`list_available_encoders`] to enumerate all detected hardware
 //! encoders.
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ffmpeg;
 #[cfg(target_os = "windows")]
 pub mod windows_amf;
@@ -113,7 +113,6 @@ pub trait VideoEncoder: Send {
 enum WindowsEncoderBackend {
     NativeNvenc(windows_nvenc::WindowsNvencEncoder),
     NativeAmf(windows_amf::WindowsAmfEncoder),
-    Ffmpeg(ffmpeg::FfmpegEncoder),
 }
 
 #[cfg(target_os = "windows")]
@@ -151,20 +150,6 @@ impl WindowsAutoEncoder {
         config.d3d11_device.is_some() && config.d3d11_context.is_some()
     }
 
-    fn requires_native_amf(config: &EncoderConfig) -> bool {
-        if config.force_ffmpeg {
-            return false;
-        }
-        if config.codec != VideoCodec::H264 {
-            return false;
-        }
-        match config.preferred_hw {
-            Some(HwAccelType::Amf) => true,
-            Some(_) => false,
-            None => Self::detected_d3d11_hw(config).map_or(false, |hw| hw == HwAccelType::Amf),
-        }
-    }
-
     fn supports_native_d3d11_h264(config: &EncoderConfig) -> bool {
         config.codec == VideoCodec::H264 && Self::has_d3d11_pair(config)
     }
@@ -198,9 +183,16 @@ impl WindowsAutoEncoder {
 impl VideoEncoder for WindowsAutoEncoder {
     fn initialize(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
         if config.force_ffmpeg {
-            log::info!(
-                "FFmpeg encoder backend explicitly requested; skipping native Windows encoders"
-            );
+            return Err(MediaError::EncoderInitFailed(
+                "FFmpeg backend is not compiled on Windows; select native_nvenc_d3d11, native_amf_d3d11, gpu, or auto".into(),
+            ));
+        }
+
+        if config.codec != VideoCodec::H264 {
+            return Err(MediaError::EncoderInitFailed(format!(
+                "Native Windows encoder currently supports H.264 only; requested {}",
+                config.codec
+            )));
         }
 
         if Self::should_try_native_nvenc(config) {
@@ -214,18 +206,9 @@ impl VideoEncoder for WindowsAutoEncoder {
                     return Ok(());
                 }
                 Err(err) => {
-                    log::warn!(
-                        "Native Windows NVENC initialization failed: {}. Falling back to FFmpeg.",
-                        err
-                    );
+                    log::warn!("Native Windows NVENC initialization failed: {}", err);
                 }
             }
-        }
-
-        if Self::requires_native_amf(config) && !Self::should_try_native_amf(config) {
-            return Err(MediaError::EncoderInitFailed(
-                "Native Windows AMF currently requires H.264 plus a D3D11 device/context; refusing FFmpeg fallback for AMD".into(),
-            ));
         }
 
         if Self::should_try_native_amf(config) {
@@ -240,28 +223,29 @@ impl VideoEncoder for WindowsAutoEncoder {
                 }
                 Err(err) => {
                     return Err(MediaError::EncoderInitFailed(format!(
-                        "Native Windows AMF initialization failed and FFmpeg fallback is disabled for AMD: {err}"
+                        "Native Windows AMF initialization failed: {err}"
                     )));
                 }
             }
         }
 
-        if let Some(hw) = Self::detected_d3d11_hw(config) {
-            match hw {
-                HwAccelType::Qsv => log::info!(
-                    "Detected Intel D3D11 adapter; using FFmpeg QuickSync path as in Sunshine"
-                ),
-                HwAccelType::Nvenc => {
-                    log::info!("Using FFmpeg NVENC fallback for NVIDIA D3D11 adapter")
-                }
-                _ => {}
+        let adapter = Self::detected_d3d11_hw(config);
+        let reason = match (config.preferred_hw, adapter) {
+            (Some(HwAccelType::Qsv), _) | (_, Some(HwAccelType::Qsv)) => {
+                "Native Intel/QSV Windows encoding is not implemented yet"
             }
-        }
-
-        let mut encoder = ffmpeg::FfmpegEncoder::new()?;
-        encoder.initialize(config)?;
-        self.backend = Some(WindowsEncoderBackend::Ffmpeg(encoder));
-        Ok(())
+            (Some(HwAccelType::Software), _) => {
+                "Software/FFmpeg encoding is not compiled on Windows"
+            }
+            (Some(HwAccelType::Nvenc), _) | (_, Some(HwAccelType::Nvenc)) => {
+                "Native NVENC requires a D3D11 device/context and successful NVENC initialization"
+            }
+            (Some(HwAccelType::Amf), _) | (_, Some(HwAccelType::Amf)) => {
+                "Native AMF requires a D3D11 device/context and successful AMF initialization"
+            }
+            _ => "No supported native Windows encoder was available",
+        };
+        Err(MediaError::EncoderInitFailed(reason.into()))
     }
 
     fn encode(
@@ -272,7 +256,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_mut() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encode(buffer, pts_us),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.encode(buffer, pts_us),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encode(buffer, pts_us),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -281,7 +264,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_mut() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.request_keyframe(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.request_keyframe(),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.request_keyframe(),
             None => {}
         }
     }
@@ -290,7 +272,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_mut() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_bitrate(bitrate_kbps),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_bitrate(bitrate_kbps),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_bitrate(bitrate_kbps),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -299,7 +280,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_mut() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_fps(fps),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_fps(fps),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_fps(fps),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -308,7 +288,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_ref() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encoder_info(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.encoder_info(),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encoder_info(),
             None => EncoderInfo {
                 name: "uninitialized".to_string(),
                 hw_type: HwAccelType::Software,
@@ -321,7 +300,6 @@ impl VideoEncoder for WindowsAutoEncoder {
         match self.backend.as_mut() {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.flush(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.flush(),
-            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.flush(),
             None => Ok(vec![]),
         }
     }
@@ -331,7 +309,6 @@ impl VideoEncoder for WindowsAutoEncoder {
             match backend {
                 WindowsEncoderBackend::NativeNvenc(encoder) => encoder.shutdown(),
                 WindowsEncoderBackend::NativeAmf(encoder) => encoder.shutdown(),
-                WindowsEncoderBackend::Ffmpeg(encoder) => encoder.shutdown(),
             }
         }
         self.backend = None;
@@ -512,7 +489,6 @@ pub fn list_available_encoders() -> Vec<EncoderInfo> {
                 supported_codecs: vec![VideoCodec::H264],
             });
         }
-        encoders.extend(ffmpeg::FfmpegEncoder::list_available());
         return encoders;
     }
 
