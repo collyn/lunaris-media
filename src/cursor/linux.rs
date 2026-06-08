@@ -65,6 +65,7 @@ impl LinuxCursorCapture {
                 visible: true,
                 kind: CursorKind::Arrow,
                 image: None,
+                in_window_move_size: false,
             },
             x11_display: None,
             last_cursor_shape: None,

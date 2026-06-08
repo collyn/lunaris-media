@@ -16,9 +16,10 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CopyIcon, DestroyIcon, DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, LoadCursorW,
-    CURSORINFO, CURSOR_SHOWING, DI_NORMAL, HCURSOR, HICON, ICONINFO, IDC_ARROW, IDC_CROSS,
-    IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    CopyIcon, DestroyIcon, DrawIconEx, GetCursorInfo, GetCursorPos, GetGUIThreadInfo, GetIconInfo,
+    LoadCursorW, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GUITHREADINFO, GUI_INMOVESIZE, HCURSOR,
+    HICON, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
 };
 
 pub struct WindowsCursorCapture {
@@ -402,6 +403,16 @@ fn cursor_image_from_handle(handle: HCURSOR) -> Option<CursorImage> {
     })
 }
 
+fn is_in_window_move_size() -> bool {
+    let mut gui_info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+
+    let has_gui_info = unsafe { GetGUIThreadInfo(0, &mut gui_info).is_ok() };
+    has_gui_info && (gui_info.flags.0 & GUI_INMOVESIZE.0) != 0
+}
+
 fn cursor_kind_from_handle(handle: HCURSOR) -> CursorKind {
     fn matches_system_cursor(handle: HCURSOR, cursor_name: windows::core::PCWSTR) -> bool {
         unsafe { LoadCursorW(None, cursor_name).is_ok_and(|system| system == handle) }
@@ -499,6 +510,7 @@ impl CursorCapture for WindowsCursorCapture {
             visible,
             kind,
             image,
+            in_window_move_size: is_in_window_move_size(),
         })
     }
 

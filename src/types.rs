@@ -220,6 +220,10 @@ pub struct CursorState {
     pub kind: CursorKind,
     /// Optional cursor image (provided when the shape changes).
     pub image: Option<CursorImage>,
+    /// True while the host desktop is in an OS window move/resize loop.
+    /// Windows may embed the real cursor in captured frames during this state,
+    /// so clients can temporarily hide their cursor overlay to avoid duplicates.
+    pub in_window_move_size: bool,
 }
 
 /// Common cursor shape categories used by remoting clients.
