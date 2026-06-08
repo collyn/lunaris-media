@@ -468,7 +468,7 @@ impl CursorCapture for WindowsCursorCapture {
                             .chunks_exact(4)
                             .filter(|px| px[3] != 0)
                             .count();
-                        log::info!(
+                        log::debug!(
                             "Windows cursor native image changed: kind={} size={}x{} hotspot={},{} visible_pixels={} bytes={}",
                             kind.as_str(),
                             cursor_image.width,
