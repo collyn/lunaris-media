@@ -7,10 +7,10 @@
 //! cargo run --example capture_frame
 //! ```
 
-use std::time::Duration;
 use lunaris_media::capture::create_screen_capture;
-use lunaris_media::types::{PixelFormat, StreamConfig, VideoCodec};
 use lunaris_media::capture::gpu_buffer::GpuBuffer;
+use lunaris_media::types::{PixelFormat, StreamConfig, VideoCodec};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Listing displays...");
     let displays = capture.list_displays().await?;
     for d in &displays {
-        println!("  Display ID: {}, Name: {}, {}x{} @{}Hz, primary: {}", d.id, d.name, d.width, d.height, d.refresh_rate, d.is_primary);
+        println!(
+            "  Display ID: {}, Name: {}, {}x{} @{}Hz, primary: {}",
+            d.id, d.name, d.width, d.height, d.refresh_rate, d.is_primary
+        );
     }
 
     if displays.is_empty() {
@@ -30,8 +33,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let primary_display = displays.iter().find(|d| d.is_primary).unwrap_or(&displays[0]);
-    println!("Selected display: {} (ID: {})", primary_display.name, primary_display.id);
+    let primary_display = displays
+        .iter()
+        .find(|d| d.is_primary)
+        .unwrap_or(&displays[0]);
+    println!(
+        "Selected display: {} (ID: {})",
+        primary_display.name, primary_display.id
+    );
 
     let config = StreamConfig {
         width: primary_display.width,
@@ -55,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(f) => {
                 if f.is_new_frame {
                     new_frame_count += 1;
-                    println!("Successfully captured frame #{}! Size: {}x{}", new_frame_count, f.width, f.height);
+                    println!(
+                        "Successfully captured frame #{}! Size: {}x{}",
+                        new_frame_count, f.width, f.height
+                    );
                     frame = Some(f);
                     if new_frame_count >= 5 {
                         break;
@@ -75,12 +87,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(f) = frame {
         match &f.buffer {
-            GpuBuffer::CpuBuffer { data, stride, format, width, height } => {
+            GpuBuffer::CpuBuffer {
+                data,
+                stride,
+                format,
+                width,
+                height,
+            } => {
                 println!("Frame buffer type: CpuBuffer, format: {:?}", format);
                 if *format == PixelFormat::BGRA {
                     let out_path = "frame.png";
                     println!("Saving frame as PNG to {}...", out_path);
-                    
+
                     // If stride is different from width * 4, we need to copy row by row
                     let mut clean_data = if *stride as usize != *width as usize * 4 {
                         let mut temp = Vec::with_capacity((*width * *height * 4) as usize);

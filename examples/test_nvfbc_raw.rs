@@ -1,6 +1,6 @@
-use std::{error::Error, ptr};
 use nvfbc::cuda::CaptureMethod;
 use nvfbc::{BufferFormat, CudaCapturer};
+use std::{error::Error, ptr};
 
 type CuInitFn = unsafe extern "C" fn(u32) -> i32;
 type CuDeviceGetFn = unsafe extern "C" fn(*mut i32, i32) -> i32;
@@ -12,9 +12,19 @@ type CuMemcpyDtoDFn = unsafe extern "C" fn(u64, u64, usize) -> i32;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Dynamically load libcuda.so
-    let mut lib = unsafe { libc::dlopen(b"libcuda.so.1\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
+    let mut lib = unsafe {
+        libc::dlopen(
+            b"libcuda.so.1\0".as_ptr() as *const libc::c_char,
+            libc::RTLD_LAZY,
+        )
+    };
     if lib.is_null() {
-        lib = unsafe { libc::dlopen(b"libcuda.so\0".as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
+        lib = unsafe {
+            libc::dlopen(
+                b"libcuda.so\0".as_ptr() as *const libc::c_char,
+                libc::RTLD_LAZY,
+            )
+        };
     }
     if lib.is_null() {
         panic!("Failed to load libcuda.so.1 or libcuda.so");
@@ -27,10 +37,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cu_device_get_ptr = libc::dlsym(lib, b"cuDeviceGet\0".as_ptr() as *const libc::c_char);
         let cu_device_get: CuDeviceGetFn = std::mem::transmute(cu_device_get_ptr);
 
-        let cu_ctx_create_ptr = libc::dlsym(lib, b"cuCtxCreate_v2\0".as_ptr() as *const libc::c_char);
+        let cu_ctx_create_ptr =
+            libc::dlsym(lib, b"cuCtxCreate_v2\0".as_ptr() as *const libc::c_char);
         let cu_ctx_create: CuCtxCreateFn = std::mem::transmute(cu_ctx_create_ptr);
 
-        let cu_ctx_destroy_ptr = libc::dlsym(lib, b"cuCtxDestroy_v2\0".as_ptr() as *const libc::c_char);
+        let cu_ctx_destroy_ptr =
+            libc::dlsym(lib, b"cuCtxDestroy_v2\0".as_ptr() as *const libc::c_char);
         let cu_ctx_destroy: CuCtxDestroyFn = std::mem::transmute(cu_ctx_destroy_ptr);
 
         let cu_mem_alloc_ptr = libc::dlsym(lib, b"cuMemAlloc_v2\0".as_ptr() as *const libc::c_char);
@@ -39,7 +51,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cu_mem_free_ptr = libc::dlsym(lib, b"cuMemFree_v2\0".as_ptr() as *const libc::c_char);
         let cu_mem_free: CuMemFreeFn = std::mem::transmute(cu_mem_free_ptr);
 
-        let cu_memcpy_dtod_ptr = libc::dlsym(lib, b"cuMemcpyDtoD_v2\0".as_ptr() as *const libc::c_char);
+        let cu_memcpy_dtod_ptr =
+            libc::dlsym(lib, b"cuMemcpyDtoD_v2\0".as_ptr() as *const libc::c_char);
         let cu_memcpy_dtod: CuMemcpyDtoDFn = std::mem::transmute(cu_memcpy_dtod_ptr);
 
         // Initialize CUDA
@@ -58,7 +71,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut capturer = CudaCapturer::new()?;
         capturer.start(BufferFormat::Nv12, 30)?;
         let frame_info = capturer.next_frame(CaptureMethod::NoWait, None)?;
-        println!("Frame grabbed under Context 1, ptr = 0x{:X}", frame_info.device_buffer);
+        println!(
+            "Frame grabbed under Context 1, ptr = 0x{:X}",
+            frame_info.device_buffer
+        );
 
         // Create Context 2 (simulating FFmpeg context)
         let mut context2: *mut std::ffi::c_void = ptr::null_mut();
