@@ -154,6 +154,10 @@ impl WindowsAutoEncoder {
         config.codec == VideoCodec::H264 && Self::has_d3d11_pair(config)
     }
 
+    fn supports_native_d3d11_amf(config: &EncoderConfig) -> bool {
+        matches!(config.codec, VideoCodec::H264 | VideoCodec::H265) && Self::has_d3d11_pair(config)
+    }
+
     fn should_try_native_nvenc(config: &EncoderConfig) -> bool {
         if config.force_ffmpeg || !Self::supports_native_d3d11_h264(config) {
             return false;
@@ -167,7 +171,7 @@ impl WindowsAutoEncoder {
     }
 
     fn should_try_native_amf(config: &EncoderConfig) -> bool {
-        if config.force_ffmpeg || !Self::supports_native_d3d11_h264(config) {
+        if config.force_ffmpeg || !Self::supports_native_d3d11_amf(config) {
             return false;
         }
 
@@ -186,13 +190,6 @@ impl VideoEncoder for WindowsAutoEncoder {
             return Err(MediaError::EncoderInitFailed(
                 "FFmpeg backend is not compiled on Windows; select native_nvenc_d3d11, native_amf_d3d11, gpu, or auto".into(),
             ));
-        }
-
-        if config.codec != VideoCodec::H264 {
-            return Err(MediaError::EncoderInitFailed(format!(
-                "Native Windows encoder currently supports H.264 only; requested {}",
-                config.codec
-            )));
         }
 
         if Self::should_try_native_nvenc(config) {
@@ -486,7 +483,7 @@ pub fn list_available_encoders() -> Vec<EncoderInfo> {
             encoders.push(EncoderInfo {
                 name: "native_amf_d3d11".to_string(),
                 hw_type: HwAccelType::Amf,
-                supported_codecs: vec![VideoCodec::H264],
+                supported_codecs: vec![VideoCodec::H264, VideoCodec::H265],
             });
         }
         return encoders;
