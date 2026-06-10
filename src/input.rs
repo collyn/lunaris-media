@@ -251,7 +251,49 @@ impl InputInjector {
             Backend::X11(x11) => {
                 let _lock = crate::X11_MUTEX.lock().unwrap();
                 unsafe {
-                    xtest::XTestFakeRelativeMotionEvent(x11.display, x11.screen, dx, dy, 0);
+                    let mut root_return = 0;
+                    let mut child_return = 0;
+                    let mut root_x = 0;
+                    let mut root_y = 0;
+                    let mut win_x = 0;
+                    let mut win_y = 0;
+                    let mut mask = 0;
+                    let root = xlib::XDefaultRootWindow(x11.display);
+                    let ok = xlib::XQueryPointer(
+                        x11.display,
+                        root,
+                        &mut root_return,
+                        &mut child_return,
+                        &mut root_x,
+                        &mut root_y,
+                        &mut win_x,
+                        &mut win_y,
+                        &mut mask,
+                    );
+                    if ok != 0 {
+                        let target_x = (root_x + dx).clamp(x11.monitor_x, x11.monitor_x + x11.monitor_width - 1);
+                        let target_y = (root_y + dy).clamp(x11.monitor_y, x11.monitor_y + x11.monitor_height - 1);
+                        xtest::XTestFakeMotionEvent(x11.display, x11.screen, target_x, target_y, 0);
+                    } else {
+                        // Fallback: if querying pointer fails, use relative event injection
+                        let wrong_func: unsafe extern "C" fn(
+                            *mut x11::xlib::Display,
+                            std::os::raw::c_int,
+                            std::os::raw::c_int,
+                            std::os::raw::c_int,
+                            std::os::raw::c_ulong,
+                        ) -> std::os::raw::c_int = xtest::XTestFakeRelativeMotionEvent;
+                        let correct_func = std::mem::transmute::<
+                            _,
+                            unsafe extern "C" fn(
+                                *mut x11::xlib::Display,
+                                std::os::raw::c_int,
+                                std::os::raw::c_int,
+                                std::os::raw::c_ulong,
+                            ) -> std::os::raw::c_int,
+                        >(wrong_func);
+                        correct_func(x11.display, dx, dy, 0);
+                    }
                 }
             }
         }
