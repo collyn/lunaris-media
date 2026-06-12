@@ -554,6 +554,7 @@ impl DrmCapture {
             height: fb2.height,
             format: fourcc_to_pixel_format(fb2.pixel_format),
             is_new_frame: true,
+            cursor: None,
         })
     }
 

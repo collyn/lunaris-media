@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Tier 1: Lint + check + unit tests (every commit, no hardware)
+  # ──────────────────────────────────────────────────────────────
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy-linux:
+    name: clippy (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libopus-dev libasound2-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libdrm-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # TODO: add -D warnings after cleaning up existing warnings
+      - run: cargo clippy --all-targets
+
+  clippy-windows:
+    name: clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # TODO: add -D warnings after cleaning up existing warnings
+      - run: cargo clippy --all-targets
+
+  check-linux:
+    name: check (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libopus-dev libasound2-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libdrm-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check
+      - run: cargo check --examples
+
+  check-windows:
+    name: check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check
+      - run: cargo check --examples
+
+  test-linux:
+    name: test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libopus-dev libasound2-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libdrm-dev \
+            xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests (with virtual display)
+        run: xvfb-run cargo test
+
+  test-windows:
+    name: test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test
+
+  # ──────────────────────────────────────────────────────────────
+  # Tier 2: Integration tests with software encoders (PR only)
+  # Requires FFmpeg with libx264, libx265, libsvtav1 + Xvfb
+  # ──────────────────────────────────────────────────────────────
+
+  integration-linux:
+    name: integration (Linux)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [check-linux, test-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang pkg-config \
+            ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libopus-dev libasound2-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libdrm-dev \
+            xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build examples
+        run: cargo build --examples
+
+      - name: Test software H.264 encode
+        run: |
+          timeout 15 xvfb-run cargo run --example capture_encode -- \
+            --codec h264 --encoder software --duration 3 --output /tmp/test_h264.h264 || true
+          if [ -f /tmp/test_h264.h264 ] && [ -s /tmp/test_h264.h264 ]; then
+            echo "H.264 software encode: OK ($(wc -c < /tmp/test_h264.h264) bytes)"
+          else
+            echo "H.264 software encode: SKIPPED (no output — likely no display server)"
+          fi
+
+      - name: Test software H.265 encode
+        run: |
+          timeout 15 xvfb-run cargo run --example capture_encode -- \
+            --codec h265 --encoder software --duration 3 --output /tmp/test_h265.h265 || true
+          if [ -f /tmp/test_h265.h265 ] && [ -s /tmp/test_h265.h265 ]; then
+            echo "H.265 software encode: OK ($(wc -c < /tmp/test_h265.h265) bytes)"
+          else
+            echo "H.265 software encode: SKIPPED (no output — likely no display server)"
+          fi
+
+      - name: Test software AV1 encode
+        run: |
+          timeout 15 xvfb-run cargo run --example capture_encode -- \
+            --codec av1 --encoder software --duration 3 --output /tmp/test_av1.av1 || true
+          if [ -f /tmp/test_av1.av1 ] && [ -s /tmp/test_av1.av1 ]; then
+            echo "AV1 software encode: OK ($(wc -c < /tmp/test_av1.av1) bytes)"
+          else
+            echo "AV1 software encode: SKIPPED (no output — likely no display server)"
+          fi

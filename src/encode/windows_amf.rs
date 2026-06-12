@@ -49,6 +49,11 @@ const AMF_VIDEO_ENCODER_HEVC: &[u16] = &[
     'E' as u16, 'n' as u16, 'c' as u16, 'o' as u16, 'd' as u16, 'e' as u16, 'r' as u16, '_' as u16,
     'H' as u16, 'E' as u16, 'V' as u16, 'C' as u16, 0,
 ];
+const AMF_VIDEO_ENCODER_AV1: &[u16] = &[
+    'A' as u16, 'M' as u16, 'F' as u16, 'V' as u16, 'i' as u16, 'd' as u16, 'e' as u16, 'o' as u16,
+    'E' as u16, 'n' as u16, 'c' as u16, 'o' as u16, 'd' as u16, 'e' as u16, 'r' as u16, '_' as u16,
+    'A' as u16, 'V' as u16, '1' as u16, 0,
+];
 
 type AmfResult = i32;
 type AmfBool = u8;
@@ -121,6 +126,7 @@ const AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR: i64 = 2;
 enum AmfVideoCodec {
     Avc,
     Hevc,
+    Av1,
 }
 
 impl AmfVideoCodec {
@@ -128,9 +134,7 @@ impl AmfVideoCodec {
         match codec {
             VideoCodec::H264 => Ok(Self::Avc),
             VideoCodec::H265 => Ok(Self::Hevc),
-            _ => Err(MediaError::EncoderInitFailed(format!(
-                "native Windows AMF D3D11 supports H.264/H.265 only; requested {codec}"
-            ))),
+            VideoCodec::AV1 => Ok(Self::Av1),
         }
     }
 
@@ -138,6 +142,7 @@ impl AmfVideoCodec {
         match self {
             Self::Avc => AMF_VIDEO_ENCODER_VCE_AVC.as_ptr(),
             Self::Hevc => AMF_VIDEO_ENCODER_HEVC.as_ptr(),
+            Self::Av1 => AMF_VIDEO_ENCODER_AV1.as_ptr(),
         }
     }
 
@@ -145,6 +150,7 @@ impl AmfVideoCodec {
         match self {
             Self::Avc => "AMFVideoEncoderVCE_AVC",
             Self::Hevc => "AMFVideoEncoder_HEVC",
+            Self::Av1 => "AMFVideoEncoder_AV1",
         }
     }
 
@@ -152,13 +158,15 @@ impl AmfVideoCodec {
         match self {
             Self::Avc => VideoCodec::H264,
             Self::Hevc => VideoCodec::H265,
+            Self::Av1 => VideoCodec::AV1,
         }
     }
 
-    fn prop(self, avc: &'static str, hevc: &'static str) -> &'static str {
+    fn prop(self, avc: &'static str, hevc: &'static str, av1: &'static str) -> &'static str {
         match self {
             Self::Avc => avc,
             Self::Hevc => hevc,
+            Self::Av1 => av1,
         }
     }
 }
@@ -593,7 +601,7 @@ impl WindowsAmfEncoder {
             info: EncoderInfo {
                 name: "native_amf_d3d11".to_string(),
                 hw_type: HwAccelType::Amf,
-                supported_codecs: vec![VideoCodec::H264, VideoCodec::H265],
+                supported_codecs: vec![VideoCodec::H264, VideoCodec::H265, VideoCodec::AV1],
             },
             initialized: false,
             force_keyframe: false,
@@ -717,24 +725,24 @@ impl WindowsAmfEncoder {
             config.fps.max(1) * 2
         };
         let bitrate = config.bitrate_kbps as i64 * 1000;
-        let usage_prop = self.codec.prop("Usage", "HevcUsage");
-        let frame_size_prop = self.codec.prop("FrameSize", "HevcFrameSize");
-        let frame_rate_prop = self.codec.prop("FrameRate", "HevcFrameRate");
-        let target_bitrate_prop = self.codec.prop("TargetBitrate", "HevcTargetBitrate");
-        let peak_bitrate_prop = self.codec.prop("PeakBitrate", "HevcPeakBitrate");
+        let usage_prop = self.codec.prop("Usage", "HevcUsage", "AV1Usage");
+        let frame_size_prop = self.codec.prop("FrameSize", "HevcFrameSize", "AV1FrameSize");
+        let frame_rate_prop = self.codec.prop("FrameRate", "HevcFrameRate", "AV1FrameRate");
+        let target_bitrate_prop = self.codec.prop("TargetBitrate", "HevcTargetBitrate", "AV1TargetBitrate");
+        let peak_bitrate_prop = self.codec.prop("PeakBitrate", "HevcPeakBitrate", "AV1PeakBitrate");
         let rate_control_prop = self
             .codec
-            .prop("RateControlMethod", "HevcRateControlMethod");
-        let quality_preset_prop = self.codec.prop("QualityPreset", "HevcQualityPreset");
-        let b_picture_prop = self.codec.prop("BPicturesPattern", "HevcBPicturesPattern");
+            .prop("RateControlMethod", "HevcRateControlMethod", "AV1RateControlMethod");
+        let quality_preset_prop = self.codec.prop("QualityPreset", "HevcQualityPreset", "AV1QualityPreset");
+        let b_picture_prop = self.codec.prop("BPicturesPattern", "HevcBPicturesPattern", "AV1BPicturesPattern");
         let low_latency_prop = self
             .codec
-            .prop("LowLatencyInternal", "HevcLowLatencyInternal");
-        let idr_period_prop = self.codec.prop("IDRPeriod", "HevcIDRPeriod");
+            .prop("LowLatencyInternal", "HevcLowLatencyInternal", "AV1LowLatencyInternal");
+        let idr_period_prop = self.codec.prop("IDRPeriod", "HevcIDRPeriod", "AV1IDRPeriod");
         let header_spacing_prop = self
             .codec
-            .prop("HeaderInsertionSpacing", "HevcHeaderInsertionSpacing");
-        let output_mode_prop = self.codec.prop("OutputMode", "HevcOutputMode");
+            .prop("HeaderInsertionSpacing", "HevcHeaderInsertionSpacing", "AV1HeaderInsertionSpacing");
+        let output_mode_prop = self.codec.prop("OutputMode", "HevcOutputMode", "AV1OutputMode");
         log::info!(
             "Native AMF: configuring component (usage={}, size={}x{}, fps={}, bitrate={}kbps)",
             usage,
@@ -1072,7 +1080,7 @@ impl WindowsAmfEncoder {
                     }
                 };
                 try_set_surface_property(
-                    self.codec.prop("ForcePictureType", "HevcForcePictureType"),
+                    self.codec.prop("ForcePictureType", "HevcForcePictureType", "AV1ForcePictureType"),
                     amf_variant_int64(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR),
                 );
                 match self.codec {
@@ -1085,6 +1093,10 @@ impl WindowsAmfEncoder {
                         try_set_surface_property("HevcInsertVPS", amf_variant_bool(true));
                         try_set_surface_property("HevcInsertSPS", amf_variant_bool(true));
                         try_set_surface_property("HevcInsertPPS", amf_variant_bool(true));
+                    }
+                    AmfVideoCodec::Av1 => {
+                        try_set_surface_property("AV1InsertHeader", amf_variant_bool(true));
+                        try_set_surface_property("AV1InsertSequenceHeader", amf_variant_bool(true));
                     }
                 }
             }
@@ -1278,12 +1290,12 @@ impl VideoEncoder for WindowsAmfEncoder {
             let bitrate = bitrate_kbps as i64 * 1000;
             self.set_component_property(
                 self.component,
-                self.codec.prop("TargetBitrate", "HevcTargetBitrate"),
+                self.codec.prop("TargetBitrate", "HevcTargetBitrate", "AV1TargetBitrate"),
                 amf_variant_int64(bitrate),
             )?;
             self.try_set_component_property(
                 self.component,
-                self.codec.prop("PeakBitrate", "HevcPeakBitrate"),
+                self.codec.prop("PeakBitrate", "HevcPeakBitrate", "AV1PeakBitrate"),
                 amf_variant_int64(bitrate),
             );
         }
@@ -1303,7 +1315,7 @@ impl VideoEncoder for WindowsAmfEncoder {
         if !self.component.is_null() {
             self.try_set_component_property(
                 self.component,
-                self.codec.prop("FrameRate", "HevcFrameRate"),
+                self.codec.prop("FrameRate", "HevcFrameRate", "AV1FrameRate"),
                 amf_variant_rate(fps, 1),
             );
         }

@@ -2,25 +2,45 @@
 
 Zero-copy-oriented screen capture, audio capture, input injection, and hardware-accelerated video encoding library for Rust.
 
-`lunaris-media` is currently a Linux-first prototype. The crate exposes a `MediaPipeline` that combines screen capture, FFmpeg video encoding, cpal/Opus audio capture, and cursor events into Tokio channels. It is intended to feed a separate transport layer such as WebRTC; this crate does not implement networking or packetization.
+`lunaris-media` exposes a `MediaPipeline` that combines screen capture, hardware-accelerated video encoding, system audio capture, and cursor events into Tokio channels. It is designed to feed a separate transport layer such as WebRTC; this crate does not implement networking or packetization.
 
 ## Current Status
 
-Updated: 2026-06-04
+Updated: 2026-06-12
+
+### Linux
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Linux screen capture | Prototype implemented | Factory order is NvFBC, DRM/KMS, PipeWire portal, then X11. Runtime permissions and hardware support vary by backend. |
-| NVIDIA NvFBC capture | Prototype implemented | Uses NvFBC with CUDA/system capture paths. Requires supported NVIDIA driver/runtime and a compatible session. |
-| DRM/KMS capture | Prototype implemented | Exports active framebuffers as DMA-BUF. Usually requires root or `CAP_SYS_ADMIN` for `DRM_IOCTL_MODE_GETFB2`. |
-| PipeWire/Wayland capture | Prototype implemented | Uses XDG Desktop Portal via `ashpd` and PipeWire. Requests user permission at runtime. |
-| X11 capture | Prototype implemented | Uses XShm when available, with XGetImage fallback. Produces CPU-backed BGRA buffers. |
-| FFmpeg video encoding | Prototype implemented | Probes H.264/H.265/AV1 encoders from the local FFmpeg build and falls back through hardware/software candidates. H.264 is the primary validated target. |
-| Linux audio capture | Prototype implemented | Uses cpal input/monitor capture and encodes Opus frames. Requires a working PulseAudio/PipeWire monitor-style device. |
-| Cursor tracking | Stub | `LinuxCursorCapture` currently returns a static default cursor state. Real X11/XFixes or PipeWire cursor metadata is still pending. |
-| Linux input injection | Prototype implemented | `InputInjector` uses X11 XTest when `DISPLAY` is available, otherwise tries `/dev/uinput`. Non-Linux is a stub. |
-| Windows/macOS capture | Not implemented in this repo | Dependencies and cfg declarations exist, but platform backend source files are not present yet. |
-| Integration tests/benchmarks | Pending | `cargo check` passes for the library; hardware/runtime validation is still needed. |
+| Screen capture | Implemented | Factory order: NvFBC → DRM/KMS → PipeWire portal → X11. Runtime fallback chain. |
+| NVIDIA NvFBC capture | Implemented | CUDA/system capture paths. Requires NVIDIA driver and CUDA/NvFBC runtime. |
+| DRM/KMS capture | Implemented | Zero-copy DMA-BUF export. Requires `CAP_SYS_ADMIN` or root for `DRM_IOCTL_MODE_GETFB2`. |
+| PipeWire/Wayland capture | Implemented | XDG Desktop Portal via `ashpd`. Supports embedded or hidden cursor modes. |
+| X11 capture | Implemented | XShm with XGetImage fallback. Produces CPU-backed BGRA buffers. |
+| FFmpeg video encoding | Implemented | Probes NVENC, VAAPI, QSV, AMF, VideoToolbox, software fallback. H.264/H.265/AV1. |
+| Audio capture | Implemented | cpal + Opus (PulseAudio/PipeWire monitor capture). |
+| Cursor tracking | Implemented | X11/XFixes cursor position + shape. PipeWire `SPA_META_Cursor` metadata per-frame. |
+| Input injection | Implemented | XTest when `DISPLAY` is available, `/dev/uinput` otherwise. |
+| Virtual display | Implemented | XRandR VIRTUAL output management. |
+
+### Windows
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Screen capture | Implemented | DXGI Desktop Duplication with GDI fallback (for RDP/VM/hybrid GPU). |
+| NVENC encoding | Implemented | Native D3D11 zero-copy. H.264 + H.265. Loads `nvEncodeAPI64.dll` at runtime. |
+| AMF encoding | Implemented | Native D3D11 zero-copy. H.264 + H.265 + AV1. Loads `amfrt64.dll` at runtime. |
+| QSV encoding | Implemented | Native D3D11 zero-copy. H.264 + H.265 + AV1. Loads `libvpl.dll` (oneVPL 2.x) at runtime. |
+| Audio capture | Implemented | WASAPI loopback capture. |
+| Cursor tracking | Implemented | Native Windows cursor position + shape. |
+| Input injection | Implemented | `SendInput` for mouse/keyboard. |
+| Virtual display | Implemented | IddCx driver communication (requires `usbmmidd` or compatible driver installed). |
+
+### macOS
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| All subsystems | Stub only | Dependencies declared in `Cargo.toml` but no source files exist. |
 
 ## Architecture
 
@@ -28,19 +48,33 @@ Updated: 2026-06-04
 MediaPipeline
   |
   |-- Screen capture
-  |     Linux: NvFBC -> DRM/KMS -> PipeWire -> X11
-  |     Output: GpuBuffer::CudaPointer, GpuBuffer::DmaBuf, or GpuBuffer::CpuBuffer
+  |     Linux:  NvFBC → DRM/KMS → PipeWire → X11
+  |     Windows: DXGI Desktop Duplication (GDI fallback)
+  |     Output: GpuBuffer::DmaBuf, GpuBuffer::CudaPointer, GpuBuffer::D3D11Texture, or GpuBuffer::CpuBuffer
   |
   |-- Video encoding
-  |     FFmpeg encoder candidates: NVENC, VAAPI, QSV, VideoToolbox/AMF cfg paths, software fallback
-  |     Output: EncodedVideoFrame
+  |     Linux:   FFmpeg (NVENC → VAAPI → QSV → AMF → software)
+  |     Windows: Native NVENC / Native AMF / Native QSV (D3D11 zero-copy, no FFmpeg)
+  |     Codecs:  H.264, H.265/HEVC, AV1
+  |     Output:  EncodedVideoFrame
   |
   |-- Audio capture
-  |     Linux cpal stream -> Opus encoder
-  |     Output: EncodedAudioFrame
+  |     Linux:   cpal + Opus (PulseAudio/PipeWire)
+  |     Windows: WASAPI loopback
+  |     Output:  EncodedAudioFrame
   |
   |-- Cursor capture
-  |     Current Linux implementation is a stub
+  |     Linux:   X11/XFixes (position + shape), PipeWire SPA_META_Cursor (per-frame metadata)
+  |     Windows: Native cursor tracking
+  |     Output:  CursorState (position, shape, image)
+  |
+  |-- Input injection
+  |     Linux:   XTest + uinput
+  |     Windows: SendInput
+  |
+  |-- Virtual display
+  |     Linux:   XRandR VIRTUAL output
+  |     Windows: IddCx driver (usbmmidd)
   |
   |-- Commands
         RequestKeyframe, SetBitrate, SetFps, Stop
@@ -67,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: 1080,
         fps: 60,
         bitrate_kbps: 10_000,
-        preferred_encoder: Some("nvenc".to_string()), // use "auto", "vaapi", "qsv", or "software" as needed
+        preferred_encoder: Some("nvenc".to_string()), // use "auto", "vaapi", "qsv", "amf", or "software"
         ..Default::default()
     };
 
@@ -108,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Linux Prerequisites
 
-Ubuntu/Debian packages commonly needed by this crate:
+Ubuntu/Debian:
 
 ```bash
 sudo apt install \
@@ -137,7 +171,17 @@ sudo pacman -S \
 
 NVIDIA NvFBC/NVENC paths also require a compatible NVIDIA driver and CUDA/NvFBC runtime availability.
 
-### Commands
+### Windows Prerequisites
+
+- Rust toolchain with MSVC target (`x86_64-pc-windows-msvc`)
+- The `windows` crate (v0.58) handles Win32 API bindings automatically
+- Native encoders load DLLs at runtime:
+  - **NVENC**: `nvEncodeAPI64.dll` (NVIDIA driver)
+  - **AMF**: `amfrt64.dll` (AMD driver)
+  - **QSV**: `libvpl.dll` (Intel oneVPL runtime)
+- Virtual display requires an IddCx driver installed (e.g. [usbmmidd](https://github.com/ge9/IddSampleDriver))
+
+### Build Commands
 
 ```bash
 cargo check
@@ -155,6 +199,8 @@ Write raw encoded video to a file:
 
 ```bash
 cargo run --example capture_encode -- --output capture.h264
+cargo run --example capture_encode -- --codec h265 --output capture.h265
+cargo run --example capture_encode -- --codec av1 --output capture.av1
 ffplay capture.h264
 ```
 
@@ -167,45 +213,58 @@ cargo run --example test_xtest
 
 ## Runtime Notes
 
-- Wayland/PipeWire capture opens an XDG Desktop Portal screen-cast permission prompt.
-- DRM/KMS capture may fail without elevated privileges because exporting the active framebuffer requires privileged DRM ioctls.
-- X11 capture requires `DISPLAY` and can use XShm for faster capture when available.
-- `/dev/uinput` input injection usually requires permissions through udev rules or root.
-- Audio capture depends on the system exposing a monitor or loopback input source.
-- Hardware encoder availability depends on the FFmpeg build and installed GPU drivers. `list_available_encoders()` reports encoders found by FFmpeg.
+- **Wayland/PipeWire**: Opens an XDG Desktop Portal screen-cast permission prompt. Cursor metadata is extracted from `SPA_META_Cursor` per-frame when available.
+- **DRM/KMS**: May fail without elevated privileges because exporting the active framebuffer requires privileged DRM ioctls.
+- **X11**: Requires `DISPLAY`. Uses XShm for faster capture when available. Cursor tracking via XFixes.
+- **`/dev/uinput`**: Input injection usually requires permissions through udev rules or root.
+- **Audio**: Depends on the system exposing a monitor or loopback input source.
+- **Windows encoders**: Native NVENC/AMF/QSV encoders use D3D11 zero-copy — frames stay on the GPU. No FFmpeg dependency on Windows.
+- **Windows virtual display**: Requires an IddCx driver (e.g. `usbmmidd`) installed and running.
 
 ## Project Structure
 
 ```text
 lunaris-media/
-|-- Cargo.toml
-|-- README.md
-|-- src/
-|   |-- lib.rs
-|   |-- types.rs
-|   |-- error.rs
-|   |-- pipeline.rs
-|   |-- input.rs
-|   |-- capture/
-|   |   |-- mod.rs
-|   |   |-- gpu_buffer.rs
-|   |   |-- linux_nvfbc.rs
-|   |   |-- linux_drm.rs
-|   |   |-- linux_wayland.rs
-|   |   `-- linux_x11.rs
-|   |-- encode/
-|   |   |-- mod.rs
-|   |   `-- ffmpeg.rs
-|   |-- audio/
-|   |   |-- mod.rs
-|   |   `-- linux.rs
-|   `-- cursor/
-|       |-- mod.rs
-|       `-- linux.rs
-`-- examples/
-    |-- capture_encode.rs
-    |-- test_nvfbc_raw.rs
-    `-- test_xtest.rs
+├── Cargo.toml
+├── README.md
+├── .github/workflows/ci.yml
+├── src/
+│   ├── lib.rs
+│   ├── types.rs
+│   ├── error.rs
+│   ├── pipeline.rs
+│   ├── input.rs
+│   ├── capture/
+│   │   ├── mod.rs
+│   │   ├── gpu_buffer.rs
+│   │   ├── linux_nvfbc.rs
+│   │   ├── linux_drm.rs
+│   │   ├── linux_wayland.rs
+│   │   ├── linux_x11.rs
+│   │   ├── windows.rs
+│   │   └── virtual_display/
+│   │       ├── mod.rs
+│   │       ├── linux.rs
+│   │       └── windows.rs
+│   ├── encode/
+│   │   ├── mod.rs
+│   │   ├── ffmpeg.rs
+│   │   ├── windows_nvenc.rs
+│   │   ├── windows_amf.rs
+│   │   └── windows_qsv.rs
+│   ├── audio/
+│   │   ├── mod.rs
+│   │   ├── linux.rs
+│   │   └── windows.rs
+│   └── cursor/
+│       ├── mod.rs
+│       ├── linux.rs
+│       └── windows.rs
+└── examples/
+    ├── capture_encode.rs
+    ├── capture_frame.rs
+    ├── test_nvfbc_raw.rs
+    └── test_xtest.rs
 ```
 
 ## Public API Highlights
@@ -213,37 +272,46 @@ lunaris-media/
 - `MediaPipeline::new(config)` returns `(pipeline, event_rx, command_tx)`.
 - `MediaPipeline::run(display_id)` starts capture, encode, audio, and cursor tasks.
 - `PipelineCommand` supports keyframe requests, bitrate changes, FPS changes, and graceful stop.
-- `GpuBuffer` supports Linux DMA-BUF, Linux CUDA pointer, platform cfg placeholders, and CPU fallback buffers.
-- `InputInjector` provides Linux mouse/keyboard injection helpers through XTest or uinput.
+- `GpuBuffer` supports DMA-BUF, CUDA pointer, D3D11 texture, and CPU fallback buffers.
+- `InputInjector` provides mouse/keyboard injection (XTest/uinput on Linux, SendInput on Windows).
+- `list_available_encoders()` reports native hardware encoders detected on the system.
+- `FrameCursorMeta` carries per-frame cursor metadata from PipeWire capture.
 
-## Roadmap
+## Encoder Support Matrix
 
-### Next Milestones
+| Encoder | H.264 | H.265 | AV1 | Platform | Backend |
+| --- | --- | --- | --- | --- | --- |
+| NVENC (FFmpeg) | ✅ | ✅ | ✅ | Linux | FFmpeg → nvenc |
+| VAAPI (FFmpeg) | ✅ | ✅ | ✅ | Linux | FFmpeg → vaapi |
+| QSV (FFmpeg) | ✅ | ✅ | ✅ | Linux | FFmpeg → qsv |
+| Software (FFmpeg) | ✅ | ✅ | ✅ | Linux | libx264/libx265/libsvtav1 |
+| NVENC (native) | ✅ | ✅ | ❌ | Windows | `nvEncodeAPI64.dll` D3D11 zero-copy |
+| AMF (native) | ✅ | ✅ | ✅ | Windows | `amfrt64.dll` D3D11 zero-copy |
+| QSV (native) | ✅ | ✅ | ✅ | Windows | `libvpl.dll` D3D11 zero-copy |
 
-- Replace Linux cursor stub with real X11/XFixes and PipeWire metadata support.
-- Add integration tests for the Linux backend fallback chain on real hardware.
-- Add benchmarks for capture latency, encode latency, FPS stability, and CPU/GPU copy behavior.
-- Harden FFmpeg hardware-frame handling for each encoder/backend combination.
-- Document required udev/capability setup for DRM capture and uinput injection.
+## CI/CD
 
-### Future Work
+GitHub Actions runs on every push and PR:
 
-- Implement Windows backend source files for DXGI capture and WASAPI audio.
-- Implement macOS backend source files for ScreenCaptureKit and VideoToolbox.
-- Validate H.265 and AV1 paths across NVENC, VAAPI, QSV, and software encoders.
-- Add dynamic resolution handling, adaptive bitrate control, and multi-monitor/region capture.
-- Add HDR/10-bit capture and encode support.
+- **Tier 1** (every commit): `cargo fmt`, `cargo clippy`, `cargo check`, `cargo test` on Linux + Windows
+- **Tier 2** (PR only): Integration tests with software H.264/H.265/AV1 encoding on Linux with Xvfb
 
 ## Dependency Snapshot
 
-| Dependency | Version in `Cargo.toml` |
-| --- | --- |
-| `ffmpeg-next` | 8 |
-| `opus` | 0.3 |
-| `cpal` | 0.15 |
-| `pipewire` | 0.8 |
-| `ashpd` | 0.9 |
-| `tokio` | 1 |
+| Dependency | Version | Platform |
+| --- | --- | --- |
+| `ffmpeg-next` | 8 | Linux |
+| `pipewire` | 0.8 | Linux |
+| `ashpd` | 0.9 | Linux |
+| `x11` | 2.21 | Linux |
+| `nix` | 0.29 | Linux |
+| `drm-fourcc` | 2.2 | Linux |
+| `nvfbc` | 0.2 | Linux |
+| `evdev` | 0.11 | Linux |
+| `windows` | 0.58 | Windows |
+| `opus` | 0.3 | Cross-platform |
+| `cpal` | 0.15 | Cross-platform |
+| `tokio` | 1 | Cross-platform |
 
 ## License
 

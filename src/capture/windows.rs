@@ -317,6 +317,7 @@ impl ScreenCapture for DxgiCapture {
                             height: self.height,
                             format: PixelFormat::BGRA,
                             is_new_frame: false,
+                            cursor: None,
                         });
                     } else {
                         return Ok(CapturedFrame {
@@ -332,6 +333,7 @@ impl ScreenCapture for DxgiCapture {
                             height: self.height,
                             format: PixelFormat::BGRA,
                             is_new_frame: false,
+                            cursor: None,
                         });
                     }
                 }
@@ -360,6 +362,7 @@ impl ScreenCapture for DxgiCapture {
                     height: self.height,
                     format: PixelFormat::BGRA,
                     is_new_frame: false,
+                    cursor: None,
                 });
             }
             Err(e) => {
@@ -429,6 +432,7 @@ impl ScreenCapture for DxgiCapture {
                     height: self.height,
                     format: PixelFormat::BGRA,
                     is_new_frame: true,
+                    cursor: None,
                 });
             }
 
@@ -443,6 +447,7 @@ impl ScreenCapture for DxgiCapture {
                 height: self.height,
                 format: PixelFormat::BGRA,
                 is_new_frame: true,
+                cursor: None,
             });
         }
 
@@ -508,6 +513,7 @@ impl ScreenCapture for DxgiCapture {
             height: self.height,
             format: PixelFormat::BGRA,
             is_new_frame: true,
+            cursor: None,
         })
     }
 
@@ -814,6 +820,7 @@ impl ScreenCapture for GdiCapture {
             height: self.height,
             format: PixelFormat::BGRA,
             is_new_frame: true,
+            cursor: None,
         })
     }
 

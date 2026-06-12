@@ -26,7 +26,8 @@
 //! 3. `h264_qsv` — Intel Quick Sync Video
 //! 4. `libx264` — Software fallback
 
-#[allow(non_upper_case_globals)]
+#![allow(non_upper_case_globals)]
+
 use std::ffi::CString;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -717,6 +718,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                     opt_set("repeat_vps_sps_pps", "1");
+                } else if codec == VideoCodec::AV1 {
+                    opt_set("profile", "main");
                 }
                 log::info!(
                     "Applied NVENC low-latency options (forced-idr=1 preset=p3 repeat headers)"
@@ -727,6 +730,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 if codec == VideoCodec::H264 {
                     opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
                 } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                } else if codec == VideoCodec::AV1 {
                     opt_set("profile", "main");
                 }
                 if low_latency {
@@ -741,6 +746,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 if codec == VideoCodec::H264 {
                     opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
                 } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                } else if codec == VideoCodec::AV1 {
                     opt_set("profile", "main");
                 }
                 if low_latency {
@@ -759,6 +766,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                     opt_set("profile", "constrained_baseline");
                     opt_set("level", "3.1");
                 } else if codec == VideoCodec::H265 {
+                    opt_set("profile", "main");
+                } else if codec == VideoCodec::AV1 {
                     opt_set("profile", "main");
                 }
                 log::info!("Applied AMF encoder options (forced_idr=1)");
@@ -1749,6 +1758,76 @@ mod tests {
         hvcc[0] = 1;
         hvcc[21] = 0xfc | 3;
         assert_eq!(nal_length_size_from_extradata(&hvcc, VideoCodec::H265), Some(4));
+    }
+
+    #[test]
+    fn h264_parameter_sets_required() {
+        assert!(codec_needs_parameter_sets(VideoCodec::H264));
+    }
+
+    #[test]
+    fn h265_parameter_sets_required() {
+        assert!(codec_needs_parameter_sets(VideoCodec::H265));
+    }
+
+    #[test]
+    fn av1_parameter_sets_not_required() {
+        assert!(!codec_needs_parameter_sets(VideoCodec::AV1));
+    }
+
+    #[test]
+    fn finds_h264_sps_pps() {
+        // H.264 SPS (NAL type 7 = 0x67) + PPS (NAL type 8 = 0x68)
+        let data = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, // SPS
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x00, 0x00, // PPS
+        ];
+        assert!(has_sps_pps(&data, VideoCodec::H264));
+        let extracted = extract_sps_pps(&data, VideoCodec::H264);
+        assert_eq!(extracted.len(), 16); // 2 NALs × 8 bytes each
+    }
+
+    #[test]
+    fn h264_sps_only_not_enough() {
+        // Only SPS, no PPS - has_sps_pps should return false
+        let data = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f];
+        assert!(!has_sps_pps(&data, VideoCodec::H264));
+        // But extract_sps_pps should still extract the SPS
+        let extracted = extract_sps_pps(&data, VideoCodec::H264);
+        assert!(!extracted.is_empty());
+    }
+
+    #[test]
+    fn finds_h265_vps_sps_pps() {
+        // H.265 VPS (NAL type 32 = 0x40), SPS (33 = 0x42), PPS (34 = 0x44)
+        let data = [
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, // VPS
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, // SPS
+            0x00, 0x00, 0x00, 0x01, 0x44, 0x01, // PPS
+        ];
+        assert!(has_sps_pps(&data, VideoCodec::H265));
+        let extracted = extract_sps_pps(&data, VideoCodec::H265);
+        assert_eq!(extracted.len(), 18); // 3 NALs × 6 bytes each
+    }
+
+    #[test]
+    fn h265_pps_only_extracted_but_no_sps_pps() {
+        // Only PPS (NAL type 34 = 0x44) - has_sps_pps should return false
+        let data = [0x00, 0x00, 0x00, 0x01, 0x44, 0x01];
+        assert!(!has_sps_pps(&data, VideoCodec::H265));
+        // But extract_sps_pps should still extract the PPS
+        let extracted = extract_sps_pps(&data, VideoCodec::H265);
+        assert!(!extracted.is_empty());
+    }
+
+    #[test]
+    fn h265_extradata_to_annexb_empty_returns_empty() {
+        assert!(h265_hvcc_extradata_to_annexb(&[]).is_empty());
+    }
+
+    #[test]
+    fn h265_extradata_to_annexb_short_returns_empty() {
+        assert!(h265_hvcc_extradata_to_annexb(&[0, 1, 2]).is_empty());
     }
 }
 

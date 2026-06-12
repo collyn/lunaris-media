@@ -296,6 +296,7 @@ impl X11Capture {
             height: self.height,
             format: PixelFormat::BGRA,
             is_new_frame: true,
+            cursor: None,
         })
     }
 
@@ -372,6 +373,7 @@ impl X11Capture {
             height: self.height,
             format: PixelFormat::BGRA,
             is_new_frame: true,
+            cursor: None,
         })
     }
 

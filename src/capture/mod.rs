@@ -68,6 +68,26 @@ pub struct CapturedFrame {
     pub format: PixelFormat,
     /// Whether this frame is a new frame (e.g. from change detection).
     pub is_new_frame: bool,
+    /// Optional cursor metadata embedded by the capture backend (e.g. PipeWire).
+    /// When present, the pipeline can skip separate cursor polling.
+    pub cursor: Option<FrameCursorMeta>,
+}
+
+/// Cursor metadata embedded in a captured frame (e.g. from PipeWire spa_meta_cursor).
+#[derive(Debug, Clone)]
+pub struct FrameCursorMeta {
+    /// Cursor X position in screen coordinates.
+    pub x: i32,
+    /// Cursor Y position in screen coordinates.
+    pub y: i32,
+    /// Hotspot X offset within the cursor bitmap.
+    pub hotspot_x: i32,
+    /// Hotspot Y offset within the cursor bitmap.
+    pub hotspot_y: i32,
+    /// Whether the cursor is visible (spa_meta_cursor.id != 0).
+    pub visible: bool,
+    /// Optional cursor bitmap. Present when the cursor shape changes.
+    pub image: Option<crate::types::CursorImage>,
 }
 
 /// Trait for screen capture backends.

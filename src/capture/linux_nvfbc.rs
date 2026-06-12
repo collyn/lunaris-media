@@ -547,6 +547,7 @@ impl NvfbcCapture {
                                     height: frame_info.height,
                                     format: PixelFormat::BGRA,
                                     is_new_frame: frame_info.is_new_frame,
+                                    cursor: None,
                                 })
                             }
                             ActiveCapturer::Cuda(c) => {
@@ -568,6 +569,7 @@ impl NvfbcCapture {
                                     height: frame_info.height,
                                     format: PixelFormat::BGRA,
                                     is_new_frame: frame_info.is_new_frame,
+                                    cursor: None,
                                 })
                             }
                         };

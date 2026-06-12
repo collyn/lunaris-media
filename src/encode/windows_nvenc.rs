@@ -43,6 +43,13 @@ const NV_ENC_CODEC_H264_GUID: GUID = GUID::from_values(
     [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
 );
 
+const NV_ENC_CODEC_HEVC_GUID: GUID = GUID::from_values(
+    0x790cda16,
+    0x6915,
+    0x4524,
+    [0xad, 0x0f, 0x60, 0xd0, 0x9d, 0x31, 0x9b, 0x10],
+);
+
 // NVENC accepts any supported preset GUID. We enumerate presets at runtime and
 // use the first one rather than pinning to a newer SDK-only GUID.
 const ZERO_GUID: GUID = GUID::from_values(0, 0, 0, [0; 8]);
@@ -86,9 +93,13 @@ fn nvenc_status(status: NvencStatus, op: &str) -> Result<(), MediaError> {
     }
 }
 
-fn is_idr_annexb(data: &[u8]) -> bool {
+/// Detect IDR/keyframe in Annex-B NAL units for both H.264 and H.265.
+///
+/// H.264: NAL type is in bits 0-4 of the first byte (type 5 = IDR).
+/// H.265: NAL type is in bits 1-6 of the first byte (types 16-21 = IDR/BLA/CRA).
+fn is_idr_annexb(data: &[u8], is_hevc: bool) -> bool {
     let mut i = 0usize;
-    while i + 5 <= data.len() {
+    while i + 4 <= data.len() {
         let start_len = if data[i..].starts_with(&[0, 0, 0, 1]) {
             4
         } else if data[i..].starts_with(&[0, 0, 1]) {
@@ -97,8 +108,20 @@ fn is_idr_annexb(data: &[u8]) -> bool {
             i += 1;
             continue;
         };
-        if i + start_len < data.len() && (data[i + start_len] & 0x1f) == 5 {
-            return true;
+        if i + start_len < data.len() {
+            let nal_byte = data[i + start_len];
+            if is_hevc {
+                let nal_type = (nal_byte >> 1) & 0x3f;
+                // 16=IDR_W_RADL, 17=IDR_N_LP, 18=CRA_NUT
+                if nal_type >= 16 && nal_type <= 18 {
+                    return true;
+                }
+            } else {
+                let nal_type = nal_byte & 0x1f;
+                if nal_type == 5 {
+                    return true;
+                }
+            }
         }
         i += start_len;
     }
@@ -400,6 +423,7 @@ pub struct WindowsNvencEncoder {
     slots: Vec<InputSlot>,
     next_slot: usize,
     config: Option<EncoderConfig>,
+    codec: VideoCodec,
     info: EncoderInfo,
     initialized: bool,
     force_keyframe: bool,
@@ -424,16 +448,24 @@ impl WindowsNvencEncoder {
             slots: Vec::new(),
             next_slot: 0,
             config: None,
+            codec: VideoCodec::H264,
             info: EncoderInfo {
                 name: "native_nvenc_d3d11".to_string(),
                 hw_type: HwAccelType::Nvenc,
-                supported_codecs: vec![VideoCodec::H264],
+                supported_codecs: vec![VideoCodec::H264, VideoCodec::H265],
             },
             initialized: false,
             force_keyframe: false,
             frame_count: 0,
             sps_pps: Vec::new(),
         })
+    }
+
+    fn codec_guid(&self) -> GUID {
+        match self.codec {
+            VideoCodec::H265 => NV_ENC_CODEC_HEVC_GUID,
+            _ => NV_ENC_CODEC_H264_GUID,
+        }
     }
 
     pub fn is_available() -> bool {
@@ -462,7 +494,7 @@ impl WindowsNvencEncoder {
         }
     }
 
-    fn check_h264_nv12_support(&self) -> Result<(), MediaError> {
+    fn check_codec_nv12_support(&self, codec_guid: GUID) -> Result<(), MediaError> {
         unsafe {
             let mut guid_count = 0u32;
             nvenc_status(
@@ -491,22 +523,24 @@ impl WindowsNvencEncoder {
             if !guids
                 .iter()
                 .take(written as usize)
-                .any(|g| *g == NV_ENC_CODEC_H264_GUID)
+                .any(|g| *g == codec_guid)
             {
-                return Err(MediaError::EncoderInitFailed(
-                    "NVENC H.264 GUID not supported".into(),
-                ));
+                let name = if codec_guid == NV_ENC_CODEC_HEVC_GUID {
+                    "HEVC"
+                } else {
+                    "H.264"
+                };
+                return Err(MediaError::EncoderInitFailed(format!(
+                    "NVENC {} GUID not supported",
+                    name
+                )));
             }
 
             let mut fmt_count = 0u32;
             nvenc_status(
                 nvenc_raw!(
                     self.api,
-                    nv_enc_get_input_format_count(
-                        self.encoder,
-                        NV_ENC_CODEC_H264_GUID,
-                        &mut fmt_count
-                    ),
+                    nv_enc_get_input_format_count(self.encoder, codec_guid, &mut fmt_count),
                     "NvEncGetInputFormatCount"
                 ),
                 "NvEncGetInputFormatCount",
@@ -518,7 +552,7 @@ impl WindowsNvencEncoder {
                     self.api,
                     nv_enc_get_input_formats(
                         self.encoder,
-                        NV_ENC_CODEC_H264_GUID,
+                        codec_guid,
                         formats.as_mut_ptr(),
                         fmt_count,
                         &mut fmt_written
@@ -540,24 +574,20 @@ impl WindowsNvencEncoder {
         }
     }
 
-    fn choose_preset(&self) -> Result<GUID, MediaError> {
+    fn choose_preset(&self, codec_guid: GUID) -> Result<GUID, MediaError> {
         unsafe {
             let mut count = 0u32;
             nvenc_status(
                 nvenc_raw!(
                     self.api,
-                    nv_enc_get_encode_preset_count(
-                        self.encoder,
-                        NV_ENC_CODEC_H264_GUID,
-                        &mut count
-                    ),
+                    nv_enc_get_encode_preset_count(self.encoder, codec_guid, &mut count),
                     "NvEncGetEncodePresetCount"
                 ),
                 "NvEncGetEncodePresetCount",
             )?;
             if count == 0 {
                 return Err(MediaError::EncoderInitFailed(
-                    "NVENC returned no H.264 presets".into(),
+                    "NVENC returned no presets for the requested codec".into(),
                 ));
             }
             let mut presets = vec![ZERO_GUID; count as usize];
@@ -567,7 +597,7 @@ impl WindowsNvencEncoder {
                     self.api,
                     nv_enc_get_encode_preset_guids(
                         self.encoder,
-                        NV_ENC_CODEC_H264_GUID,
+                        codec_guid,
                         presets.as_mut_ptr(),
                         count,
                         &mut written
@@ -584,11 +614,12 @@ impl WindowsNvencEncoder {
     }
 
     fn initialize_encoder(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
-        let preset = self.choose_preset()?;
+        let codec_guid = self.codec_guid();
+        let preset = self.choose_preset(codec_guid)?;
         unsafe {
             let mut params: NvEncInitializeParams = std::mem::zeroed();
             params.version = nvenc_extended_struct_version(7);
-            params.encode_guid = NV_ENC_CODEC_H264_GUID;
+            params.encode_guid = codec_guid;
             params.preset_guid = preset;
             params.encode_width = config.width;
             params.encode_height = config.height;
@@ -912,7 +943,8 @@ impl WindowsNvencEncoder {
             return Ok(vec![]);
         }
 
-        let is_key = lock.picture_type == NV_ENC_PIC_TYPE_IDR || is_idr_annexb(&data);
+        let is_hevc = self.codec == VideoCodec::H265;
+        let is_key = lock.picture_type == NV_ENC_PIC_TYPE_IDR || is_idr_annexb(&data, is_hevc);
         if is_key && !self.sps_pps.is_empty() && !data.starts_with(&self.sps_pps) {
             let mut with_headers = Vec::with_capacity(self.sps_pps.len() + data.len());
             with_headers.extend_from_slice(&self.sps_pps);
@@ -933,17 +965,20 @@ impl WindowsNvencEncoder {
             } else {
                 0
             },
-            codec: VideoCodec::H264,
+            codec: self.codec,
         }])
     }
 }
 
 impl VideoEncoder for WindowsNvencEncoder {
     fn initialize(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
-        if config.codec != VideoCodec::H264 {
-            return Err(MediaError::EncoderInitFailed(
-                "native Windows NVENC v1 supports H.264 only".into(),
-            ));
+        match config.codec {
+            VideoCodec::H264 | VideoCodec::H265 => {}
+            _ => {
+                return Err(MediaError::EncoderInitFailed(
+                    "native Windows NVENC supports H.264 and H.265 only".into(),
+                ));
+            }
         }
         let device_ptr = config
             .d3d11_device
@@ -961,8 +996,11 @@ impl VideoEncoder for WindowsNvencEncoder {
             self.context = Some((*borrowed_context).clone());
         }
 
+        self.codec = config.codec;
+        let codec_guid = self.codec_guid();
+
         self.open_session(device_ptr)?;
-        self.check_h264_nv12_support()?;
+        self.check_codec_nv12_support(codec_guid)?;
         self.initialize_encoder(config)?;
         self.create_slots(config.width, config.height)?;
         self.config = Some(config.clone());
@@ -974,11 +1012,12 @@ impl VideoEncoder for WindowsNvencEncoder {
         self.frame_count = 0;
 
         log::info!(
-            "Native Windows NVENC D3D11 initialized: {}x{} @{}fps {}kbps",
+            "Native Windows NVENC D3D11 initialized: {}x{} @{}fps {}kbps codec={:?}",
             config.width,
             config.height,
             config.fps,
             config.bitrate_kbps,
+            self.codec,
         );
         Ok(())
     }

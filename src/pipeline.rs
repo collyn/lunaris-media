@@ -37,13 +37,11 @@ use tokio::sync::mpsc;
 use crate::audio;
 use crate::capture;
 use crate::cursor;
+use crate::capture::virtual_display::VirtualDisplayHandle;
 use crate::encode;
 use crate::encode::EncoderConfig;
 use crate::error::MediaError;
 use crate::types::*;
-
-#[cfg(target_os = "linux")]
-use crate::capture::virtual_display::VirtualDisplay;
 
 /// Events emitted by the running media pipeline.
 #[derive(Debug, Clone)]
@@ -199,26 +197,22 @@ impl MediaPipeline {
         #[allow(unused_mut)]
         let mut capture_display_id = display_id.to_string();
 
-        #[cfg(target_os = "linux")]
-        let _virtual_display = if self.config.virtual_display {
-            match VirtualDisplay::create(self.config.width, self.config.height, self.config.fps) {
+        let mut _virtual_display: Option<Box<dyn VirtualDisplayHandle>> = None;
+        if self.config.virtual_display {
+            match crate::capture::virtual_display::create_virtual_display(
+                self.config.width,
+                self.config.height,
+                self.config.fps,
+            ) {
                 Ok(vd) => {
-                    capture_display_id = vd.output_name().to_string();
+                    capture_display_id = vd.display_id().to_string();
                     log::info!("Created virtual display: {}", capture_display_id);
-                    Some(vd)
+                    _virtual_display = Some(vd);
                 }
                 Err(e) => {
                     log::warn!("Failed to create virtual display: {}", e);
-                    None
                 }
             }
-        } else {
-            None
-        };
-
-        #[cfg(not(target_os = "linux"))]
-        if self.config.virtual_display {
-            log::warn!("Virtual display is not supported on this platform yet");
         }
 
         #[cfg(target_os = "linux")]
