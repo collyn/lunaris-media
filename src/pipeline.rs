@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use crate::audio;
 use crate::capture;
 use crate::cursor;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::capture::virtual_display::VirtualDisplayHandle;
 use crate::encode;
 use crate::encode::EncoderConfig;
@@ -197,7 +198,11 @@ impl MediaPipeline {
         #[allow(unused_mut)]
         let mut capture_display_id = display_id.to_string();
 
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let mut _virtual_display: Option<Box<dyn VirtualDisplayHandle>> = None;
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let mut _virtual_display: Option<()> = None;
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if self.config.virtual_display {
             match crate::capture::virtual_display::create_virtual_display(
                 self.config.width,

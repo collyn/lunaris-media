@@ -25,7 +25,7 @@ pub mod linux_wayland;
 pub mod linux_x11;
 #[cfg(target_os = "macos")]
 pub mod macos;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod virtual_display;
 #[cfg(target_os = "windows")]
 pub mod windows;
