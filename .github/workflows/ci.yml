@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -142,7 +141,6 @@ jobs:
   integration-linux:
     name: integration (Linux)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     needs: [check-linux, test-linux]
     steps:
       - uses: actions/checkout@v4
