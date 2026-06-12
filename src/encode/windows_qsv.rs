@@ -201,6 +201,7 @@ struct MfxInfoMfx {
     encoded_bit_depth: u16,
     src_bit_depth: u16,
     fourcc: i32,
+    frame_info: MfxFrameInfo,
     frame_rate_ext: MfxFrameRateExt,
     aspect_ratio: MfxAspectRatio,
     pic_struct: u16,
