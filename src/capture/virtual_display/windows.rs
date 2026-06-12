@@ -200,13 +200,12 @@ fn open_idd_driver() -> Result<HANDLE, MediaError> {
         let handle = unsafe {
             windows::Win32::Storage::FileSystem::CreateFileA(
                 PCSTR(path.as_ptr()),
-                windows::Win32::Storage::FileSystem::GENERIC_READ
-                    | windows::Win32::Storage::FileSystem::GENERIC_WRITE,
+                0x80000000u32 | 0x40000000u32, // GENERIC_READ | GENERIC_WRITE
                 windows::Win32::Storage::FileSystem::FILE_SHARE_READ
                     | windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
                 None,
                 windows::Win32::Storage::FileSystem::OPEN_EXISTING,
-                windows::Win32::Foundation::HANDLE_FLAGS(0),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
                 None,
             )
         };
