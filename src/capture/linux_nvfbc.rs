@@ -686,6 +686,55 @@ impl Drop for NvfbcCapture {
             let _ = handle.join();
         }
     }
+
+    /// Fallback display enumeration using xrandr.
+    fn list_displays_xrandr() -> Result<Vec<DisplayInfo>, MediaError> {
+        let output = std::process::Command::new("xrandr")
+            .arg("--query")
+            .output()
+            .map_err(|e| MediaError::CaptureError(format!("xrandr failed: {}", e)))?;
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut displays = Vec::new();
+
+        for line in text.lines() {
+            // Match lines like: "DP-1 connected primary 1920x1080+0+0"
+            // or: "HDMI-0 connected 1920x1080+1920+0"
+            if !line.contains(" connected") {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let name = parts[0].to_string();
+            let is_primary = parts.contains(&"primary");
+
+            // Extract resolution and offset from geometry string (e.g. "1920x1080+0+0")
+            let (width, height) = parts
+                .iter()
+                .find(|p| p.contains('x') && p.contains('+'))
+                .and_then(|geo| {
+                    let res_part = geo.split('+').next()?;
+                    let mut wh = res_part.split('x');
+                    let w = wh.next()?.parse::<u32>().ok()?;
+                    let h = wh.next()?.parse::<u32>().ok()?;
+                    Some((w, h))
+                })
+                .unwrap_or((0, 0));
+
+            if width > 0 && height > 0 {
+                displays.push(DisplayInfo {
+                    id: name.clone(),
+                    name,
+                    width,
+                    height,
+                    refresh_rate: 60.0, // xrandr doesn't easily give refresh rate per output here
+                    is_primary,
+                });
+            }
+        }
+
+        Ok(displays)
+    }
 }
 
 #[async_trait::async_trait]
@@ -719,6 +768,14 @@ impl ScreenCapture for NvfbcCapture {
                     is_primary: index == 0,
                 })
                 .collect());
+        }
+
+        // Fallback: use xrandr to enumerate displays
+        log::info!("NvFBC returned no outputs, falling back to xrandr for display enumeration");
+        match Self::list_displays_xrandr() {
+            Ok(displays) if !displays.is_empty() => return Ok(displays),
+            Ok(_) => log::warn!("xrandr returned no displays"),
+            Err(e) => log::warn!("xrandr fallback failed: {}", e),
         }
 
         Ok(vec![DisplayInfo {
