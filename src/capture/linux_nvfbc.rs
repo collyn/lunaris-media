@@ -668,24 +668,6 @@ impl NvfbcCapture {
             frame_rx: None,
         })
     }
-}
-
-impl Drop for NvfbcCapture {
-    fn drop(&mut self) {
-        // Drop command sender to close the thread loop
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        if self
-            .cmd_tx
-            .send(NvfbcCommand::Stop { reply: reply_tx })
-            .is_ok()
-        {
-            let _ = reply_rx.recv();
-        }
-
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
-    }
 
     /// Fallback display enumeration using xrandr.
     fn list_displays_xrandr() -> Result<Vec<DisplayInfo>, MediaError> {
@@ -734,6 +716,24 @@ impl Drop for NvfbcCapture {
         }
 
         Ok(displays)
+    }
+}
+
+impl Drop for NvfbcCapture {
+    fn drop(&mut self) {
+        // Drop command sender to close the thread loop
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self
+            .cmd_tx
+            .send(NvfbcCommand::Stop { reply: reply_tx })
+            .is_ok()
+        {
+            let _ = reply_rx.recv();
+        }
+
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
