@@ -754,18 +754,22 @@ impl ScreenCapture for NvfbcCapture {
                 MediaError::CaptureError(format!("Failed to query NvFBC status: {}", e))
             })?;
 
+        log::info!("NvFBC status: {} outputs", status.outputs.len());
         if !status.outputs.is_empty() {
             return Ok(status
                 .outputs
                 .iter()
                 .enumerate()
-                .map(|(index, output)| DisplayInfo {
-                    id: output.id.to_string(),
-                    name: output.name.clone(),
-                    width: output.tracked_box.w,
-                    height: output.tracked_box.h,
-                    refresh_rate: 60.0,
-                    is_primary: index == 0,
+                .map(|(index, output)| {
+                    log::info!("NvFBC output[{}]: id={} name={} {}x{}", index, output.id, output.name, output.tracked_box.w, output.tracked_box.h);
+                    DisplayInfo {
+                        id: output.id.to_string(),
+                        name: output.name.clone(),
+                        width: output.tracked_box.w,
+                        height: output.tracked_box.h,
+                        refresh_rate: 60.0,
+                        is_primary: index == 0,
+                    }
                 })
                 .collect());
         }
