@@ -628,35 +628,121 @@ impl MediaPipeline {
 
     #[cfg(target_os = "linux")]
     fn try_set_refresh_rate(display_id: &str, target_fps: u32) {
+        // xrandr / the NVIDIA driver will happily accept `--rate N` and return a
+        // success exit code while silently clamping to the panel's real maximum.
+        // So: only attempt the change when the output actually advertises a mode
+        // at ~target_fps, and verify the rate that was truly applied afterwards.
+        if !Self::output_advertises_rate(display_id, target_fps) {
+            log::warn!(
+                "Display '{}' does not advertise a ~{}Hz mode; leaving its refresh \
+                 rate unchanged. Capture stays capped at the panel's real refresh \
+                 rate — use a genuine high-refresh output (or a forced-EDID / \
+                 virtual display) to exceed it.",
+                display_id,
+                target_fps
+            );
+            return;
+        }
+
         let target = target_fps.to_string();
-        match std::process::Command::new("xrandr")
+        if let Err(e) = std::process::Command::new("xrandr")
             .args(["--output", display_id, "--rate", target.as_str()])
             .output()
         {
-            Ok(output) if output.status.success() => {
+            log::warn!(
+                "Failed to run xrandr for {}Hz refresh-rate change on display {}: {}",
+                target_fps,
+                display_id,
+                e
+            );
+            return;
+        }
+
+        // Read back the rate the driver actually applied instead of trusting the
+        // exit code.
+        match Self::active_refresh_rate(display_id) {
+            Some(actual) if (actual - target_fps as f64).abs() <= 1.5 => {
                 log::info!(
                     "Changed display {} refresh rate to {}Hz",
                     display_id,
                     target_fps
                 );
             }
-            Ok(output) => {
+            Some(actual) => {
                 log::warn!(
-                    "Failed to change refresh rate to {}Hz for display {}: {}",
+                    "Requested {}Hz on display {} but the driver applied {:.2}Hz — \
+                     capture stays capped at ~{:.0}fps.",
                     target_fps,
                     display_id,
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    actual,
+                    actual
                 );
             }
-            Err(e) => {
+            None => {
                 log::warn!(
-                    "Failed to run xrandr for {}Hz refresh-rate change on display {}: {}",
+                    "Set {}Hz on display {} but could not verify the applied rate.",
                     target_fps,
-                    display_id,
-                    e
+                    display_id
                 );
             }
         }
+    }
+
+    /// Returns `true` if `xrandr` lists any mode for `display_id` whose refresh
+    /// rate is within ~1.5 Hz of `target_fps`.
+    #[cfg(target_os = "linux")]
+    fn output_advertises_rate(display_id: &str, target_fps: u32) -> bool {
+        Self::xrandr_output_rates(display_id)
+            .iter()
+            .any(|rate| (rate - target_fps as f64).abs() <= 1.5)
+    }
+
+    /// Returns the currently-active refresh rate (the one marked with `*`) for
+    /// `display_id`, parsed from `xrandr --query`.
+    #[cfg(target_os = "linux")]
+    fn active_refresh_rate(display_id: &str) -> Option<f64> {
+        Self::xrandr_rates(display_id, true).into_iter().next()
+    }
+
+    /// Returns all refresh rates advertised for `display_id`.
+    #[cfg(target_os = "linux")]
+    fn xrandr_output_rates(display_id: &str) -> Vec<f64> {
+        Self::xrandr_rates(display_id, false)
+    }
+
+    /// Parse refresh rates for a single output from `xrandr --query`. When
+    /// `active_only` is set, only the rate marked with `*` is returned.
+    #[cfg(target_os = "linux")]
+    fn xrandr_rates(display_id: &str, active_only: bool) -> Vec<f64> {
+        let mut rates = Vec::new();
+        let output = match std::process::Command::new("xrandr").arg("--query").output() {
+            Ok(o) => o,
+            Err(_) => return rates,
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut in_block = false;
+        for line in text.lines() {
+            // Output header lines start at column 0 (e.g. "DP-1 connected ...").
+            let is_header = !line.is_empty() && !line.starts_with(char::is_whitespace);
+            if is_header {
+                in_block = line.split_whitespace().next() == Some(display_id);
+                continue;
+            }
+            if !in_block {
+                continue;
+            }
+            // Mode lines are indented: "   1920x1080  60.00*+  59.94  50.00".
+            for tok in line.split_whitespace() {
+                if active_only && !tok.contains('*') {
+                    continue;
+                }
+                let cleaned = tok.trim_end_matches(|c| c == '*' || c == '+');
+                if let Ok(rate) = cleaned.parse::<f64>() {
+                    rates.push(rate);
+                }
+            }
+        }
+        rates
     }
 }
 
