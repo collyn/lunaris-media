@@ -441,6 +441,12 @@ pub struct NvfbcCapture {
     capturing: bool,
     last_frame_time: Instant,
     frame_rx: Option<tokio::sync::mpsc::Receiver<Result<CapturedFrame, String>>>,
+    /// Display id passed to the last `start` call, needed to recreate the
+    /// session when the capture frame rate changes at runtime.
+    display_id: String,
+    /// Config from the last `start` call, reused when reconfiguring the session
+    /// (e.g. on `set_fps`).
+    last_config: Option<StreamConfig>,
 }
 
 impl NvfbcCapture {
@@ -666,6 +672,8 @@ impl NvfbcCapture {
             capturing: false,
             last_frame_time: Instant::now(),
             frame_rx: None,
+            display_id: "default".to_string(),
+            last_config: None,
         })
     }
 
@@ -800,6 +808,8 @@ impl ScreenCapture for NvfbcCapture {
         self.width = config.width;
         self.height = config.height;
         self.fps = config.fps;
+        self.display_id = display_id.to_string();
+        self.last_config = Some(config.clone());
 
         // Create the mpsc channel for streaming frames.
         // Capacity of 2 is optimal for double buffering.
@@ -873,6 +883,45 @@ impl ScreenCapture for NvfbcCapture {
         self.capturing = false;
         log::info!("Stopped NvFBC capture");
         Ok(())
+    }
+
+    async fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        let fps = fps.max(1);
+        if fps == self.fps {
+            return Ok(());
+        }
+
+        // If not currently capturing, just remember the new rate; it will be
+        // applied by the next `start`.
+        if !self.capturing {
+            self.fps = fps;
+            return Ok(());
+        }
+
+        // NvFBC bakes the sampling rate (dwSamplingRateMs = 1000 / fps) into the
+        // capture session at creation time, so the only way to change the
+        // capture rate at runtime is to tear the session down and recreate it.
+        let config = match &self.last_config {
+            Some(cfg) => {
+                let mut cfg = cfg.clone();
+                cfg.fps = fps;
+                cfg
+            }
+            None => {
+                // No prior config to rebuild from — record the rate and bail out.
+                self.fps = fps;
+                return Ok(());
+            }
+        };
+        let display_id = self.display_id.clone();
+
+        log::info!(
+            "NvFBC set_fps: recreating capture session at {} fps (was {})",
+            fps,
+            self.fps
+        );
+        self.stop().await?;
+        self.start(&display_id, &config).await
     }
 
     fn is_capturing(&self) -> bool {

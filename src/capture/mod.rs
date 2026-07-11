@@ -114,6 +114,20 @@ pub trait ScreenCapture: Send {
     /// Stop the running capture session and release resources.
     async fn stop(&mut self) -> Result<(), MediaError>;
 
+    /// Update the target capture frame rate while capture is running.
+    ///
+    /// Some backends bake their capture pacing into the session at creation
+    /// time (e.g. NvFBC's `dwSamplingRateMs = 1000 / fps`). For those, simply
+    /// changing the pipeline's frame ticker is not enough — the backend keeps
+    /// producing frames at the original rate and the stream stays capped. Such
+    /// backends override this to reconfigure themselves.
+    ///
+    /// The default implementation is a no-op, appropriate for backends that are
+    /// paced purely by the pipeline's frame ticker (X11, DRM, DXGI, …).
+    async fn set_fps(&mut self, _fps: u32) -> Result<(), MediaError> {
+        Ok(())
+    }
+
     /// Returns `true` if capture is currently active.
     fn is_capturing(&self) -> bool;
 

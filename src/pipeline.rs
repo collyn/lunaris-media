@@ -539,6 +539,36 @@ impl MediaPipeline {
                             if let Err(e) = encoder.set_fps(new_fps) {
                                 log::warn!("Failed to update encoder FPS: {}", e);
                             }
+                            // On Linux, capturing above the display's refresh rate is
+                            // impossible unless we raise it first — the compositor
+                            // simply won't produce new frames any faster.
+                            #[cfg(target_os = "linux")]
+                            if new_fps > 60 {
+                                if let Ok(displays) = capture.list_displays().await {
+                                    if let Some(display) = displays
+                                        .iter()
+                                        .find(|display| display.is_primary)
+                                        .or_else(|| displays.first())
+                                    {
+                                        if (display.refresh_rate as u32) < new_fps {
+                                            log::info!(
+                                                "Target FPS {} > display refresh rate {}, attempting to change display '{}'",
+                                                new_fps,
+                                                display.refresh_rate,
+                                                display.id
+                                            );
+                                            Self::try_set_refresh_rate(&display.id, new_fps);
+                                        }
+                                    }
+                                }
+                            }
+                            // Reconfigure the capture backend so it actually captures
+                            // at the new rate. Some backends (e.g. NvFBC) bake the
+                            // capture pacing into the session and must recreate it;
+                            // without this the stream stays stuck at the initial FPS.
+                            if let Err(e) = capture.set_fps(new_fps).await {
+                                log::warn!("Failed to update capture FPS: {}", e);
+                            }
                             target_interval = Duration::from_nanos(1_000_000_000 / new_fps as u64);
                             frame_ticker = tokio::time::interval(target_interval);
                             frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
