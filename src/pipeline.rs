@@ -379,6 +379,11 @@ impl MediaPipeline {
         let mut target_interval = Duration::from_nanos(1_000_000_000 / self.config.fps as u64);
         let mut frame_ticker = tokio::time::interval(target_interval);
         frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Constant-FPS output pads the stream with duplicate frames so it always
+        // reaches the target FPS, instead of only emitting frames when the screen
+        // changes. Default ON so the stream honours the client's requested rate;
+        // set LUNARIS_CONSTANT_FPS=0 to fall back to change-driven encoding (lower
+        // bitrate/CPU on static screens).
         let constant_fps = std::env::var("LUNARIS_CONSTANT_FPS")
             .map(|value| {
                 matches!(
@@ -386,7 +391,7 @@ impl MediaPipeline {
                     "1" | "true" | "yes" | "on"
                 )
             })
-            .unwrap_or(cfg!(target_os = "windows"));
+            .unwrap_or(true);
         log::info!("Pipeline constant-FPS output: {}", constant_fps);
 
         let mut last_sent_time = Instant::now() - Duration::from_secs(5);
