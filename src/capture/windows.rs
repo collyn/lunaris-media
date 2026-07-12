@@ -212,7 +212,7 @@ impl ScreenCapture for DxgiCapture {
                 width,
                 height,
                 refresh_rate: 60.0,
-                is_primary: i == 0,
+                is_primary: rect.left == 0 && rect.top == 0,
             });
         }
 
@@ -227,7 +227,20 @@ impl ScreenCapture for DxgiCapture {
         let (device, context) = Self::create_d3d11_device()?;
         let outputs = Self::enumerate_outputs(&device)?;
 
-        let output_index: usize = display_id.parse().unwrap_or(0);
+        // "default" (no explicit selection) must map to the PRIMARY output, not
+        // output index 0 — DXGI EnumOutputs order is not guaranteed to be
+        // primary-first, which left the default stream capturing a blank/wrong
+        // monitor. The primary output's desktop rect is always at the origin.
+        let output_index: usize = if display_id == "default" || display_id.is_empty() {
+            outputs
+                .iter()
+                .position(|(_, d)| {
+                    d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0
+                })
+                .unwrap_or(0)
+        } else {
+            display_id.parse().unwrap_or(0)
+        };
         let (output, desc) = outputs
             .into_iter()
             .nth(output_index)
@@ -745,7 +758,16 @@ impl ScreenCapture for GdiCapture {
         }
 
         let displays = enumerate_gdi_monitors_with_coords()?;
-        let display_index: usize = display_id.parse().unwrap_or(0);
+        // "default" → the primary monitor (positioned at the desktop origin),
+        // not GDI monitor index 0.
+        let display_index: usize = if display_id == "default" || display_id.is_empty() {
+            displays
+                .iter()
+                .position(|d| d.x == 0 && d.y == 0)
+                .unwrap_or(0)
+        } else {
+            display_id.parse().unwrap_or(0)
+        };
         let display = displays
             .into_iter()
             .nth(display_index)
