@@ -20,6 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
     VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::GetLastError;
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::IsUserAnAdmin;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
 struct UinputInjector {
@@ -163,6 +169,42 @@ pub struct InputInjector {
     _private: (), // SendInput is stateless, no per-instance state needed
 }
 
+#[cfg(target_os = "windows")]
+/// Timestamp of last UIPI-access-denied log line (milliseconds since epoch),
+/// used to rate-limit the warning to once every ~5 seconds instead of
+/// thousands of times per second while an elevated window is in focus.
+static LAST_UIPI_WARN_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+/// Wrap `SendInput` with error checking. Returns the same value as `SendInput`
+/// (count of successfully inserted events). Logs a rate-limited diagnostic when
+/// the call fails due to UIPI (e.g. an elevated window like Task Manager has
+/// focus and blocks input from a non-admin process).
+unsafe fn send_input_checked(inputs: &[INPUT], cb_size: i32) -> u32 {
+    let ret = SendInput(inputs, cb_size);
+    if ret == 0 {
+        // Input was blocked — nearly always UIPI when a privileged window
+        // (Task Manager, UAC prompt, etc.) has focus.
+        let err = GetLastError();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_UIPI_WARN_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) > 5000 {
+            LAST_UIPI_WARN_MS.store(now_ms, Ordering::Relaxed);
+            log::warn!(
+                "SendInput blocked (Win32 error {}). This usually means an \
+                 elevated window (e.g. Task Manager, UAC) is in focus and \
+                 UIPI is preventing non-admin input injection. To fix, \
+                 restart the Lunaris agent as Administrator.",
+                err.0
+            );
+        }
+    }
+    ret
+}
+
 // SAFETY: input injection backends are safe to send between threads when wrapped
 // and synchronized (e.g. by using a Mutex in the calling/owning task).
 unsafe impl Send for InputInjector {}
@@ -224,6 +266,21 @@ impl InputInjector {
         }
         #[cfg(target_os = "windows")]
         {
+            // Warn early if the agent isn't running as Administrator. Without
+            // admin elevation, Windows UIPI blocks `SendInput` to any elevated
+            // window — most notably Task Manager (Ctrl+Shift+Esc). When that
+            // happens all mouse/keyboard injection silently fails and remote
+            // input appears frozen.
+            unsafe {
+                if !IsUserAnAdmin().as_bool() {
+                    log::warn!(
+                        "Windows UIPI: agent is NOT running as Administrator. \
+                         If the remote mouse/keyboard stops responding when an \
+                         elevated window (Task Manager, UAC prompt, …) is in \
+                         focus, restart the agent as Administrator."
+                    );
+                }
+            }
             log::info!("InputInjector: initialized Windows SendInput backend");
             Some(Self { _private: () })
         }
@@ -312,7 +369,7 @@ impl InputInjector {
                     },
                 },
             };
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32);
         }
     }
 
@@ -365,7 +422,7 @@ impl InputInjector {
                             },
                         },
                     };
-                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                    send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32);
                 }
             }
         }
@@ -454,7 +511,7 @@ impl InputInjector {
                     },
                 },
             };
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32);
         }
     }
 
@@ -511,7 +568,7 @@ impl InputInjector {
                     },
                 },
             };
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32);
         }
     }
 
