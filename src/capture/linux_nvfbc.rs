@@ -246,7 +246,14 @@ unsafe extern "C" fn custom_x11_error_handler(
     0 // Return 0 to continue (don't exit)
 }
 
-fn init_capturer() -> Result<(ActiveCapturer, Option<CudaContextGuard>), String> {
+/// Initialize an NvFBC capturer under a temporary X11 error-handler guard.
+///
+/// When `prefer_cuda` is `true`, a CUDA context + NvFBC CUDA capturer is tried
+/// first (zero-copy GPU capture path). When `false`, CUDA is skipped entirely
+/// and only the System capturer is created — much cheaper (no ~28 MiB CUDA
+/// context, no `cuInit`), which is all that display enumeration / status queries
+/// need.
+fn init_capturer(prefer_cuda: bool) -> Result<(ActiveCapturer, Option<CudaContextGuard>), String> {
     // Install custom X11 error handler to prevent GLX errors from being fatal.
     // NvFBC internally creates GLX contexts which can trigger X errors that
     // would kill the process. We suppress them and check after each step.
@@ -313,7 +320,7 @@ fn init_capturer() -> Result<(ActiveCapturer, Option<CudaContextGuard>), String>
         }
     };
 
-    let result = init_capturer_inner(x_display, xlib_handle, &x_sync);
+    let result = init_capturer_inner(x_display, xlib_handle, &x_sync, prefer_cuda);
 
     // Restore previous X11 error handler
     unsafe {
@@ -344,9 +351,12 @@ fn init_capturer_inner(
     x_display: *mut libc::c_void,
     xlib_handle: *mut libc::c_void,
     x_sync: &dyn Fn(*mut libc::c_void, *mut libc::c_void),
+    prefer_cuda: bool,
 ) -> Result<(ActiveCapturer, Option<CudaContextGuard>), String> {
-    // Step 1: Try CUDA + NvFBC CUDA Capturer
-    match unsafe { try_init_cuda() } {
+    // Step 1: Try CUDA + NvFBC CUDA Capturer (unless the caller only needs a
+    // lightweight status query, in which case CUDA is skipped entirely).
+    if prefer_cuda {
+        match unsafe { try_init_cuda() } {
         Ok(guard) => {
             // XSync to flush any X errors from CUDA init
             x_sync(x_display, xlib_handle);
@@ -396,7 +406,8 @@ fn init_capturer_inner(
                 e
             );
         }
-    }
+        }
+    } // end `if prefer_cuda`
 
     // Step 2: Try NvFBC System Capturer (no CUDA needed)
     match SystemCapturer::new() {
@@ -416,6 +427,49 @@ fn init_capturer_inner(
     }
 }
 
+/// Build [`DisplayInfo`]s from an NvFBC status. The display id is the **numeric
+/// NvFBC output id**, which is what [`custom_start_nvfbc`] parses back into
+/// `dwOutputId` — so ids produced here round-trip correctly to a capture start.
+fn displays_from_status(status: &nvfbc::Status) -> Vec<DisplayInfo> {
+    status
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| DisplayInfo {
+            id: output.id.to_string(),
+            name: output.name.clone(),
+            width: output.tracked_box.w,
+            height: output.tracked_box.h,
+            refresh_rate: 60.0,
+            is_primary: index == 0,
+        })
+        .collect()
+}
+
+/// Enumerate displays for capability queries **without** creating a CUDA context.
+///
+/// Creates only the NvFBC *System* capturer (no CUDA context, no capture
+/// session) purely to read output status, then tears it down. This avoids the
+/// ~28 MiB CUDA context and the slow `cuInit`/`cuCtxCreate` that a full capture
+/// backend pays — which matters because capability queries fire every time a
+/// client opens its settings. Returns the same numeric NvFBC output ids as the
+/// capture path, so display selection is unaffected.
+///
+/// Returns `Err` when NvFBC is unavailable (non-NVIDIA / Wayland), letting the
+/// caller fall back to the full capture backend. Must be called from a blocking
+/// context: it performs synchronous NvFBC/GLX init on the calling thread and
+/// drops the capturer on that same thread (GLX context thread-affinity).
+pub fn list_displays_lightweight() -> Result<Vec<DisplayInfo>, MediaError> {
+    let (capturer, _guard) = init_capturer(false)
+        .map_err(|e| MediaError::CaptureError(format!("NvFBC status init failed: {}", e)))?;
+    let status_res = capturer.status();
+    // Drop on THIS thread (same thread that created the GLX context).
+    drop(capturer);
+    let status = status_res
+        .map_err(|e| MediaError::CaptureError(format!("NvFBC status query failed: {:?}", e)))?;
+    Ok(displays_from_status(&status))
+}
+
 enum NvfbcCommand {
     GetStatus {
         reply: std::sync::mpsc::Sender<Result<nvfbc::Status, String>>,
@@ -427,6 +481,16 @@ enum NvfbcCommand {
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Stop {
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// Terminate the background thread entirely (used by `Drop`). Unlike `Stop`
+    /// — which only ends the current capture session but keeps the thread alive
+    /// for reuse (e.g. `set_fps` does stop+start) — `Shutdown` breaks the thread
+    /// loop so the thread returns, dropping the capturer and CUDA context. Without
+    /// a dedicated shutdown signal, `Drop::join()` deadlocks: `Stop` leaves the
+    /// thread blocked on `cmd_rx.recv()`, which never returns while `cmd_tx` is
+    /// still held by the struct being dropped.
+    Shutdown {
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
 }
@@ -468,7 +532,7 @@ impl NvfbcCapture {
         let thread_handle = std::thread::Builder::new()
             .name("lunaris-nvfbc".into())
             .spawn(move || {
-                let (mut capturer, cuda_guard) = match init_capturer() {
+                let (mut capturer, cuda_guard) = match init_capturer(true) {
                     Ok(res) => {
                         let _ = init_tx.send(Ok(()));
                         res
@@ -481,7 +545,7 @@ impl NvfbcCapture {
 
                 let mut active_frame_tx: Option<tokio::sync::mpsc::Sender<Result<CapturedFrame, String>>> = None;
 
-                loop {
+                'thread_loop: loop {
                     // 1. Process all pending commands first (non-blocking check)
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
@@ -524,6 +588,13 @@ impl NvfbcCapture {
                                 active_frame_tx = None;
                                 let res = capturer.stop().map_err(|e| format!("{:?}", e));
                                 let _ = reply.send(res);
+                            }
+                            NvfbcCommand::Shutdown { reply } => {
+                                // End any active session, then break the loop so the
+                                // thread returns and its capturer + CUDA context drop.
+                                let _ = capturer.stop();
+                                let _ = reply.send(Ok(()));
+                                break 'thread_loop;
                             }
                         }
                     }
@@ -627,9 +698,16 @@ impl NvfbcCapture {
                                     NvfbcCommand::Stop { reply } => {
                                         let _ = reply.send(Ok(()));
                                     }
+                                    NvfbcCommand::Shutdown { reply } => {
+                                        // Not capturing here, so just acknowledge and
+                                        // break out so the thread returns and drops its
+                                        // capturer + CUDA context.
+                                        let _ = reply.send(Ok(()));
+                                        break 'thread_loop;
+                                    }
                                 }
                             }
-                            Err(_) => break, // cmd_tx dropped, exit thread
+                            Err(_) => break 'thread_loop, // cmd_tx dropped, exit thread
                         }
                     }
                 }
@@ -729,11 +807,15 @@ impl NvfbcCapture {
 
 impl Drop for NvfbcCapture {
     fn drop(&mut self) {
-        // Drop command sender to close the thread loop
+        // Send a dedicated Shutdown (NOT Stop): Stop only ends the capture
+        // session but leaves the thread blocked on `cmd_rx.recv()`, so the
+        // `join()` below would deadlock (the thread never exits while `cmd_tx`
+        // is still held here). Shutdown breaks the thread loop so `join()`
+        // returns and the CUDA context / NvFBC session are released.
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .cmd_tx
-            .send(NvfbcCommand::Stop { reply: reply_tx })
+            .send(NvfbcCommand::Shutdown { reply: reply_tx })
             .is_ok()
         {
             let _ = reply_rx.recv();
@@ -764,22 +846,17 @@ impl ScreenCapture for NvfbcCapture {
 
         log::info!("NvFBC status: {} outputs", status.outputs.len());
         if !status.outputs.is_empty() {
-            return Ok(status
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(index, output)| {
-                    log::info!("NvFBC output[{}]: id={} name={} {}x{}", index, output.id, output.name, output.tracked_box.w, output.tracked_box.h);
-                    DisplayInfo {
-                        id: output.id.to_string(),
-                        name: output.name.clone(),
-                        width: output.tracked_box.w,
-                        height: output.tracked_box.h,
-                        refresh_rate: 60.0,
-                        is_primary: index == 0,
-                    }
-                })
-                .collect());
+            for (index, output) in status.outputs.iter().enumerate() {
+                log::info!(
+                    "NvFBC output[{}]: id={} name={} {}x{}",
+                    index,
+                    output.id,
+                    output.name,
+                    output.tracked_box.w,
+                    output.tracked_box.h
+                );
+            }
+            return Ok(displays_from_status(&status));
         }
 
         // Fallback: use xrandr to enumerate displays

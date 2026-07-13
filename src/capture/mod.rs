@@ -191,3 +191,46 @@ pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     Err(MediaError::PlatformNotSupported("Unsupported OS".into()))
 }
+
+/// Enumerate displays for capability queries as cheaply as possible.
+///
+/// Unlike [`create_screen_capture`] followed by [`ScreenCapture::list_displays`],
+/// this avoids spinning up a full GPU capture backend — and, on NVIDIA, a
+/// ~28 MiB CUDA context plus a slow `cuInit` — just to read the display list.
+/// That matters because capability queries fire every time a client opens its
+/// settings; the heavyweight path made each query allocate GPU memory and (before
+/// the drop fix) leak it.
+///
+/// On Linux it first tries an NvFBC status-only query that skips CUDA entirely;
+/// if NvFBC is unavailable it falls back to the regular capture backend. On other
+/// platforms it uses the regular backend, whose enumeration is already light.
+/// The returned display ids are identical to the capture path, so display
+/// selection is unaffected.
+pub async fn list_displays_for_capabilities() -> Result<Vec<DisplayInfo>, MediaError> {
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::task::spawn_blocking(linux_nvfbc::list_displays_lightweight).await {
+            Ok(Ok(displays)) if !displays.is_empty() => return Ok(displays),
+            Ok(Ok(_)) => {
+                log::info!(
+                    "NvFBC lightweight enumeration returned no outputs; using full backend"
+                );
+            }
+            Ok(Err(e)) => {
+                log::info!(
+                    "NvFBC lightweight enumeration unavailable ({}); using full backend",
+                    e
+                );
+            }
+            Err(e) => log::warn!("NvFBC lightweight enumeration task join failed: {}", e),
+        }
+    }
+
+    // Fallback: full capture backend. Its teardown is leak-free after the drop
+    // fix, but on Linux `NvfbcCapture::drop()` still joins a background thread, so
+    // drop it off the async runtime rather than blocking a runtime worker.
+    let cap = create_screen_capture()?;
+    let displays = cap.list_displays().await;
+    tokio::task::spawn_blocking(move || drop(cap));
+    displays
+}
