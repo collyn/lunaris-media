@@ -23,9 +23,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::GetLastError;
 #[cfg(target_os = "windows")]
-use windows::Win32::Security::IsUserAnAdmin;
-#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "windows")]
+/// Direct FFI binding to `IsUserAnAdmin` in shell32.dll. Avoids pulling in the
+/// `Win32_UI_Shell` windows-rs feature just for one bool function.
+extern "system" {
+    fn IsUserAnAdmin() -> i32;
+}
 
 #[cfg(target_os = "linux")]
 struct UinputInjector {
@@ -272,7 +277,7 @@ impl InputInjector {
             // happens all mouse/keyboard injection silently fails and remote
             // input appears frozen.
             unsafe {
-                if !IsUserAnAdmin().as_bool() {
+                if IsUserAnAdmin() == 0 {
                     log::warn!(
                         "Windows UIPI: agent is NOT running as Administrator. \
                          If the remote mouse/keyboard stops responding when an \
