@@ -416,8 +416,11 @@ impl MediaPipeline {
                     // Backpressure: skip encode if downstream is congested.
                     // This prevents unbounded queue growth and keeps latency low.
                     let queue_len = event_capacity - self.event_tx.capacity();
-                    if queue_len >= 48 {
-                        // Downstream can't keep up — skip this frame
+                    if queue_len >= 56 {
+                        // Downstream can't keep up — skip this frame.
+                        // Threshold at ~87% of 64 (was 75%=48) gives the encoder
+                        // more breathing room before we start dropping frames,
+                        // reducing visible stutter during high-motion scenes.
                         skipped_frames += 1;
                         if skipped_frames % 60 == 1 {
                             log::warn!("Pipeline backpressure: skipped {} frames (queue_len={})",
