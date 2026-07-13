@@ -267,7 +267,11 @@ impl MediaPipeline {
             fps: self.config.fps,
             bitrate_kbps: self.config.bitrate_kbps,
             low_latency: true,
-            keyframe_interval: 0,
+            // IDR every 4 s at 60 fps (240 frames). Was 0 (=fps=60=1 s),
+            // which caused a bandwidth spike every second from the large IDR
+            // frame, producing visible micro-stutter. PLI from the browser
+            // still triggers immediate IDR on demand.
+            keyframe_interval: 240,
             preferred_hw,
             force_ffmpeg,
             d3d11_device,
