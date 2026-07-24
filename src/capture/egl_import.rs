@@ -374,53 +374,115 @@ impl EglImporter {
 
             let w = width as EGLint;
             let h = height as EGLint;
-            let attrs = [
+
+            // DRM_FORMAT_XRGB8888 as fallback (no alpha, common on GNOME Wayland)
+            const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+
+            // Build candidate attribute lists. On NVIDIA Wayland, the DMA-BUF
+            // uses block-linear tiling but PipeWire may not report the modifier
+            // correctly (modifier=0 means LINEAR, which is wrong). Strategy:
+            //
+            // 1. Try WITHOUT modifier attrs — EGL auto-detects the layout.
+            //    This works on NVIDIA 535+ with EGL_EXT_image_dma_buf_import.
+            // 2. Try WITH explicit modifier (if non-zero and explicitly found).
+            // 3. Try alternate fourcc (XRGB8888 instead of ARGB8888) without modifier.
+            let mut attempts: Vec<(Vec<EGLint>, &str)> = Vec::new();
+
+            // Attempt 1: no modifier, original fourcc
+            attempts.push((vec![
                 EGL_WIDTH, w,
                 EGL_HEIGHT, h,
                 EGL_LINUX_DRM_FOURCC_EXT, fourcc as EGLint,
                 EGL_DMA_BUF_PLANE0_FD_EXT, fd as EGLint,
                 EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset as EGLint,
                 EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as EGLint,
-                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (modifier & 0xFFFFFFFF) as EGLint,
-                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (modifier >> 32) as EGLint,
                 EGL_NONE,
-            ];
+            ], "no-modifier"));
 
-            let image = (self.eglCreateImageKHR)(self.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, ptr::null_mut(), attrs.as_ptr());
-            if image == EGL_NO_IMAGE_KHR {
-                return Err(MediaError::CaptureError(format!("eglCreateImageKHR failed, error: 0x{:X}", (self.eglGetError)())));
+            // Attempt 2: with explicit modifier (if non-zero)
+            if modifier != 0 {
+                attempts.push((vec![
+                    EGL_WIDTH, w,
+                    EGL_HEIGHT, h,
+                    EGL_LINUX_DRM_FOURCC_EXT, fourcc as EGLint,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, fd as EGLint,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset as EGLint,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as EGLint,
+                    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (modifier & 0xFFFFFFFF) as EGLint,
+                    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (modifier >> 32) as EGLint,
+                    EGL_NONE,
+                ], "with-modifier"));
             }
 
-            let mut tex = 0;
-            (self.glGenTextures)(1, &mut tex);
-            (self.glBindTexture)(GL_TEXTURE_2D, tex);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            (self.glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, image);
+            // Attempt 3: alternate fourcc (XRGB8888) without modifier
+            if fourcc != DRM_FORMAT_XRGB8888 {
+                attempts.push((vec![
+                    EGL_WIDTH, w,
+                    EGL_HEIGHT, h,
+                    EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_XRGB8888 as EGLint,
+                    EGL_DMA_BUF_PLANE0_FD_EXT, fd as EGLint,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset as EGLint,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as EGLint,
+                    EGL_NONE,
+                ], "XRGB8888-no-modifier"));
+            }
 
-            let mut fbo = 0;
-            (self.glGenFramebuffers)(1, &mut fbo);
-            (self.glBindFramebuffer)(GL_FRAMEBUFFER, fbo);
-            (self.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            let mut last_error = String::new();
+            for (attrs, label) in &attempts {
+                let image = (self.eglCreateImageKHR)(
+                    self.display,
+                    EGL_NO_CONTEXT,
+                    EGL_LINUX_DMA_BUF_EXT,
+                    ptr::null_mut(),
+                    attrs.as_ptr(),
+                );
+                if image == EGL_NO_IMAGE_KHR {
+                    last_error = format!("eglCreateImageKHR({}) failed: 0x{:X}", label, (self.eglGetError)());
+                    continue;
+                }
 
-            if (self.glCheckFramebufferStatus)(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE {
+                let mut tex = 0;
+                (self.glGenTextures)(1, &mut tex);
+                (self.glBindTexture)(GL_TEXTURE_2D, tex);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                (self.glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, image);
+
+                let mut fbo = 0;
+                (self.glGenFramebuffers)(1, &mut fbo);
+                (self.glBindFramebuffer)(GL_FRAMEBUFFER, fbo);
+                (self.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+                let fb_status = (self.glCheckFramebufferStatus)(GL_FRAMEBUFFER);
+                if fb_status != GL_FRAMEBUFFER_COMPLETE {
+                    (self.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+                    (self.glDeleteFramebuffers)(1, &fbo);
+                    (self.glDeleteTextures)(1, &tex);
+                    (self.eglDestroyImageKHR)(self.display, image);
+                    last_error = format!("GL framebuffer incomplete ({}, status=0x{:X})", label, fb_status);
+                    continue;
+                }
+
+                // Success! Read pixels.
+                let mut buf = vec![0u8; (width * height * 4) as usize];
+                (self.glReadPixels)(0, 0, width as GLsizei, height as GLsizei, GL_BGRA, GL_UNSIGNED_BYTE, buf.as_mut_ptr() as *mut c_void);
+
+                // Cleanup
+                (self.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
                 (self.glDeleteFramebuffers)(1, &fbo);
                 (self.glDeleteTextures)(1, &tex);
                 (self.eglDestroyImageKHR)(self.display, image);
-                return Err(MediaError::CaptureError("GL framebuffer incomplete".into()));
+
+                // Log which strategy worked (only on first success)
+                if self.cached_modifier.is_none() {
+                    log::info!("EGL DMA-BUF import succeeded with strategy '{}' (fourcc=0x{:08X}, modifier=0x{:016X})", label, fourcc, modifier);
+                }
+                self.cached_modifier = Some(modifier);
+
+                return Ok(buf);
             }
 
-            let mut buf = vec![0u8; (width * height * 4) as usize];
-            (self.glReadPixels)(0, 0, width as GLsizei, height as GLsizei, GL_BGRA, GL_UNSIGNED_BYTE, buf.as_mut_ptr() as *mut c_void);
-
-            // Cleanup
-            (self.glDeleteFramebuffers)(1, &fbo);
-            (self.glDeleteTextures)(1, &tex);
-            (self.eglDestroyImageKHR)(self.display, image);
-
-            self.cached_modifier = Some(modifier);
-
-            Ok(buf)
+            Err(MediaError::CaptureError(format!("All EGL import attempts failed. Last: {}", last_error)))
         }
     }
 }
