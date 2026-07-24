@@ -204,6 +204,14 @@ pub struct EglImporter {
     /// Once a working modifier is found, it's reused for all subsequent imports.
     cached_modifier: Option<u64>,
 
+    // Persistent GL resources for fast DMA-BUF import (reused across frames to eliminate CPU allocation overhead)
+    cached_width: u32,
+    cached_height: u32,
+    src_tex: GLuint,
+    src_fbo: GLuint,
+    dst_tex: GLuint,
+    dst_fbo: GLuint,
+
     // EGL function pointers
     eglGetError: EglGetErrorFn,
     eglGetProcAddress: EglGetProcAddressFn,
@@ -561,6 +569,12 @@ impl EglImporter {
             config,
             surface: draw_surf,
             cached_modifier: None,
+            cached_width: 0,
+            cached_height: 0,
+            src_tex: 0,
+            src_fbo: 0,
+            dst_tex: 0,
+            dst_fbo: 0,
             eglGetError,
             eglGetProcAddress,
             eglInitialize,
@@ -861,49 +875,62 @@ impl EglImporter {
             image, fd, width, height, stride, fourcc, offset, modifier
         );
 
-        // --- 3. Create GL texture from EGLImage ---
-        let mut tex: GLuint = 0;
-        unsafe { (self.glGenTextures)(1, &mut tex); }
-        if tex == 0 {
-            unsafe { (self.eglDestroyImage)(self.display, image); }
-            return Err(MediaError::CaptureError("glGenTextures failed".into()));
-        }
-
         // --- 3 & 4. Bind EGLImage and read back linear pixel data via GPU texture sampler ---
-        let data_size = (width * height * 4) as usize;
-        let mut data: Vec<u8> = vec![0u8; data_size];
-        let mut src_tex: GLuint = 0;
-        let mut src_fbo: GLuint = 0;
-        let mut dst_tex: GLuint = 0;
-        let mut dst_fbo: GLuint = 0;
+        if self.cached_width != width || self.cached_height != height || self.dst_fbo == 0 {
+            unsafe {
+                if self.dst_fbo != 0 {
+                    (self.glDeleteFramebuffers)(1, &self.dst_fbo);
+                    self.dst_fbo = 0;
+                }
+                if self.dst_tex != 0 {
+                    (self.glDeleteTextures)(1, &self.dst_tex);
+                    self.dst_tex = 0;
+                }
+                if self.src_fbo != 0 {
+                    (self.glDeleteFramebuffers)(1, &self.src_fbo);
+                    self.src_fbo = 0;
+                }
+                if self.src_tex != 0 {
+                    (self.glDeleteTextures)(1, &self.src_tex);
+                    self.src_tex = 0;
+                }
+
+                (self.glGenTextures)(1, &mut self.src_tex);
+                (self.glBindTexture)(GL_TEXTURE_2D, self.src_tex);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+                (self.glGenFramebuffers)(1, &mut self.src_fbo);
+                (self.glBindFramebuffer)(GL_READ_FRAMEBUFFER, self.src_fbo);
+                (self.glFramebufferTexture2D)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.src_tex, 0);
+
+                (self.glGenTextures)(1, &mut self.dst_tex);
+                (self.glBindTexture)(GL_TEXTURE_2D, self.dst_tex);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                (self.glTexImage2D)(
+                    GL_TEXTURE_2D, 0, GL_RGBA as GLint,
+                    width as GLsizei, height as GLsizei, 0,
+                    GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null(),
+                );
+
+                (self.glGenFramebuffers)(1, &mut self.dst_fbo);
+                (self.glBindFramebuffer)(GL_FRAMEBUFFER, self.dst_fbo);
+                (self.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.dst_tex, 0);
+
+                self.cached_width = width;
+                self.cached_height = height;
+            }
+        }
 
         unsafe {
-            (self.glGenTextures)(1, &mut src_tex);
-            (self.glBindTexture)(GL_TEXTURE_2D, src_tex);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            (self.glBindTexture)(GL_TEXTURE_2D, self.src_tex);
             (self.glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, image);
-
-            (self.glGenFramebuffers)(1, &mut src_fbo);
-            (self.glBindFramebuffer)(GL_READ_FRAMEBUFFER, src_fbo);
-            (self.glFramebufferTexture2D)(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src_tex, 0);
-
-            (self.glGenTextures)(1, &mut dst_tex);
-            (self.glBindTexture)(GL_TEXTURE_2D, dst_tex);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            (self.glTexImage2D)(
-                GL_TEXTURE_2D, 0, GL_RGBA as GLint,
-                width as GLsizei, height as GLsizei, 0,
-                GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null(),
-            );
-
-            (self.glGenFramebuffers)(1, &mut dst_fbo);
-            (self.glBindFramebuffer)(GL_FRAMEBUFFER, dst_fbo);
-            (self.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst_tex, 0);
         }
 
-        let rendered = self.draw_textured_quad(src_tex, dst_fbo, width, height);
+        let rendered = self.draw_textured_quad(self.src_tex, self.dst_fbo, width, height);
+        let data_size = (width * height * 4) as usize;
+        let mut data: Vec<u8> = vec![0u8; data_size];
 
         let result = if !rendered {
             Err(MediaError::CaptureError("draw_textured_quad failed".into()))
@@ -915,9 +942,14 @@ impl EglImporter {
                     GL_RGBA, GL_UNSIGNED_BYTE,
                     data.as_mut_ptr() as *mut std::ffi::c_void,
                 );
-                // Convert RGBA -> BGRA in place
-                for pixel in data.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
+
+                // Fast 32-bit bit-wise R/B channel swapping (autovectorized by LLVM to SSE4/AVX2)
+                let u32_ptr = data.as_mut_ptr() as *mut u32;
+                let len = data.len() / 4;
+                let slice = std::slice::from_raw_parts_mut(u32_ptr, len);
+                for p in slice {
+                    let v = *p;
+                    *p = (v & 0xFF00FF00) | ((v & 0x00FF0000) >> 16) | ((v & 0x000000FF) << 16);
                 }
             }
 
@@ -933,9 +965,6 @@ impl EglImporter {
                     static LOGGED: AtomicBool = AtomicBool::new(false);
                     if !LOGGED.swap(true, Ordering::Relaxed) {
                         let non_zero = data.iter().filter(|&&b| b != 0).count();
-                        let row0 = &data[..data.len().min(32)];
-                        let row100_off = (100 * width as usize * 4).min(data.len().saturating_sub(32));
-                        let row100 = &data[row100_off..(row100_off + 32).min(data.len())];
                         log::info!(
                             "EGL DMA-BUF import: {}x{} stride={} fourcc=0x{:08X} -> RGBA bytes={} non_zero={}",
                             width, height, stride, fourcc, data.len(), non_zero,
@@ -946,13 +975,9 @@ impl EglImporter {
             }
         };
 
-        // Cleanup
+        // Only destroy per-frame EGLImage; cached GL textures and FBOs remain allocated
         unsafe {
             (self.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
-            (self.glDeleteFramebuffers)(1, &dst_fbo);
-            (self.glDeleteTextures)(1, &dst_tex);
-            (self.glDeleteFramebuffers)(1, &src_fbo);
-            (self.glDeleteTextures)(1, &src_tex);
             (self.eglDestroyImage)(self.display, image);
         }
 
