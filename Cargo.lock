@@ -1595,6 +1595,7 @@ dependencies = [
  "ffmpeg-next",
  "image",
  "libc",
+ "libloading",
  "log",
  "nix 0.29.0",
  "nvfbc",

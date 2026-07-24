@@ -59,7 +59,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
 use windows::core::Interface;
 
 #[cfg(not(target_os = "windows"))]
-const SWS_FAST_BILINEAR: libc::c_int = ffi::SWS_FAST_BILINEAR as libc::c_int;
+const SWS_FAST_BILINEAR: libc::c_int = 1; // SWS_FAST_BILINEAR = 1 in all FFmpeg versions
 
 use crate::capture::gpu_buffer::GpuBuffer;
 use crate::encode::{EncoderConfig, VideoEncoder};

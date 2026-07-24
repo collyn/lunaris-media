@@ -220,8 +220,26 @@ impl InputInjector {
     pub fn new() -> Option<Self> {
         #[cfg(target_os = "linux")]
         {
-            // 1. Prioritize X11 XTest if running inside an active display session (DISPLAY is set),
-            // as uinput devices might be ignored/unplugged by the active X11/display server.
+            let is_wayland = std::env::var("XDG_SESSION_TYPE")
+                .unwrap_or_default()
+                == "wayland";
+
+            // On Wayland, X11 XTest events go through XWayland and cannot
+            // reach native Wayland windows — they silently fail. Prefer
+            // uinput (kernel-level evdev injection) which works everywhere.
+            // On X11, prefer XTest for lower latency and better compositor
+            // integration (uinput devices may be ignored by some WMs).
+            if is_wayland {
+                if let Some(uinput) = UinputInjector::new() {
+                    log::info!("InputInjector: initialized uinput backend (Wayland)");
+                    return Some(Self {
+                        backend: Backend::Uinput(uinput),
+                    });
+                }
+                log::warn!("InputInjector: uinput unavailable on Wayland, falling back to X11 XTest (may not reach native Wayland windows)");
+            }
+
+            // X11 path (primary for X11 sessions, fallback for Wayland)
             if std::env::var("DISPLAY").is_ok() {
                 unsafe {
                     xlib::XInitThreads();
@@ -231,20 +249,20 @@ impl InputInjector {
                     unsafe { xlib::XOpenDisplay(std::ptr::null()) }
                 };
                 if !display.is_null() {
-                    log::info!("InputInjector: initialized X11 display connection (preferred backend)");
+                    log::info!("InputInjector: initialized X11 display connection (X11 XTest backend)");
                     let (screen, screen_width, screen_height) = unsafe {
                         let s = xlib::XDefaultScreen(display);
                         let w = xlib::XDisplayWidth(display, s) as i32;
                         let h = xlib::XDisplayHeight(display, s) as i32;
                         (s, w, h)
                     };
-                    
+
                     let (monitor_x, monitor_y, monitor_width, monitor_height) = if let Some(geom) = get_primary_monitor_geometry() {
                         (geom.x, geom.y, geom.width, geom.height)
                     } else {
                         (0, 0, screen_width, screen_height)
                     };
-                    
+
                     return Some(Self {
                         backend: Backend::X11(X11Backend {
                             display,
@@ -258,12 +276,14 @@ impl InputInjector {
                 }
             }
 
-            // 2. Try uinput (optimal kernel-level low-latency injection, matching Sunshine, fallback for headless/Wayland)
-            if let Some(uinput) = UinputInjector::new() {
-                log::info!("InputInjector: initialized uinput backend");
-                return Some(Self {
-                    backend: Backend::Uinput(uinput),
-                });
+            // uinput fallback for X11 (or headless without DISPLAY)
+            if !is_wayland {
+                if let Some(uinput) = UinputInjector::new() {
+                    log::info!("InputInjector: initialized uinput backend");
+                    return Some(Self {
+                        backend: Backend::Uinput(uinput),
+                    });
+                }
             }
 
             log::error!("InputInjector: failed to initialize both X11 XTest and uinput");

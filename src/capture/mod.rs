@@ -23,6 +23,8 @@ pub mod linux_nvfbc;
 pub mod linux_wayland;
 #[cfg(target_os = "linux")]
 pub mod linux_x11;
+#[cfg(target_os = "linux")]
+pub mod egl_import;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -145,32 +147,53 @@ pub trait ScreenCapture: Send {
 pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
     #[cfg(target_os = "linux")]
     {
-        // Priority: NvFBC (NVIDIA GPU direct) > DRM/KMS (zero-copy GPU) > PipeWire (Wayland) > X11
-        match linux_nvfbc::NvfbcCapture::new() {
-            Ok(nvfbc) => {
-                log::info!("Using NVIDIA NvFBC screen capture (GPU accelerated)");
-                return Ok(Box::new(nvfbc));
+        let is_wayland = std::env::var("XDG_SESSION_TYPE")
+            .unwrap_or_default()
+            == "wayland";
+
+        if is_wayland {
+            // On Wayland:
+            // - NvFBC is X11-only (uses GLX/X11 framebuffer capture)
+            // - DRM/KMS requires CAP_SYS_ADMIN and the compositor holds DRM Master
+            // → PipeWire via XDG Desktop Portal is the only reliable path
+            log::info!("Wayland session detected — trying PipeWire first");
+            match linux_wayland::PipeWireCapture::new() {
+                Ok(pw) => {
+                    log::info!("Using PipeWire screen capture (Wayland, DMA-BUF)");
+                    return Ok(Box::new(pw));
+                }
+                Err(e) => {
+                    log::warn!("PipeWire not available on Wayland: {}, trying X11 fallback", e);
+                }
             }
-            Err(e) => {
-                log::warn!("NvFBC capture not available: {}, trying DRM/KMS", e);
+        } else {
+            // X11 session: NvFBC > DRM > PipeWire > X11
+            match linux_nvfbc::NvfbcCapture::new() {
+                Ok(nvfbc) => {
+                    log::info!("Using NVIDIA NvFBC screen capture (GPU accelerated)");
+                    return Ok(Box::new(nvfbc));
+                }
+                Err(e) => {
+                    log::warn!("NvFBC capture not available: {}, trying DRM/KMS", e);
+                }
             }
-        }
-        match linux_drm::DrmCapture::new() {
-            Ok(drm) => {
-                log::info!("Using DRM/KMS screen capture (zero-copy GPU)");
-                return Ok(Box::new(drm));
+            match linux_drm::DrmCapture::new() {
+                Ok(drm) => {
+                    log::info!("Using DRM/KMS screen capture (zero-copy GPU)");
+                    return Ok(Box::new(drm));
+                }
+                Err(e) => {
+                    log::warn!("DRM capture not available: {}, trying PipeWire", e);
+                }
             }
-            Err(e) => {
-                log::warn!("DRM capture not available: {}, trying PipeWire", e);
-            }
-        }
-        match linux_wayland::PipeWireCapture::new() {
-            Ok(pw) => {
-                log::info!("Using PipeWire screen capture (Wayland)");
-                return Ok(Box::new(pw));
-            }
-            Err(e) => {
-                log::warn!("PipeWire not available: {}, falling back to X11", e);
+            match linux_wayland::PipeWireCapture::new() {
+                Ok(pw) => {
+                    log::info!("Using PipeWire screen capture (Wayland)");
+                    return Ok(Box::new(pw));
+                }
+                Err(e) => {
+                    log::warn!("PipeWire not available: {}, falling back to X11", e);
+                }
             }
         }
         let x11 = linux_x11::X11Capture::new()?;
@@ -209,20 +232,27 @@ pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
 pub async fn list_displays_for_capabilities() -> Result<Vec<DisplayInfo>, MediaError> {
     #[cfg(target_os = "linux")]
     {
-        match tokio::task::spawn_blocking(linux_nvfbc::list_displays_lightweight).await {
-            Ok(Ok(displays)) if !displays.is_empty() => return Ok(displays),
-            Ok(Ok(_)) => {
-                log::info!(
-                    "NvFBC lightweight enumeration returned no outputs; using full backend"
-                );
+        let is_wayland = std::env::var("XDG_SESSION_TYPE")
+            .unwrap_or_default()
+            == "wayland";
+
+        // NvFBC lightweight enumeration is X11-only — skip on Wayland
+        if !is_wayland {
+            match tokio::task::spawn_blocking(linux_nvfbc::list_displays_lightweight).await {
+                Ok(Ok(displays)) if !displays.is_empty() => return Ok(displays),
+                Ok(Ok(_)) => {
+                    log::info!(
+                        "NvFBC lightweight enumeration returned no outputs; using full backend"
+                    );
+                }
+                Ok(Err(e)) => {
+                    log::info!(
+                        "NvFBC lightweight enumeration unavailable ({}); using full backend",
+                        e
+                    );
+                }
+                Err(e) => log::warn!("NvFBC lightweight enumeration task join failed: {}", e),
             }
-            Ok(Err(e)) => {
-                log::info!(
-                    "NvFBC lightweight enumeration unavailable ({}); using full backend",
-                    e
-                );
-            }
-            Err(e) => log::warn!("NvFBC lightweight enumeration task join failed: {}", e),
         }
     }
 
