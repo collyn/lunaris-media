@@ -912,9 +912,13 @@ impl EglImporter {
                 (self.glReadPixels)(
                     0, 0,
                     width as GLsizei, height as GLsizei,
-                    GL_BGRA, GL_UNSIGNED_BYTE,
+                    GL_RGBA, GL_UNSIGNED_BYTE,
                     data.as_mut_ptr() as *mut std::ffi::c_void,
                 );
+                // Convert RGBA -> BGRA in place
+                for pixel in data.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
             }
 
             let gl_err = unsafe { (self.glGetError)() };
@@ -1100,7 +1104,12 @@ impl EglImporter {
         }
 
         if block_count > 0 {
-            block_diff_sum / block_count
+            let avg = block_diff_sum / block_count;
+            if avg == 0 {
+                999999 // Penalty for zero variance / blank image
+            } else {
+                avg
+            }
         } else {
             u64::MAX
         }
@@ -1339,25 +1348,7 @@ impl EglImporter {
                     create_khr(self.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
                         std::ptr::null_mut(), attrs.as_ptr())
                 };
-                if img != EGL_NO_IMAGE {
-                    img
-                } else {
-                    let err = unsafe { (self.eglGetError)() };
-                    log::info!("eglCreateImageKHR with modifier 0x{:016X} failed (EGL error 0x{:04X}), retrying without", modifier, err);
-                    let attrs_no_mod: [EGLint; 13] = [
-                        EGL_WIDTH as EGLint, width as EGLint,
-                        EGL_HEIGHT as EGLint, height as EGLint,
-                        EGL_LINUX_DRM_FOURCC_EXT, fourcc as EGLint,
-                        EGL_DMA_BUF_PLANE0_FD_EXT, fd as EGLint,
-                        EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset as EGLint,
-                        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as EGLint,
-                        EGL_NONE,
-                    ];
-                    unsafe {
-                        create_khr(self.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
-                            std::ptr::null_mut(), attrs_no_mod.as_ptr())
-                    }
-                }
+                img
             } else {
                 let attrs: [EGLint; 13] = [
                     EGL_WIDTH as EGLint, width as EGLint,
