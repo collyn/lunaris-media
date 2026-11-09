@@ -262,7 +262,16 @@ impl MediaPipeline {
         // Zero-copy: a DMA-BUF from the display GPU can only be consumed
         // without a copy by VAAPI on that same GPU. In "auto" mode prefer it
         // (other encoders remain as fallbacks via EGL readback).
-        let preferred_hw = if preferred_hw.is_none() && capture.delivers_dmabuf() {
+        // 4:4:4 needs NVENC (or the software encoder); VAAPI on AMD/Intel and
+        // QSV only encode 4:2:0, so don't steer towards them.
+        let yuv444 = self.config.yuv444 && self.config.codec == VideoCodec::H264;
+        if self.config.yuv444 && !yuv444 {
+            log::warn!("YUV 4:4:4 is only supported with H.264; encoding 4:2:0");
+        }
+        let preferred_hw = if yuv444 && preferred_hw.is_none() {
+            log::info!("YUV 4:4:4 requested — preferring NVENC (falls back to software)");
+            Some(HwAccelType::Nvenc)
+        } else if preferred_hw.is_none() && capture.delivers_dmabuf() {
             log::info!("Capture delivers DMA-BUF frames — preferring VAAPI for zero-copy encode");
             Some(HwAccelType::Vaapi)
         } else {
@@ -291,6 +300,7 @@ impl MediaPipeline {
             force_ffmpeg,
             d3d11_device,
             d3d11_context,
+            yuv444,
         })?;
         let encoder_info = encoder.encoder_info();
         // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the
@@ -298,10 +308,11 @@ impl MediaPipeline {
         capture.set_dmabuf_passthrough(encoder_info.hw_type == HwAccelType::Vaapi);
         let gpu_name = encode::describe_encoder_gpu(encoder_info.hw_type, d3d11_device);
         log::info!(
-            "Encoder initialized: {} ({}) on {}",
+            "Encoder initialized: {} ({}) on {} chroma={}",
             encoder_info.name,
             encoder_info.hw_type,
-            gpu_name.as_deref().unwrap_or("unknown GPU")
+            gpu_name.as_deref().unwrap_or("unknown GPU"),
+            if yuv444 { "4:4:4" } else { "4:2:0" }
         );
         let _ = self
             .event_tx

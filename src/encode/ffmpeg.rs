@@ -690,6 +690,30 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         result
     }
 
+    /// Switch an H.264 encoder to full-resolution chroma (High 4:4:4).
+    fn apply_yuv444_options(codec_ctx: *mut ffi::AVCodecContext, hw_type: HwAccelType) {
+        let set = |key: &str, value: &str| {
+            let ckey = CString::new(key).unwrap();
+            let cval = CString::new(value).unwrap();
+            // SAFETY: codec_ctx is a valid, not yet opened context.
+            let ret = unsafe { ffi::av_opt_set((*codec_ctx).priv_data, ckey.as_ptr(), cval.as_ptr(), 0) };
+            if ret < 0 {
+                log::warn!("YUV 4:4:4: av_opt_set({}, {}) failed: {}", key, value, ret);
+            }
+        };
+        match hw_type {
+            HwAccelType::Nvenc => {
+                // Input stays packed RGB (BGRA/CUDA); NVENC converts it to
+                // YUV 4:4:4 itself instead of the default 4:2:0.
+                set("profile", "high444p");
+                set("rgb_mode", "yuv444");
+            }
+            HwAccelType::Software => set("profile", "high444"),
+            _ => {}
+        }
+        log::info!("YUV 4:4:4 enabled ({:?}, H.264 High 4:4:4)", hw_type);
+    }
+
     /// Set encoder-specific private options via `av_opt_set`.
     ///
     /// This applies tuning parameters that differ per encoder backend.
@@ -1058,7 +1082,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             };
 
             if config.codec == VideoCodec::H264 {
-                (*codec_ctx).level = 31; // Match SDP profile-level-id=42001f (Level 3.1)
+                // 4:4:4 is negotiated as profile-level-id=f4002a (Level 4.2).
+                (*codec_ctx).level = if config.yuv444 { 42 } else { 31 }; // 4:2:0: SDP 42001f (Level 3.1)
             }
 
             let is_d3d11 = if cfg!(target_os = "windows") && config.d3d11_device.is_some() && config.d3d11_context.is_some() && matches!(hw_type, HwAccelType::Amf | HwAccelType::Nvenc) {
@@ -1077,6 +1102,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 } else {
                     (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
                 }
+            } else if config.yuv444 {
+                (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV444P;
             } else {
                 (*codec_ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
             }
@@ -1268,6 +1295,9 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         }
 
         Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency);
+        if config.yuv444 && config.codec == VideoCodec::H264 {
+            Self::apply_yuv444_options(codec_ctx, hw_type);
+        }
 
         let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, ptr::null_mut()) };
         if ret < 0 {
@@ -1887,7 +1917,13 @@ impl VideoEncoder for FfmpegEncoder {
         );
 
         // Get the full list of encoder candidates to try.
-        let candidates = Self::select_encoder_candidates(config.codec, config.preferred_hw, config.d3d11_device);
+        let mut candidates = Self::select_encoder_candidates(config.codec, config.preferred_hw, config.d3d11_device);
+        if config.yuv444 {
+            // Only NVENC (high444p) and libx264 (yuv444p) can produce H.264
+            // 4:4:4 here; VAAPI/QSV/AMF are 4:2:0-only on current drivers.
+            candidates.retain(|(_, hw)| matches!(hw, HwAccelType::Nvenc | HwAccelType::Software));
+            log::info!("YUV 4:4:4: encoder candidates narrowed to {:?}", candidates);
+        }
 
         let mut last_err = MediaError::EncoderInitFailed("No encoders available".into());
 
@@ -2633,6 +2669,7 @@ impl VideoEncoder for FfmpegEncoder {
 
                 let sw_format = match hw_type {
                     HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    HwAccelType::Software if config.yuv444 => ffi::AVPixelFormat::AV_PIX_FMT_YUV444P,
                     HwAccelType::Software => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
                     _ => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 };

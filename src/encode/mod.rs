@@ -53,6 +53,9 @@ pub struct EncoderConfig {
     pub d3d11_device: Option<usize>,
     /// Optional Direct3D11 device context pointer (cast to usize) for Windows zero-copy GPU encoding.
     pub d3d11_context: Option<usize>,
+    /// Full-resolution chroma (YUV 4:4:4). H.264 only; supported by NVENC
+    /// (`high444p`) and libx264 (`yuv444p`). Other backends are skipped.
+    pub yuv444: bool,
 }
 
 impl Default for EncoderConfig {
@@ -69,6 +72,7 @@ impl Default for EncoderConfig {
             force_ffmpeg: false,
             d3d11_device: None,
             d3d11_context: None,
+            yuv444: false,
         }
     }
 }

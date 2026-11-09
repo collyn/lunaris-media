@@ -69,6 +69,9 @@ pub struct StreamConfig {
     pub preferred_encoder: Option<String>,
     /// Create and capture a temporary virtual display when supported.
     pub virtual_display: bool,
+    /// Encode with full-resolution chroma (YUV 4:4:4, H.264 High 4:4:4).
+    /// Sharper coloured text; needs NVENC or the software encoder.
+    pub yuv444: bool,
 }
 
 impl Default for StreamConfig {
@@ -82,6 +85,7 @@ impl Default for StreamConfig {
             pixel_format: PixelFormat::NV12,
             preferred_encoder: None,
             virtual_display: false,
+            yuv444: false,
         }
     }
 }

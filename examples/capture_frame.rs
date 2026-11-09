@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pixel_format: PixelFormat::NV12,
         preferred_encoder: None,
         virtual_display: false,
+        yuv444: false,
     };
 
     println!("Starting capture...");
