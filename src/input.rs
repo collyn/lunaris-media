@@ -32,75 +32,356 @@ extern "system" {
     fn IsUserAnAdmin() -> i32;
 }
 
+/// Absolute axis range of the virtual absolute mouse (same as inputtino,
+/// the input library used by Sunshine/Wolf). The compositor maps the full
+/// range onto the whole desktop; resolution must be non-zero for libinput.
+#[cfg(target_os = "linux")]
+const ABS_MAX_WIDTH: i32 = 19200;
+#[cfg(target_os = "linux")]
+const ABS_MAX_HEIGHT: i32 = 12000;
+#[cfg(target_os = "linux")]
+const ABS_RESOLUTION: i32 = 28;
+
+/// Mouse buttons exposed by both virtual mice.
+#[cfg(target_os = "linux")]
+const MOUSE_BUTTONS: [Key; 8] = [
+    Key::BTN_LEFT,
+    Key::BTN_RIGHT,
+    Key::BTN_MIDDLE,
+    Key::BTN_SIDE,
+    Key::BTN_EXTRA,
+    Key::BTN_FORWARD,
+    Key::BTN_BACK,
+    Key::BTN_TASK,
+];
+
+/// Virtual input devices created through `/dev/uinput`, modelled on
+/// inputtino (Sunshine): a keyboard, a relative mouse with high-resolution
+/// wheels, and an absolute mouse (ABS_X/ABS_Y + buttons — classified by udev
+/// as a pointer, not a tablet). Works on every Wayland compositor because the
+/// events enter through libinput like a physical device.
 #[cfg(target_os = "linux")]
 struct UinputInjector {
     mouse_rel: std::sync::Mutex<VirtualDevice>,
     mouse_abs: std::sync::Mutex<VirtualDevice>,
     keyboard: std::sync::Mutex<VirtualDevice>,
+    /// Whether the last pointer motion was absolute. Buttons are emitted on
+    /// the device that moved last so the compositor clicks where the pointer
+    /// actually is (same rule as inputtino).
+    last_absolute: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
 impl UinputInjector {
     fn new() -> Option<Self> {
+        let log_err = |what: &str, e: std::io::Error| {
+            log::warn!("uinput: {} failed: {} (is /dev/uinput writable? add the user to the 'input' group or install a udev rule)", what, e);
+        };
+
         // 1. Keyboard device
         let mut kbd_keys = AttributeSet::new();
         for code in 1..=255 {
             kbd_keys.insert(Key::new(code));
         }
         let keyboard = VirtualDeviceBuilder::new()
+            .map_err(|e| log_err("open", e))
             .ok()?
             .name("Lunaris Keyboard passthrough")
-            .with_keys(&kbd_keys).ok()?
+            .with_keys(&kbd_keys)
+            .ok()?
             .build()
+            .map_err(|e| log_err("create keyboard", e))
             .ok()?;
 
-        // 2. Relative Mouse device
-        let mut rel_keys = AttributeSet::new();
-        rel_keys.insert(Key::BTN_LEFT);
-        rel_keys.insert(Key::BTN_RIGHT);
-        rel_keys.insert(Key::BTN_MIDDLE);
-        rel_keys.insert(Key::BTN_SIDE);
-        rel_keys.insert(Key::BTN_EXTRA);
+        let mut buttons = AttributeSet::new();
+        for b in MOUSE_BUTTONS {
+            buttons.insert(b);
+        }
 
+        // 2. Relative mouse with high-resolution wheels
         let mut rel_axes = AttributeSet::new();
         rel_axes.insert(RelativeAxisType::REL_X);
         rel_axes.insert(RelativeAxisType::REL_Y);
         rel_axes.insert(RelativeAxisType::REL_WHEEL);
         rel_axes.insert(RelativeAxisType::REL_HWHEEL);
-
+        rel_axes.insert(RelativeAxisType::REL_WHEEL_HI_RES);
+        rel_axes.insert(RelativeAxisType::REL_HWHEEL_HI_RES);
         let mouse_rel = VirtualDeviceBuilder::new()
             .ok()?
             .name("Lunaris Mouse passthrough")
-            .with_keys(&rel_keys).ok()?
-            .with_relative_axes(&rel_axes).ok()?
+            .with_keys(&buttons)
+            .ok()?
+            .with_relative_axes(&rel_axes)
+            .ok()?
             .build()
+            .map_err(|e| log_err("create relative mouse", e))
             .ok()?;
 
-        // 3. Absolute Mouse/Tablet device
-        let mut abs_keys = AttributeSet::new();
-        abs_keys.insert(Key::BTN_TOOL_PEN);
-
-        let abs_x_info = AbsInfo::new(0, 0, 32767, 0, 0, 0);
-        let abs_y_info = AbsInfo::new(0, 0, 32767, 0, 0, 0);
-        let abs_x_setup = UinputAbsSetup::new(AbsoluteAxisType::ABS_X, abs_x_info);
-        let abs_y_setup = UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, abs_y_info);
-
+        // 3. Absolute mouse: buttons + ABS_X/ABS_Y with a real resolution.
+        //    No BTN_TOOL_PEN/BTN_TOUCH, otherwise libinput treats it as a
+        //    tablet (and rejects it without proper tablet capabilities).
+        let abs_x = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_X,
+            AbsInfo::new(0, 0, ABS_MAX_WIDTH, 1, 0, ABS_RESOLUTION),
+        );
+        let abs_y = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_Y,
+            AbsInfo::new(0, 0, ABS_MAX_HEIGHT, 1, 0, ABS_RESOLUTION),
+        );
         let mouse_abs = VirtualDeviceBuilder::new()
             .ok()?
             .name("Lunaris Mouse passthrough (absolute)")
-            .with_keys(&abs_keys).ok()?
-            .with_absolute_axis(&abs_x_setup).ok()?
-            .with_absolute_axis(&abs_y_setup).ok()?
+            .with_keys(&buttons)
+            .ok()?
+            .with_absolute_axis(&abs_x)
+            .ok()?
+            .with_absolute_axis(&abs_y)
+            .ok()?
             .build()
+            .map_err(|e| log_err("create absolute mouse", e))
             .ok()?;
 
-        log::info!("uinput: successfully created virtual input devices (/dev/uinput)");
+        log::info!("uinput: created virtual keyboard, relative mouse and absolute mouse");
         Some(Self {
             keyboard: std::sync::Mutex::new(keyboard),
             mouse_rel: std::sync::Mutex::new(mouse_rel),
             mouse_abs: std::sync::Mutex::new(mouse_abs),
+            last_absolute: std::sync::atomic::AtomicBool::new(false),
         })
     }
+
+    fn emit(dev: &std::sync::Mutex<VirtualDevice>, events: &[InputEvent]) {
+        if let Ok(mut dev) = dev.lock() {
+            if let Err(e) = dev.emit(events) {
+                log::debug!("uinput emit failed: {}", e);
+            }
+        }
+    }
+
+    /// Device that should receive button events.
+    fn pointer_device(&self) -> &std::sync::Mutex<VirtualDevice> {
+        if self.last_absolute.load(std::sync::atomic::Ordering::Relaxed) {
+            &self.mouse_abs
+        } else {
+            &self.mouse_rel
+        }
+    }
+
+    fn move_absolute(&self, abs_x: i32, abs_y: i32) {
+        self.last_absolute
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Self::emit(
+            &self.mouse_abs,
+            &[
+                InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, abs_x),
+                InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, abs_y),
+                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+            ],
+        );
+    }
+
+    /// Scroll by `notches` detents (positive = up/right), emitting both the
+    /// high-resolution (120 per detent) and legacy wheel events.
+    fn scroll(&self, horizontal: bool, notches: i32) {
+        let (lo, hi) = if horizontal {
+            (RelativeAxisType::REL_HWHEEL, RelativeAxisType::REL_HWHEEL_HI_RES)
+        } else {
+            (RelativeAxisType::REL_WHEEL, RelativeAxisType::REL_WHEEL_HI_RES)
+        };
+        Self::emit(
+            &self.mouse_rel,
+            &[
+                InputEvent::new(evdev::EventType::RELATIVE, hi.0, notches * 120),
+                InputEvent::new(evdev::EventType::RELATIVE, lo.0, notches),
+                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+            ],
+        );
+    }
+}
+
+/// A rectangle in desktop (compositor logical) coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl ScreenRegion {
+    fn union(self, other: ScreenRegion) -> ScreenRegion {
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.width).max(other.x + other.width);
+        let y1 = (self.y + self.height).max(other.y + other.height);
+        ScreenRegion { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+    }
+}
+
+/// Region of the desktop being streamed plus the desktop bounding box, used
+/// to map client coordinates onto the absolute mouse (which spans the whole
+/// desktop). Set by the capture backend once the streamed monitor is known.
+#[cfg(target_os = "linux")]
+static CAPTURE_MAPPING: std::sync::Mutex<Option<(ScreenRegion, ScreenRegion)>> =
+    std::sync::Mutex::new(None);
+
+/// Tell the input layer which part of the desktop is being streamed (logical
+/// coordinates, e.g. the portal stream position/size). Absolute pointer
+/// events are then mapped onto that monitor, like Sunshine's touch port.
+#[cfg(target_os = "linux")]
+pub fn set_capture_region(target: ScreenRegion) {
+    let desktop = desktop_layout()
+        .into_iter()
+        .fold(target, |acc, r| acc.union(r));
+    log::info!("Input mapping: streamed region {:?} within desktop {:?}", target, desktop);
+    if let Ok(mut m) = CAPTURE_MAPPING.lock() {
+        *m = Some((target, desktop));
+    }
+}
+
+/// Logical geometry of all enabled outputs. KDE's `kscreen-doctor` reports the
+/// compositor's logical layout (scale-aware); `xrandr --listmonitors` (via
+/// XWayland or X11) is the generic fallback.
+#[cfg(target_os = "linux")]
+fn desktop_layout() -> Vec<ScreenRegion> {
+    if let Some(regions) = kscreen_layout() {
+        if !regions.is_empty() {
+            return regions;
+        }
+    }
+    xrandr_monitors()
+}
+
+#[cfg(target_os = "linux")]
+fn kscreen_layout() -> Option<Vec<ScreenRegion>> {
+    let out = std::process::Command::new("kscreen-doctor").arg("-j").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Minimal extraction without a JSON dependency: walk each output object.
+    let mut regions = Vec::new();
+    let outputs = text.split("\"outputs\"").nth(1)?;
+    // Tiny scanner over the top-level `{...}` objects of the outputs array.
+    let bytes = outputs.as_bytes();
+    let mut depth = 0i32;
+    let mut start = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s0) = start.take() {
+                        if let Some(r) = parse_kscreen_output(&outputs[s0..=i]) {
+                            regions.push(r);
+                        }
+                    }
+                }
+                if depth < 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(regions)
+}
+
+/// Extract `"<key>": <number>` from a JSON fragment.
+#[cfg(target_os = "linux")]
+fn json_number(fragment: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{}\"", key);
+    let idx = fragment.find(&pat)? + pat.len();
+    let rest = fragment[idx..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn json_object<'a>(fragment: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{}\"", key);
+    let idx = fragment.find(&pat)? + pat.len();
+    let rest = &fragment[idx..];
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')? + open;
+    Some(&rest[open..=close])
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kscreen_output(obj: &str) -> Option<ScreenRegion> {
+    if !obj.contains("\"enabled\": true") && !obj.contains("\"enabled\":true") {
+        return None;
+    }
+    let pos = json_object(obj, "pos")?;
+    let size = json_object(obj, "size")?;
+    let scale = json_number(obj, "scale").filter(|s| *s > 0.0).unwrap_or(1.0);
+    let rotation = json_number(obj, "rotation").unwrap_or(1.0) as i32;
+    let (mut w, mut h) = (json_number(size, "width")?, json_number(size, "height")?);
+    if rotation == 2 || rotation == 8 {
+        std::mem::swap(&mut w, &mut h);
+    }
+    Some(ScreenRegion {
+        x: json_number(pos, "x")? as i32,
+        y: json_number(pos, "y")? as i32,
+        width: (w / scale).round() as i32,
+        height: (h / scale).round() as i32,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn xrandr_monitors() -> Vec<ScreenRegion> {
+    let Ok(out) = std::process::Command::new("xrandr").arg("--listmonitors").output() else {
+        return Vec::new();
+    };
+    // Lines look like: " 0: +*DP-2 1920/527x1080/296+0+0  DP-2"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let geom = line.split_whitespace().nth(2)?;
+            let (w, rest) = geom.split_once('/')?;
+            let (_, rest) = rest.split_once('x')?;
+            let (h, rest) = rest.split_once('/')?;
+            let mut parts = rest.split('+').skip(1);
+            Some(ScreenRegion {
+                x: parts.next()?.parse().ok()?,
+                y: parts.next()?.parse().ok()?,
+                width: w.parse().ok()?,
+                height: h.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Map client coordinates (`x`/`y` within `ref_w`×`ref_h`) to the absolute
+/// mouse axis range, honouring the streamed region inside the desktop.
+#[cfg(target_os = "linux")]
+fn map_to_abs_axes(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (i32, i32) {
+    let mapping = CAPTURE_MAPPING.lock().ok().and_then(|m| *m);
+    // Aim at the pixel centre so the compositor's floor() lands on (x, y).
+    let fx = ((x as f64 + 0.5) / ref_w as f64).clamp(0.0, 1.0);
+    let fy = ((y as f64 + 0.5) / ref_h as f64).clamp(0.0, 1.0);
+    let (nx, ny) = match mapping {
+        Some((target, desktop)) if desktop.width > 0 && desktop.height > 0 => (
+            (target.x - desktop.x) as f64 / desktop.width as f64
+                + fx * target.width as f64 / desktop.width as f64,
+            (target.y - desktop.y) as f64 / desktop.height as f64
+                + fy * target.height as f64 / desktop.height as f64,
+        ),
+        _ => (fx, fy),
+    };
+    (
+        (nx * ABS_MAX_WIDTH as f64).round() as i32,
+        (ny * ABS_MAX_HEIGHT as f64).round() as i32,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -321,6 +602,7 @@ impl InputInjector {
         #[cfg(target_os = "linux")]
         match &self.backend {
             Backend::Uinput(u) => {
+                u.last_absolute.store(false, std::sync::atomic::Ordering::Relaxed);
                 let events = [
                     InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_X.0, dx),
                     InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_Y.0, dy),
@@ -404,17 +686,8 @@ impl InputInjector {
         match &self.backend {
             Backend::Uinput(u) => {
                 if reference_width > 0 && reference_height > 0 {
-                    let abs_x = (x * 32767) / reference_width;
-                    let abs_y = (y * 32767) / reference_height;
-                    let events = [
-                        InputEvent::new(evdev::EventType::KEY, Key::BTN_TOOL_PEN.0, 1),
-                        InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, abs_x),
-                        InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, abs_y),
-                        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
-                    ];
-                    if let Ok(mut dev) = u.mouse_abs.lock() {
-                        let _ = dev.emit(&events);
-                    }
+                    let (abs_x, abs_y) = map_to_abs_axes(x, y, reference_width, reference_height);
+                    u.move_absolute(abs_x, abs_y);
                 }
             }
             Backend::X11(x11) => {
@@ -462,27 +735,13 @@ impl InputInjector {
                     4 | 5 => {
                         // Scroll Wheel: 4 = Up, 5 = Down
                         if is_press {
-                            let val = if button == 4 { 1 } else { -1 };
-                            let events = [
-                                InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_WHEEL.0, val),
-                                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
-                            ];
-                            if let Ok(mut dev) = u.mouse_rel.lock() {
-                                let _ = dev.emit(&events);
-                            }
+                            u.scroll(false, if button == 4 { 1 } else { -1 });
                         }
                     }
                     6 | 7 => {
                         // Horizontal Scroll Wheel: 6 = Left, 7 = Right
                         if is_press {
-                            let val = if button == 7 { 1 } else { -1 };
-                            let events = [
-                                InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_HWHEEL.0, val),
-                                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
-                            ];
-                            if let Ok(mut dev) = u.mouse_rel.lock() {
-                                let _ = dev.emit(&events);
-                            }
+                            u.scroll(true, if button == 7 { 1 } else { -1 });
                         }
                     }
                     _ => {
@@ -495,9 +754,7 @@ impl InputInjector {
                                 ),
                                 InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
                             ];
-                            if let Ok(mut dev) = u.mouse_rel.lock() {
-                                let _ = dev.emit(&events);
-                            }
+                            UinputInjector::emit(u.pointer_device(), &events);
                         }
                     }
                 }
