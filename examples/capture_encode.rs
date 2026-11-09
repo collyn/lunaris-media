@@ -42,9 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let preferred_encoder = arg_value(&args, "--encoder");
 
     // ── Configure the pipeline ──────────────────────────────────────
+    let width = parse_u32_arg(&args, "--width", 1920)?;
+    let height = parse_u32_arg(&args, "--height", 1080)?;
+
     let config = StreamConfig {
-        width: 1920,
-        height: 1080,
+        width,
+        height,
         fps,
         codec,
         bitrate_kbps,
