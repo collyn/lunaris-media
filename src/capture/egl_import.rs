@@ -17,8 +17,11 @@
 //! The EGL context is created once per [`EglImporter`] instance and must be
 //! used from a single thread (the PipeWire callback thread).
 
+// FFI symbols keep their C names (eglCreateImage, glReadPixels, …) so they
+// can be matched 1:1 against the EGL/GL specs.
+#![allow(non_snake_case)]
+
 use std::os::unix::io::RawFd;
-use std::sync::OnceLock;
 
 use crate::error::MediaError;
 
@@ -28,7 +31,6 @@ use crate::error::MediaError;
 
 type EGLBoolean = libc::c_uint;
 type EGLint = libc::c_int;
-type EGLLabel = *const libc::c_char; // KHR_debug label
 type EGLAttrib = libc::intptr_t;
 type EGLDisplay = *mut std::ffi::c_void;
 type EGLConfig = *mut std::ffi::c_void;
@@ -41,8 +43,6 @@ type GLuint = libc::c_uint;
 type GLint = libc::c_int;
 type GLenum = libc::c_uint;
 type GLsizei = libc::c_int;
-type GLboolean = libc::c_uchar;
-type GLbitfield = libc::c_uint;
 
 // ---------------------------------------------------------------------------
 // EGL constants
@@ -51,12 +51,10 @@ type GLbitfield = libc::c_uint;
 const EGL_TRUE: EGLBoolean = 1;
 const EGL_FALSE: EGLBoolean = 0;
 const EGL_NO_CONTEXT: EGLContext = std::ptr::null_mut();
-const EGL_NO_DISPLAY: EGLDisplay = std::ptr::null_mut();
 const EGL_NO_SURFACE: EGLSurface = std::ptr::null_mut();
 const EGL_NO_IMAGE: EGLImage = std::ptr::null_mut();
 const EGL_DEFAULT_DISPLAY: EGLDisplay = 0 as EGLDisplay;
 const EGL_NONE: EGLint = 0x3038;
-const EGL_SUCCESS: EGLint = 0x3000;
 
 const EGL_ALPHA_SIZE: EGLint = 0x3021;
 const EGL_BLUE_SIZE: EGLint = 0x3022;
@@ -68,12 +66,8 @@ const EGL_OPENGL_BIT: EGLint = 0x0008;
 const EGL_PBUFFER_BIT: EGLint = 0x0001;
 const EGL_HEIGHT: EGLint = 0x3056;
 const EGL_WIDTH: EGLint = 0x3057;
-const EGL_CONTEXT_CLIENT_VERSION: EGLint = 0x3098;
 const EGL_OPENGL_API: EGLint = 0x30A2;
 const EGL_CONTEXT_MAJOR_VERSION: EGLint = 0x3098;
-const EGL_CONTEXT_MINOR_VERSION: EGLint = 0x30FB;
-const EGL_CONTEXT_OPENGL_PROFILE_MASK: EGLint = 0x30FD;
-const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: EGLint = 0x00000001;
 
 const EGL_LINUX_DMA_BUF_EXT: EGLint = 0x3270;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
@@ -89,15 +83,11 @@ const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 const GL_LINEAR: GLint = 0x2601;
 const GL_RGBA: GLenum = 0x1908;
-const GL_BGRA: GLenum = 0x80E1;
 const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_FRAMEBUFFER: GLenum = 0x8D40;
 const GL_READ_FRAMEBUFFER: GLenum = 0x8CA8;
-const GL_DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
 const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
-const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 const GL_NO_ERROR: GLenum = 0;
-const GL_COLOR_BUFFER_BIT: u32 = 0x00004000;
 const GL_NEAREST: GLint = 0x2600;
 const GL_PROJECTION: GLenum = 0x1701;
 const GL_MODELVIEW: GLenum = 0x1700;
@@ -154,7 +144,6 @@ type GlDeleteFramebuffersFn = unsafe extern "C" fn(n: GLsizei, framebuffers: *co
 type GlBindFramebufferFn = unsafe extern "C" fn(target: GLenum, framebuffer: GLuint);
 type GlFramebufferTexture2DFn =
     unsafe extern "C" fn(target: GLenum, attachment: GLenum, textarget: GLenum, texture: GLuint, level: GLint);
-type GlCheckFramebufferStatusFn = unsafe extern "C" fn(target: GLenum) -> GLenum;
 type GlReadPixelsFn = unsafe extern "C" fn(
     x: GLint, y: GLint, width: GLsizei, height: GLsizei,
     format: GLenum, type_: GLenum, pixels: *mut std::ffi::c_void,
@@ -194,11 +183,11 @@ type GlVertex2fFn = unsafe extern "C" fn(x: f32, y: f32);
 /// context must only be used from one thread at a time (it is made current on
 /// the thread that calls [`import_dmabuf`]).
 pub struct EglImporter {
-    egllib: libloading::Library,
-    gleslib: libloading::Library,
+    // Keep the libraries loaded for as long as the function pointers live.
+    _egllib: libloading::Library,
+    _gleslib: libloading::Library,
     display: EGLDisplay,
     context: EGLContext,
-    config: EGLConfig,
     surface: EGLSurface,
     /// Cached DRM modifier found during first-frame probing.
     /// Once a working modifier is found, it's reused for all subsequent imports.
@@ -215,8 +204,6 @@ pub struct EglImporter {
     // EGL function pointers
     eglGetError: EglGetErrorFn,
     eglGetProcAddress: EglGetProcAddressFn,
-    eglInitialize: EglInitializeFn,
-    eglCreateContext: EglCreateContextFn,
     eglMakeCurrent: EglMakeCurrentFn,
     eglDestroyContext: EglDestroyContextFn,
     eglTerminate: EglTerminateFn,
@@ -233,12 +220,10 @@ pub struct EglImporter {
     glDeleteFramebuffers: GlDeleteFramebuffersFn,
     glBindFramebuffer: GlBindFramebufferFn,
     glFramebufferTexture2D: GlFramebufferTexture2DFn,
-    glCheckFramebufferStatus: GlCheckFramebufferStatusFn,
     glReadPixels: GlReadPixelsFn,
     glGetError: GlGetErrorFn,
     glEGLImageTargetTexture2DOES: GlEGLImageTargetTexture2DOESFn,
     glTexImage2D: GlTexImage2DFn,
-    glBlitFramebuffer: Option<GlBlitFramebufferFn>,
     glEnable: Option<GlEnableFn>,
     glDisable: Option<GlDisableFn>,
     glViewport: Option<GlViewportFn>,
@@ -254,6 +239,7 @@ pub struct EglImporter {
 /// Safely load a symbol from a library, returning a descriptive error on failure.
 macro_rules! load_sym {
     ($lib:expr, $name:literal) => {
+        #[allow(unused_unsafe)] // some call sites are already inside `unsafe`
         unsafe {
             $lib.get::<*const u8>($name.as_bytes())
                 .map_err(|e| MediaError::CaptureError(format!(
@@ -306,7 +292,6 @@ impl EglImporter {
         let glDeleteFramebuffers: GlDeleteFramebuffersFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glDeleteFramebuffers")) };
         let glBindFramebuffer: GlBindFramebufferFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glBindFramebuffer")) };
         let glFramebufferTexture2D: GlFramebufferTexture2DFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glFramebufferTexture2D")) };
-        let glCheckFramebufferStatus: GlCheckFramebufferStatusFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glCheckFramebufferStatus")) };
         let glReadPixels: GlReadPixelsFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glReadPixels")) };
         let glGetError: GlGetErrorFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glGetError")) };
 
@@ -581,11 +566,10 @@ impl EglImporter {
         let glVertex2f: Option<GlVertex2fFn> = load_gl_opt!("glVertex2f\0");
 
         Ok(Self {
-            egllib,
-            gleslib,
+            _egllib: egllib,
+            _gleslib: gleslib,
             display,
             context,
-            config,
             surface: draw_surf,
             cached_modifier: None,
             cached_width: 0,
@@ -596,8 +580,6 @@ impl EglImporter {
             dst_fbo: 0,
             eglGetError,
             eglGetProcAddress,
-            eglInitialize,
-            eglCreateContext,
             eglMakeCurrent,
             eglDestroyContext,
             eglTerminate,
@@ -612,12 +594,10 @@ impl EglImporter {
             glDeleteFramebuffers,
             glBindFramebuffer,
             glFramebufferTexture2D,
-            glCheckFramebufferStatus,
             glReadPixels,
             glGetError,
             glEGLImageTargetTexture2DOES,
             glTexImage2D,
-            glBlitFramebuffer,
             glEnable,
             glDisable,
             glViewport,
