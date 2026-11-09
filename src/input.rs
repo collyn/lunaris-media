@@ -320,6 +320,12 @@ fn parse_kscreen_output(obj: &str) -> Option<ScreenRegion> {
     if !obj.contains("\"enabled\": true") && !obj.contains("\"enabled\":true") {
         return None;
     }
+    // A replicating (mirrored) output shows its source's content; KDE keeps a
+    // stale `pos` for it, which would wrongly widen the desktop (e.g. two
+    // mirrored 1920x1080 screens reported as 3840x1080).
+    if json_number(obj, "replicationSource").is_some_and(|src| src != 0.0) {
+        return None;
+    }
     let pos = json_object(obj, "pos")?;
     let size = json_object(obj, "size")?;
     let scale = json_number(obj, "scale").filter(|s| *s > 0.0).unwrap_or(1.0);
@@ -1083,4 +1089,37 @@ fn vk_to_keysym(vk: u16) -> Option<u32> {
         _ => return None,
     };
     Some(sym)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod layout_tests {
+    use super::{parse_kscreen_output, ScreenRegion};
+
+    const DP2: &str = r#"{"enabled": true, "id": 2, "name": "DP-2", "pos": {"x": 0, "y": 0}, "replicationSource": 0, "rotation": 1, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
+
+    #[test]
+    fn mirrored_output_is_ignored() {
+        let hdmi = r#"{"enabled": true, "id": 1, "name": "HDMI-A-2", "pos": {"x": 1920, "y": 0}, "replicationSource": 2, "rotation": 1, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
+        assert_eq!(parse_kscreen_output(hdmi), None);
+        assert_eq!(
+            parse_kscreen_output(DP2),
+            Some(ScreenRegion { x: 0, y: 0, width: 1920, height: 1080 })
+        );
+    }
+
+    #[test]
+    fn extended_and_scaled_outputs() {
+        let side = r#"{"enabled": true, "pos": {"x": 1920, "y": 0}, "replicationSource": 0, "rotation": 1, "scale": 2, "size": {"height": 2160, "width": 3840}}"#;
+        assert_eq!(
+            parse_kscreen_output(side),
+            Some(ScreenRegion { x: 1920, y: 0, width: 1920, height: 1080 })
+        );
+        let rotated = r#"{"enabled": true, "pos": {"x": 0, "y": 0}, "rotation": 2, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
+        assert_eq!(
+            parse_kscreen_output(rotated),
+            Some(ScreenRegion { x: 0, y: 0, width: 1080, height: 1920 })
+        );
+        let disabled = r#"{"enabled": false, "pos": {"x": 0, "y": 0}, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
+        assert_eq!(parse_kscreen_output(disabled), None);
+    }
 }
