@@ -48,6 +48,8 @@ pub struct LinuxCursorCapture {
     debug_cursor_shapes: bool,
     /// Whether cursor tracking is currently active.
     active: bool,
+    /// Last PipeWire cursor bitmap serial forwarded to consumers.
+    pw_image_serial: u64,
 }
 
 unsafe impl Send for LinuxCursorCapture {}
@@ -71,6 +73,7 @@ impl LinuxCursorCapture {
             last_cursor_shape: None,
             debug_cursor_shapes: std::env::var_os("LUNARIS_CURSOR_DEBUG").is_some(),
             active: false,
+            pw_image_serial: 0,
         })
     }
 
@@ -363,6 +366,21 @@ impl CursorCapture for LinuxCursorCapture {
     fn get_cursor_state(&mut self) -> Result<CursorState, MediaError> {
         if !self.active {
             return Err(MediaError::CursorError("Cursor capture not started".into()));
+        }
+
+        // Wayland: the compositor reports the cursor through PipeWire
+        // metadata; XFixes would only see XWayland windows.
+        if let Some(pw) = crate::capture::linux_wayland::pipewire_cursor() {
+            self.last_state.x = pw.x;
+            self.last_state.y = pw.y;
+            self.last_state.visible = pw.visible;
+            self.last_state.image = if pw.image_serial != self.pw_image_serial {
+                self.pw_image_serial = pw.image_serial;
+                pw.image
+            } else {
+                None
+            };
+            return Ok(self.last_state.clone());
         }
 
         if let Some((x, y)) = self.query_x11_cursor() {

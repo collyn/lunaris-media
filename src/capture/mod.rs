@@ -16,6 +16,8 @@
 pub mod gpu_buffer;
 
 #[cfg(target_os = "linux")]
+pub mod dmabuf_caps;
+#[cfg(target_os = "linux")]
 pub mod linux_drm;
 #[cfg(target_os = "linux")]
 pub mod linux_nvfbc;
@@ -133,6 +135,19 @@ pub trait ScreenCapture: Send {
     /// Returns `true` if capture is currently active.
     fn is_capturing(&self) -> bool;
 
+    /// Whether frames are delivered as DMA-BUFs that the VAAPI encoder on the
+    /// display GPU can consume zero-copy. The pipeline then prefers VAAPI over
+    /// encoders that would need a GPU→CPU readback.
+    fn delivers_dmabuf(&self) -> bool {
+        false
+    }
+
+    /// Called once the encoder is known: `true` when it consumes DMA-BUFs
+    /// zero-copy (VAAPI on the display GPU). Backends that can read frames
+    /// back themselves switch to CPU frames when `false`, which is cheaper
+    /// than letting the encoder read back every (re-)encoded frame.
+    fn set_dmabuf_passthrough(&mut self, _enabled: bool) {}
+
     /// Optional: Get the Direct3D11 device and context pointers (cast to usize) for Windows.
     fn get_d3d11_device(&self) -> Option<(usize, usize)> {
         None
@@ -154,8 +169,21 @@ pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
         if is_wayland {
             // On Wayland:
             // - NvFBC is X11-only (uses GLX/X11 framebuffer capture)
-            // - DRM/KMS requires CAP_SYS_ADMIN and the compositor holds DRM Master
-            // → PipeWire via XDG Desktop Portal is the only reliable path
+            // - PipeWire via the XDG Desktop Portal is the default (needs no
+            //   privileges, gives cursor metadata, DMA-BUF zero-copy).
+            // - KMS (like Sunshine's kmsgrab) is opt-in with
+            //   LUNARIS_CAPTURE=kms; it needs `setcap cap_sys_admin+p` on the
+            //   binary but skips the portal prompt entirely.
+            let forced = std::env::var("LUNARIS_CAPTURE").unwrap_or_default().to_ascii_lowercase();
+            if forced == "kms" || forced == "drm" {
+                match linux_drm::DrmCapture::new() {
+                    Ok(drm) => {
+                        log::info!("Using DRM/KMS screen capture on Wayland (LUNARIS_CAPTURE=kms)");
+                        return Ok(Box::new(drm));
+                    }
+                    Err(e) => log::warn!("KMS capture requested but unavailable: {}; using PipeWire", e),
+                }
+            }
             log::info!("Wayland session detected — trying PipeWire first");
             match linux_wayland::PipeWireCapture::new() {
                 Ok(pw) => {

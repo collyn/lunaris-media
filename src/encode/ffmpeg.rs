@@ -227,6 +227,17 @@ pub struct FfmpegEncoder {
     packet: *mut ffi::AVPacket,
     /// SIMD-optimized color converter (BGRA → NV12) via FFmpeg swscale.
     sws_ctx: *mut ffi::SwsContext,
+    /// Source size and destination format `sws_ctx` was created for.
+    sws_key: (libc::c_int, libc::c_int, libc::c_int),
+    /// Zero-copy DMA-BUF → NV12 converter (VAAPI VPP), created lazily.
+    #[cfg(target_os = "linux")]
+    vaapi_dmabuf: Option<super::vaapi_dmabuf::VaapiDmabufConverter>,
+    /// Set after the zero-copy path failed once; DMA-BUFs then use readback.
+    #[cfg(target_os = "linux")]
+    dmabuf_zero_copy_failed: bool,
+    /// EGL readback used when a DMA-BUF cannot be consumed zero-copy.
+    #[cfg(target_os = "linux")]
+    dmabuf_readback: Option<crate::capture::egl_import::EglImporter>,
     /// When `true`, the next encoded frame will be forced as a keyframe.
     force_keyframe: bool,
     /// Monotonically increasing frame counter.
@@ -296,6 +307,13 @@ impl FfmpegEncoder {
             sw_frame: ptr::null_mut(),
             packet: ptr::null_mut(),
             sws_ctx: ptr::null_mut(),
+            sws_key: (0, 0, -1),
+            #[cfg(target_os = "linux")]
+            vaapi_dmabuf: None,
+            #[cfg(target_os = "linux")]
+            dmabuf_zero_copy_failed: false,
+            #[cfg(target_os = "linux")]
+            dmabuf_readback: None,
             force_keyframe: false,
             frame_count: 0,
             config: None,
@@ -1108,10 +1126,21 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 }
             } else {
                 let (device_type, device_path): (ffi::AVHWDeviceType, Option<CString>) = match hw_type {
-                    HwAccelType::Vaapi => (
-                        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                        Some(CString::new("/dev/dri/renderD128").unwrap()),
-                    ),
+                    HwAccelType::Vaapi => {
+                        // Encode on the GPU that drives the displays so that
+                        // captured DMA-BUFs can be imported without a copy
+                        // (renderD128 is often an unrelated iGPU).
+                        #[cfg(target_os = "linux")]
+                        let node = crate::capture::dmabuf_caps::display_render_node()
+                            .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+                        #[cfg(not(target_os = "linux"))]
+                        let node = "/dev/dri/renderD128".to_string();
+                        log::info!("VAAPI device: {}", node);
+                        (
+                            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                            Some(CString::new(node).unwrap()),
+                        )
+                    }
                     HwAccelType::Nvenc => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, None),
                     _ => (ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None),
                 };
@@ -1881,6 +1910,11 @@ impl VideoEncoder for FfmpegEncoder {
             return Err(MediaError::EncoderNotInitialized);
         }
 
+        #[cfg(target_os = "linux")]
+        if let GpuBuffer::DmaBuf { .. } = buffer {
+            return self.encode_dmabuf(buffer, pts_us);
+        }
+
         let config = self.config.as_ref().unwrap();
         let info = self.info.as_ref().unwrap();
         let hw_type = info.hw_type;
@@ -2290,13 +2324,8 @@ impl VideoEncoder for FfmpegEncoder {
 
             #[cfg(target_os = "linux")]
             GpuBuffer::DmaBuf { .. } => {
-                log::warn!(
-                    "DMA-BUF zero-copy import not yet implemented; \
-                     please use CpuBuffer path for now"
-                );
-                return Err(MediaError::EncodeError(
-                    "DMA-BUF zero-copy import not yet implemented".into(),
-                ));
+                // Handled by `encode_dmabuf` before this match.
+                return Err(MediaError::EncodeError("unexpected DMA-BUF in generic path".into()));
             }
 
             #[cfg(target_os = "linux")]
@@ -2587,6 +2616,12 @@ impl VideoEncoder for FfmpegEncoder {
                 let w = *width as libc::c_int;
                 let h = *height as libc::c_int;
                 let src_stride = *stride as usize;
+                // The encoder (and its HW frame pool) is sized from the
+                // config; captures may arrive at the monitor's native size
+                // (e.g. PipeWire), in which case swscale also rescales.
+                let dst_w = config.width as libc::c_int;
+                let dst_h = config.height as libc::c_int;
+                let needs_scale = (w, h) != (dst_w, dst_h);
 
                 let sw_format = match hw_type {
                     HwAccelType::Nvenc => ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
@@ -2595,10 +2630,14 @@ impl VideoEncoder for FfmpegEncoder {
                 };
                 unsafe {
                     let ret = ffi::av_frame_make_writable(self.sw_frame);
-                    if ret < 0 {
+                    if ret < 0
+                        || (*self.sw_frame).width != dst_w
+                        || (*self.sw_frame).height != dst_h
+                        || (*self.sw_frame).format != sw_format as libc::c_int
+                    {
                         ffi::av_frame_unref(self.sw_frame);
-                        (*self.sw_frame).width = w;
-                        (*self.sw_frame).height = h;
+                        (*self.sw_frame).width = dst_w;
+                        (*self.sw_frame).height = dst_h;
                         (*self.sw_frame).format = sw_format as libc::c_int;
                         let ret = ffi::av_frame_get_buffer(self.sw_frame, 32);
                         if ret < 0 {
@@ -2608,6 +2647,12 @@ impl VideoEncoder for FfmpegEncoder {
                 }
 
                 match format {
+                    PixelFormat::NV12 if needs_scale => {
+                        return Err(MediaError::EncodeError(format!(
+                            "NV12 frame {}x{} does not match encoder size {}x{}",
+                            w, h, dst_w, dst_h
+                        )));
+                    }
                     PixelFormat::NV12 => unsafe {
                         let y_dst = (*self.sw_frame).data[0];
                         let y_dst_stride = (*self.sw_frame).linesize[0] as usize;
@@ -2644,7 +2689,7 @@ impl VideoEncoder for FfmpegEncoder {
                         }
                     },
                     PixelFormat::BGRA => {
-                        if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
+                        if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA && !needs_scale {
                             unsafe {
                                 let dst = (*self.sw_frame).data[0];
                                 let dst_stride = (*self.sw_frame).linesize[0] as usize;
@@ -2666,14 +2711,20 @@ impl VideoEncoder for FfmpegEncoder {
                                 }
                             }
                         } else {
+                            let key = (w, h, sw_format as libc::c_int);
+                            if !self.sws_ctx.is_null() && self.sws_key != key {
+                                unsafe { ffi::sws_freeContext(self.sws_ctx) };
+                                self.sws_ctx = ptr::null_mut();
+                            }
                             if self.sws_ctx.is_null() {
+                                self.sws_key = key;
                                 self.sws_ctx = unsafe {
                                     ffi::sws_getContext(
                                         w,
                                         h,
                                         ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                                        w,
-                                        h,
+                                        dst_w,
+                                        dst_h,
                                         sw_format,
                                         SWS_FAST_BILINEAR,
                                         ptr::null_mut(),
@@ -2745,8 +2796,8 @@ impl VideoEncoder for FfmpegEncoder {
                             return Err(ff_err(ret));
                         }
 
-                        (*self.frame).width = w;
-                        (*self.frame).height = h;
+                        (*self.frame).width = dst_w;
+                        (*self.frame).height = dst_h;
                     }
                     self.frame
                 } else {
@@ -2763,68 +2814,7 @@ impl VideoEncoder for FfmpegEncoder {
             }
         };
 
-        // Set PTS and colorspace characteristics.
-        unsafe {
-            (*send_frame).pts = self.frame_count as i64;
-            (*send_frame).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-            (*send_frame).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
-                ffi::AVColorRange::AVCOL_RANGE_MPEG
-            } else {
-                ffi::AVColorRange::AVCOL_RANGE_JPEG
-            };
-            (*send_frame).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-            (*send_frame).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-        }
-
-        // Force keyframe if requested.
-        if self.force_keyframe {
-            unsafe {
-                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
-            }
-            log::debug!("Forcing keyframe at frame #{}", self.frame_count);
-        } else {
-            unsafe {
-                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
-                (*send_frame).flags &= !(ffi::AV_FRAME_FLAG_KEY as libc::c_int);
-            }
-        }
-
-        // Send the frame to the encoder.
-        let ret = unsafe { ffi::avcodec_send_frame(self.codec_ctx, send_frame) };
-        if ret < 0 {
-            log::error!(
-                "avcodec_send_frame failed at frame #{}: {}",
-                self.frame_count,
-                ret
-            );
-            unsafe {
-                ffi::av_frame_unref(self.frame);
-                ffi::av_frame_unref(self.sw_frame);
-            }
-            return Err(ff_err(ret));
-        }
-
-        // Drain output packets, prepending SPS/PPS to any IDR keyframes.
-        let result = self.drain_packets(config.codec, config.fps, true);
-
-        // Clean up frame state for this iteration.
-        unsafe {
-            ffi::av_frame_unref(self.frame);
-            ffi::av_frame_unref(self.sw_frame);
-        }
-
-        self.frame_count += 1;
-        self.force_keyframe = false;
-
-        log::trace!(
-            "Encoded frame #{} pts={}us -> {} packets",
-            self.frame_count - 1,
-            pts_us,
-            result.as_ref().map(|v| v.len()).unwrap_or(0),
-        );
-
-        result
+        self.submit_frame(send_frame, pts_us)
     }
 
     fn request_keyframe(&mut self) {
@@ -2942,6 +2932,14 @@ impl VideoEncoder for FfmpegEncoder {
         // either valid or null. FFmpeg's free functions are null-safe
         // (they check internally), and we null them out after freeing to
         // prevent double-free.
+        // The VPP converter borrows FFmpeg's VADisplay: release it first.
+        #[cfg(target_os = "linux")]
+        {
+            self.vaapi_dmabuf = None;
+            self.dmabuf_readback = None;
+            self.dmabuf_zero_copy_failed = false;
+        }
+
         unsafe {
             if !self.codec_ctx.is_null() {
                 ffi::avcodec_free_context(&mut self.codec_ctx);
@@ -2977,6 +2975,7 @@ impl VideoEncoder for FfmpegEncoder {
                 ffi::sws_freeContext(self.sws_ctx);
                 self.sws_ctx = ptr::null_mut();
             }
+            self.sws_key = (0, 0, -1);
         }
 
         self.initialized = false;
@@ -2998,6 +2997,186 @@ impl VideoEncoder for FfmpegEncoder {
         }
 
         log::info!("FFmpeg encoder shut down successfully");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl FfmpegEncoder {
+    /// Stamp, send and drain one frame (shared tail of all encode paths).
+    fn submit_frame(
+        &mut self,
+        send_frame: *mut ffi::AVFrame,
+        pts_us: u64,
+    ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
+        let config = self.config.as_ref().unwrap();
+        let hw_type = self.info.as_ref().unwrap().hw_type;
+        let codec = config.codec;
+        let fps = config.fps;
+
+        // Set PTS and colorspace characteristics.
+        unsafe {
+            (*send_frame).pts = self.frame_count as i64;
+            (*send_frame).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+            (*send_frame).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+                ffi::AVColorRange::AVCOL_RANGE_MPEG
+            } else {
+                ffi::AVColorRange::AVCOL_RANGE_JPEG
+            };
+            (*send_frame).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*send_frame).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        }
+
+        // Force keyframe if requested.
+        if self.force_keyframe {
+            unsafe {
+                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*send_frame).flags |= ffi::AV_FRAME_FLAG_KEY as libc::c_int;
+            }
+            log::debug!("Forcing keyframe at frame #{}", self.frame_count);
+        } else {
+            unsafe {
+                (*send_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+                (*send_frame).flags &= !(ffi::AV_FRAME_FLAG_KEY as libc::c_int);
+            }
+        }
+
+        // Send the frame to the encoder.
+        let ret = unsafe { ffi::avcodec_send_frame(self.codec_ctx, send_frame) };
+        if ret < 0 {
+            log::error!(
+                "avcodec_send_frame failed at frame #{}: {}",
+                self.frame_count,
+                ret
+            );
+            unsafe {
+                ffi::av_frame_unref(self.frame);
+                ffi::av_frame_unref(self.sw_frame);
+            }
+            return Err(ff_err(ret));
+        }
+
+        // Drain output packets, prepending SPS/PPS to any IDR keyframes.
+        let result = self.drain_packets(codec, fps, true);
+
+        // Clean up frame state for this iteration.
+        unsafe {
+            ffi::av_frame_unref(self.frame);
+            ffi::av_frame_unref(self.sw_frame);
+        }
+
+        self.frame_count += 1;
+        self.force_keyframe = false;
+
+        log::trace!(
+            "Encoded frame #{} pts={}us -> {} packets",
+            self.frame_count - 1,
+            pts_us,
+            result.as_ref().map(|v| v.len()).unwrap_or(0),
+        );
+
+        result
+    }
+
+    /// Encode a DMA-BUF frame.
+    ///
+    /// VAAPI: import the buffer as a VA surface and colour-convert/scale it
+    /// into an NV12 pool surface with VPP — zero-copy, all on the GPU.
+    /// Other encoders (or if VPP fails): EGL readback into a CPU buffer.
+    #[cfg(target_os = "linux")]
+    fn encode_dmabuf(
+        &mut self,
+        buffer: &GpuBuffer,
+        pts_us: u64,
+    ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
+        let GpuBuffer::DmaBuf { fd, offset, stride, modifier, size, width, height, fourcc } = buffer
+        else {
+            return Err(MediaError::EncodeError("encode_dmabuf: not a DMA-BUF".into()));
+        };
+        let frame = super::vaapi_dmabuf::DmabufFrame {
+            fd: *fd,
+            offset: *offset,
+            stride: *stride,
+            modifier: *modifier,
+            size: *size,
+            width: *width,
+            height: *height,
+            drm_format: *fourcc,
+        };
+        let hw_type = self.info.as_ref().unwrap().hw_type;
+
+        if hw_type == HwAccelType::Vaapi && !self.hw_frames_ctx.is_null() && !self.dmabuf_zero_copy_failed {
+            match self.vaapi_convert_dmabuf(&frame) {
+                Ok(()) => return self.submit_frame(self.frame, pts_us),
+                Err(e) => {
+                    log::warn!(
+                        "VAAPI zero-copy import failed ({}); falling back to EGL readback",
+                        e
+                    );
+                    self.dmabuf_zero_copy_failed = true;
+                    self.vaapi_dmabuf = None;
+                    unsafe { ffi::av_frame_unref(self.frame) };
+                }
+            }
+        }
+
+        // Fallback: GPU → CPU readback, then the regular upload path.
+        if self.dmabuf_readback.is_none() {
+            self.dmabuf_readback = Some(crate::capture::egl_import::EglImporter::new()?);
+            log::info!("DMA-BUF readback via EGL enabled for {:?} encoder", hw_type);
+        }
+        let bgra = self.dmabuf_readback.as_mut().unwrap().import_dmabuf(
+            frame.fd,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.drm_format,
+            frame.offset,
+            frame.modifier,
+        )?;
+        let cpu = GpuBuffer::CpuBuffer {
+            data: bgra,
+            stride: frame.width * 4,
+            format: PixelFormat::BGRA,
+            width: frame.width,
+            height: frame.height,
+        };
+        self.encode(&cpu, pts_us)
+    }
+
+    /// Fill `self.frame` with an NV12 pool surface converted from `frame`.
+    #[cfg(target_os = "linux")]
+    fn vaapi_convert_dmabuf(
+        &mut self,
+        frame: &super::vaapi_dmabuf::DmabufFrame,
+    ) -> Result<(), MediaError> {
+        let (out_w, out_h) = {
+            let c = self.config.as_ref().unwrap();
+            (c.width, c.height)
+        };
+        if self.vaapi_dmabuf.is_none() {
+            let display = unsafe {
+                let device_ctx = (*self.hw_device_ctx).data as *mut ffi::AVHWDeviceContext;
+                // AVVAAPIDeviceContext { VADisplay display; unsigned driver_quirks; }
+                *((*device_ctx).hwctx as *mut *mut libc::c_void)
+            };
+            self.vaapi_dmabuf = Some(unsafe {
+                super::vaapi_dmabuf::VaapiDmabufConverter::new(display, out_w, out_h)?
+            });
+        }
+
+        unsafe {
+            ffi::av_frame_unref(self.frame);
+            let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);
+            if ret < 0 {
+                return Err(ff_err(ret));
+            }
+            // For AV_PIX_FMT_VAAPI, data[3] carries the VASurfaceID.
+            let dst = (*self.frame).data[3] as usize as u32;
+            (*self.frame).width = out_w as libc::c_int;
+            (*self.frame).height = out_h as libc::c_int;
+            self.vaapi_dmabuf.as_mut().unwrap().convert(frame, dst)?;
+        }
+        Ok(())
     }
 }
 

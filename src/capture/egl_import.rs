@@ -375,9 +375,28 @@ impl EglImporter {
         ];
         let mut config: EGLConfig = std::ptr::null_mut();
         let mut num_configs: EGLint = 0;
-        let ok = unsafe {
+        let mut ok = unsafe {
             eglChooseConfig(display, config_attribs.as_ptr(), &mut config, 1, &mut num_configs)
         };
+        if ok == EGL_FALSE || num_configs == 0 {
+            // GBM displays (Mesa) expose no PBuffer configs; the context is
+            // then bound surfaceless (EGL_KHR_surfaceless_context) below.
+            let surfaceless_attribs: [EGLint; 11] = [
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+                EGL_RED_SIZE, 8,
+                EGL_GREEN_SIZE, 8,
+                EGL_BLUE_SIZE, 8,
+                EGL_ALPHA_SIZE, 0,
+                EGL_NONE,
+            ];
+            num_configs = 0;
+            ok = unsafe {
+                eglChooseConfig(display, surfaceless_attribs.as_ptr(), &mut config, 1, &mut num_configs)
+            };
+            if ok != EGL_FALSE && num_configs > 0 {
+                log::info!("EGL: no PBuffer config on this display, using a surfaceless context");
+            }
+        }
         if ok == EGL_FALSE || num_configs == 0 {
             let err = unsafe { eglGetError() };
             return Err(MediaError::CaptureError(format!(
@@ -686,9 +705,19 @@ impl EglImporter {
                 type GbmCreateDeviceFn = unsafe extern "C" fn(fd: libc::c_int) -> *mut std::ffi::c_void;
                 if let Ok(gbm_create_device) = unsafe { gbmlib.get::<GbmCreateDeviceFn>(b"gbm_create_device") } {
                     let gbm_create_device = *gbm_create_device;
-                    // Try common render nodes
-                    for render_node in &["/dev/dri/renderD128", "/dev/dri/renderD129"] {
-                        let c_path = std::ffi::CString::new(*render_node).unwrap();
+                    // The display GPU first (the compositor's buffers live
+                    // there), then the remaining render nodes.
+                    let mut render_nodes: Vec<String> = Vec::new();
+                    if let Some(node) = super::dmabuf_caps::display_render_node() {
+                        render_nodes.push(node);
+                    }
+                    for n in ["/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130"] {
+                        if !render_nodes.iter().any(|r| r == n) {
+                            render_nodes.push(n.to_string());
+                        }
+                    }
+                    for render_node in &render_nodes {
+                        let c_path = std::ffi::CString::new(render_node.as_str()).unwrap();
                         let drm_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
                         if drm_fd < 0 {
                             continue;
@@ -1193,7 +1222,11 @@ impl EglImporter {
         };
 
         // Open render node
-        let render_path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        let render_path = std::ffi::CString::new(
+            super::dmabuf_caps::display_render_node()
+                .unwrap_or_else(|| "/dev/dri/renderD128".to_string()),
+        )
+        .unwrap();
         let drm_fd = unsafe { libc::open(render_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if drm_fd < 0 {
             return 0;

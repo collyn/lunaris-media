@@ -259,6 +259,16 @@ impl MediaPipeline {
             (None, None)
         };
 
+        // Zero-copy: a DMA-BUF from the display GPU can only be consumed
+        // without a copy by VAAPI on that same GPU. In "auto" mode prefer it
+        // (other encoders remain as fallbacks via EGL readback).
+        let preferred_hw = if preferred_hw.is_none() && capture.delivers_dmabuf() {
+            log::info!("Capture delivers DMA-BUF frames — preferring VAAPI for zero-copy encode");
+            Some(HwAccelType::Vaapi)
+        } else {
+            preferred_hw
+        };
+
         // 3. Initialize encoder
         encoder.initialize(&EncoderConfig {
             codec: self.config.codec,
@@ -278,6 +288,9 @@ impl MediaPipeline {
             d3d11_context,
         })?;
         let encoder_info = encoder.encoder_info();
+        // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the
+        // capture backend read frames back (once per new frame).
+        capture.set_dmabuf_passthrough(encoder_info.hw_type == HwAccelType::Vaapi);
         let gpu_name = encode::describe_host_gpu(d3d11_device);
         log::info!(
             "Encoder initialized: {} ({}) on {}",

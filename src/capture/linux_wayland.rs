@@ -1,10 +1,13 @@
 //! PipeWire-based screen capture for Wayland compositors (Linux).
 //!
 //! Uses the XDG Desktop Portal (via `ashpd`) to request screen capture permission
-//! and PipeWire to receive DMA-BUF frames. On NVIDIA GPUs the DMA-BUF uses
-//! block-linear tiling — plain `mmap` produces noise. An EGL importer
-//! (see [`super::egl_import`]) converts the tiled GPU memory into linear BGRA
-//! pixel data via `glReadPixels`.
+//! and PipeWire to receive frames. Format negotiation follows Sunshine: every
+//! format is offered with the DRM modifiers the display GPU can import (queried
+//! through EGL/GBM, see [`super::dmabuf_caps`]) so the compositor shares its
+//! GPU buffers directly. Those DMA-BUFs are forwarded untouched to the encoder
+//! (`GpuBuffer::DmaBuf`), which converts/scales them on the GPU (VAAPI VPP) —
+//! no pixel ever crosses the CPU. Shared-memory buffers remain as fallback, and
+//! `LUNARIS_PIPEWIRE_ZERO_COPY=0` restores the EGL `glReadPixels` readback.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +18,48 @@ use crate::capture::{CapturedFrame, FrameCursorMeta, ScreenCapture};
 use crate::error::MediaError;
 use crate::types::*;
 
+/// Latest cursor reported by the compositor through `SPA_META_Cursor`.
+///
+/// Wayland has no global pointer query (XFixes only sees XWayland windows), so
+/// the cursor backend reads this instead. Coordinates are relative to the
+/// streamed monitor, in frame pixels.
+#[derive(Clone, Debug, Default)]
+pub struct PipewireCursor {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+    /// Most recent cursor bitmap.
+    pub image: Option<CursorImage>,
+    /// Incremented whenever `image` changes.
+    pub image_serial: u64,
+}
+
+static PIPEWIRE_CURSOR: std::sync::Mutex<Option<PipewireCursor>> = std::sync::Mutex::new(None);
+
+/// Snapshot of the PipeWire cursor, if a PipeWire capture is running.
+pub fn pipewire_cursor() -> Option<PipewireCursor> {
+    PIPEWIRE_CURSOR.lock().ok().and_then(|c| c.clone())
+}
+
+fn publish_cursor(meta: &FrameCursorMeta) {
+    if let Ok(mut slot) = PIPEWIRE_CURSOR.lock() {
+        let cur = slot.get_or_insert_with(PipewireCursor::default);
+        cur.x = meta.x;
+        cur.y = meta.y;
+        cur.visible = meta.visible;
+        if let Some(image) = &meta.image {
+            cur.image = Some(image.clone());
+            cur.image_serial = cur.image_serial.wrapping_add(1);
+        }
+    }
+}
+
+fn clear_cursor() {
+    if let Ok(mut slot) = PIPEWIRE_CURSOR.lock() {
+        *slot = None;
+    }
+}
+
 /// Capacity of the internal frame channel.
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 
@@ -24,6 +69,10 @@ pub struct PipeWireCapture {
     pw_thread: Option<std::thread::JoinHandle<()>>,
     shutdown_tx: Option<pipewire::channel::Sender<()>>,
     capturing: bool,
+    /// Target frame rate; bounds how long `next_frame` waits for damage.
+    fps: u32,
+    /// Forward DMA-BUFs untouched (zero-copy) instead of reading them back.
+    passthrough: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PipeWireCapture {
@@ -48,6 +97,10 @@ impl PipeWireCapture {
             pw_thread: None,
             shutdown_tx: None,
             capturing: false,
+            fps: 60,
+            passthrough: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                pipewire_zero_copy_enabled(),
+            )),
         })
     }
 }
@@ -108,8 +161,17 @@ impl ScreenCapture for PipeWireCapture {
             log::info!("PipeWireCapture: embedding host cursor in video stream");
             CursorMode::Embedded
         } else {
-            log::info!("PipeWireCapture: hiding host cursor from video stream; browser overlay will render it");
-            CursorMode::Hidden
+            // Cursor as metadata (SPA_META_Cursor): not drawn into the video,
+            // forwarded to the client overlay instead. Fall back to embedding
+            // when the portal cannot provide metadata.
+            let available = screencast.available_cursor_modes().await.unwrap_or_default();
+            if available.contains(CursorMode::Metadata) {
+                log::info!("PipeWireCapture: cursor as metadata; browser overlay will render it");
+                CursorMode::Metadata
+            } else {
+                log::info!("PipeWireCapture: portal lacks cursor metadata; embedding cursor in video");
+                CursorMode::Embedded
+            }
         };
         let types = BitFlags::from(SourceType::Monitor);
         screencast
@@ -152,17 +214,33 @@ impl ScreenCapture for PipeWireCapture {
             .ok_or_else(|| MediaError::CaptureError("No stream returned from portal".into()))?;
 
         let node_id = stream_info.pipe_wire_node_id();
-        log::info!("Screencast portal started. Node ID: {}", node_id);
+        log::info!(
+            "Screencast portal started. Node ID: {} position={:?} size={:?}",
+            node_id,
+            stream_info.position(),
+            stream_info.size()
+        );
+        // Map absolute pointer input onto the monitor the user picked.
+        if let (Some((x, y)), Some((w, h))) = (stream_info.position(), stream_info.size()) {
+            crate::input::set_capture_region(crate::input::ScreenRegion {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+        }
 
         let (frame_tx, frame_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let (pw_sender, pw_receiver) = pipewire::channel::channel::<()>();
 
         let config = config.clone();
+        self.fps = config.fps.max(1);
+        let passthrough = self.passthrough.clone();
 
         let pw_thread = std::thread::Builder::new()
             .name("lunaris-pw".into())
             .spawn(move || {
-                if let Err(e) = run_pipewire_loop(node_id, frame_tx, pw_receiver, config) {
+                if let Err(e) = run_pipewire_loop(node_id, frame_tx, pw_receiver, config, passthrough) {
                     log::error!("PipeWire loop error: {:?}", e);
                 }
                 // Close the portal session after PipeWire stops.
@@ -208,9 +286,41 @@ impl ScreenCapture for PipeWireCapture {
             .as_mut()
             .ok_or(MediaError::CaptureNotStarted)?;
 
-        rx.recv()
-            .await
-            .ok_or_else(|| MediaError::CaptureError("Frame channel closed".into()))
+        // Compositors only push frames on damage. Wait at most one frame
+        // interval; on timeout hand back an empty buffer so the pipeline
+        // re-encodes its last frame (constant FPS) instead of stalling.
+        let interval = std::time::Duration::from_micros(1_000_000 / self.fps.max(1) as u64);
+        let mut frame = match tokio::time::timeout(interval, rx.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Err(MediaError::CaptureError("Frame channel closed".into())),
+            Err(_) => {
+                return Ok(CapturedFrame {
+                    buffer: GpuBuffer::CpuBuffer {
+                        data: Vec::new(),
+                        stride: 0,
+                        format: PixelFormat::BGRA,
+                        width: 0,
+                        height: 0,
+                    },
+                    timestamp_us: 0,
+                    width: 0,
+                    height: 0,
+                    format: PixelFormat::BGRA,
+                    is_new_frame: false,
+                    cursor: None,
+                })
+            }
+        };
+        // Always encode the newest picture available.
+        while let Ok(newer) = rx.try_recv() {
+            frame = newer;
+        }
+        Ok(frame)
+    }
+
+    async fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        self.fps = fps.max(1);
+        Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), MediaError> {
@@ -229,6 +339,7 @@ impl ScreenCapture for PipeWireCapture {
 
         self.frame_rx = None;
         self.capturing = false;
+        clear_cursor();
 
         log::info!("PipeWire capture stopped");
         Ok(())
@@ -236,6 +347,20 @@ impl ScreenCapture for PipeWireCapture {
 
     fn is_capturing(&self) -> bool {
         self.capturing
+    }
+
+    fn delivers_dmabuf(&self) -> bool {
+        self.passthrough.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_dmabuf_passthrough(&mut self, enabled: bool) {
+        let enabled = enabled && pipewire_zero_copy_enabled();
+        log::info!(
+            "PipeWire: DMA-BUF passthrough {}",
+            if enabled { "ON (zero-copy)" } else { "OFF (EGL readback in capture thread)" }
+        );
+        self.passthrough
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -251,12 +376,168 @@ impl Drop for PipeWireCapture {
     }
 }
 
-/// Shared state for negotiated format, updated by param_changed callback
-/// and read by process callback.
+/// Format fixed by the compositor in `param_changed`, read by `process`.
+#[derive(Clone, Copy, Debug, Default)]
 struct NegotiatedFormat {
-    fourcc: u32,
+    /// DRM fourcc equivalent of the negotiated SPA format.
+    drm_format: u32,
+    /// DRM modifier (only meaningful when `dmabuf` is true).
     modifier: u64,
-    format_ready: bool,
+    /// Actual frame size chosen by the compositor (may differ from the
+    /// encoder size; the encoder scales on the GPU).
+    width: u32,
+    height: u32,
+    /// The format carried a modifier, i.e. buffers will be DMA-BUFs.
+    dmabuf: bool,
+    ready: bool,
+}
+
+/// Whether DMA-BUF frames are forwarded untouched to the encoder (zero-copy).
+///
+/// Set `LUNARIS_PIPEWIRE_ZERO_COPY=0` to force the legacy EGL `glReadPixels`
+/// readback inside the capture thread.
+fn pipewire_zero_copy_enabled() -> bool {
+    std::env::var("LUNARIS_PIPEWIRE_ZERO_COPY")
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+/// Size of `SPA_META_Cursor` holding a `side`×`side` RGBA bitmap.
+fn cursor_meta_size(side: i32) -> i32 {
+    (std::mem::size_of::<pipewire::spa::sys::spa_meta_cursor>()
+        + std::mem::size_of::<pipewire::spa::sys::spa_meta_bitmap>()) as i32
+        + side * side * 4
+}
+
+/// SPA POD builders for the stream parameters (modelled on Sunshine's
+/// `pipewire.cpp` / OBS' `pipewire.c`).
+mod pods {
+    use pipewire::spa::pod::builder::Builder;
+    use pipewire::spa::sys as spa;
+    use pipewire::spa::utils::{Fraction, Id, Rectangle};
+    use std::mem::MaybeUninit;
+
+    fn err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> String {
+        move |e| format!("{}: {:?}", what, e)
+    }
+
+    /// One `EnumFormat` entry: a single video format, a size range defaulting
+    /// to the requested size, variable framerate capped at `fps`, and — when
+    /// `modifiers` is non-empty — a mandatory, non-fixated modifier list that
+    /// lets the compositor pick a GPU layout we can import.
+    pub fn enum_format(
+        spa_format: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        modifiers: &[u64],
+    ) -> Result<Vec<u8>, String> {
+        let mut data = Vec::with_capacity(512);
+        unsafe {
+            let mut b = Builder::new(&mut data);
+            let mut obj = MaybeUninit::uninit();
+            b.push_object(&mut obj, spa::SPA_TYPE_OBJECT_Format, spa::SPA_PARAM_EnumFormat)
+                .map_err(err("push Format"))?;
+
+            b.add_prop(spa::SPA_FORMAT_mediaType, 0).map_err(err("mediaType"))?;
+            b.add_id(Id(spa::SPA_MEDIA_TYPE_video)).map_err(err("mediaType"))?;
+            b.add_prop(spa::SPA_FORMAT_mediaSubtype, 0).map_err(err("mediaSubtype"))?;
+            b.add_id(Id(spa::SPA_MEDIA_SUBTYPE_raw)).map_err(err("mediaSubtype"))?;
+            b.add_prop(spa::SPA_FORMAT_VIDEO_format, 0).map_err(err("format"))?;
+            b.add_id(Id(spa_format)).map_err(err("format"))?;
+
+            b.add_prop(spa::SPA_FORMAT_VIDEO_size, 0).map_err(err("size"))?;
+            let mut choice = MaybeUninit::uninit();
+            b.push_choice(&mut choice, spa::SPA_CHOICE_Range, 0).map_err(err("size choice"))?;
+            b.add_rectangle(Rectangle { width: width.max(1), height: height.max(1) })
+                .map_err(err("size"))?;
+            b.add_rectangle(Rectangle { width: 1, height: 1 }).map_err(err("size"))?;
+            b.add_rectangle(Rectangle { width: 8192, height: 8192 }).map_err(err("size"))?;
+            b.pop(&mut *choice.as_mut_ptr());
+
+            // Variable framerate (0/1) bounded by maxFramerate: the compositor
+            // then pushes a frame whenever the screen changes, up to `fps`.
+            b.add_prop(spa::SPA_FORMAT_VIDEO_framerate, 0).map_err(err("framerate"))?;
+            b.add_fraction(Fraction { num: 0, denom: 1 }).map_err(err("framerate"))?;
+            b.add_prop(spa::SPA_FORMAT_VIDEO_maxFramerate, 0).map_err(err("maxFramerate"))?;
+            let mut choice = MaybeUninit::uninit();
+            b.push_choice(&mut choice, spa::SPA_CHOICE_Range, 0)
+                .map_err(err("maxFramerate choice"))?;
+            b.add_fraction(Fraction { num: fps.max(1), denom: 1 }).map_err(err("maxFramerate"))?;
+            b.add_fraction(Fraction { num: 0, denom: 1 }).map_err(err("maxFramerate"))?;
+            b.add_fraction(Fraction { num: 1000, denom: 1 }).map_err(err("maxFramerate"))?;
+            b.pop(&mut *choice.as_mut_ptr());
+
+            if !modifiers.is_empty() {
+                b.add_prop(
+                    spa::SPA_FORMAT_VIDEO_modifier,
+                    spa::SPA_POD_PROP_FLAG_MANDATORY | spa::SPA_POD_PROP_FLAG_DONT_FIXATE,
+                )
+                .map_err(err("modifier"))?;
+                let mut choice = MaybeUninit::uninit();
+                b.push_choice(&mut choice, spa::SPA_CHOICE_Enum, 0)
+                    .map_err(err("modifier choice"))?;
+                // First value of an Enum choice is the default.
+                b.add_long(modifiers[0] as i64).map_err(err("modifier"))?;
+                for &m in modifiers {
+                    b.add_long(m as i64).map_err(err("modifier"))?;
+                }
+                b.pop(&mut *choice.as_mut_ptr());
+            }
+
+            b.pop(&mut *obj.as_mut_ptr());
+        }
+        Ok(data)
+    }
+
+    /// `ParamBuffers` restricting the buffer memory types.
+    pub fn buffers(data_types: i32) -> Result<Vec<u8>, String> {
+        let mut data = Vec::with_capacity(128);
+        unsafe {
+            let mut b = Builder::new(&mut data);
+            let mut obj = MaybeUninit::uninit();
+            b.push_object(&mut obj, spa::SPA_TYPE_OBJECT_ParamBuffers, spa::SPA_PARAM_Buffers)
+                .map_err(err("push Buffers"))?;
+            b.add_prop(spa::SPA_PARAM_BUFFERS_dataType, 0).map_err(err("dataType"))?;
+            b.add_int(data_types).map_err(err("dataType"))?;
+            b.pop(&mut *obj.as_mut_ptr());
+        }
+        Ok(data)
+    }
+
+    /// `ParamMeta` requesting `SPA_META_Cursor` with room for a bitmap.
+    pub fn cursor_meta() -> Result<Vec<u8>, String> {
+        let mut data = Vec::with_capacity(128);
+        unsafe {
+            let mut b = Builder::new(&mut data);
+            let mut obj = MaybeUninit::uninit();
+            b.push_object(&mut obj, spa::SPA_TYPE_OBJECT_ParamMeta, spa::SPA_PARAM_Meta)
+                .map_err(err("push Meta"))?;
+            b.add_prop(spa::SPA_PARAM_META_type, 0).map_err(err("meta type"))?;
+            b.add_id(Id(spa::SPA_META_Cursor)).map_err(err("meta type"))?;
+            b.add_prop(spa::SPA_PARAM_META_size, 0).map_err(err("meta size"))?;
+            let mut choice = MaybeUninit::uninit();
+            b.push_choice(&mut choice, spa::SPA_CHOICE_Range, 0).map_err(err("meta choice"))?;
+            b.add_int(super::cursor_meta_size(64)).map_err(err("meta size"))?;
+            b.add_int(super::cursor_meta_size(1)).map_err(err("meta size"))?;
+            b.add_int(super::cursor_meta_size(256)).map_err(err("meta size"))?;
+            b.pop(&mut *choice.as_mut_ptr());
+            b.pop(&mut *obj.as_mut_ptr());
+        }
+        Ok(data)
+    }
+
+    /// View a built POD buffer as a `Pod`. The returned reference borrows `data`.
+    pub fn as_pod(data: &[u8]) -> &pipewire::spa::pod::Pod {
+        unsafe { pipewire::spa::pod::Pod::from_raw(data.as_ptr() as *const spa::spa_pod) }
+    }
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 fn run_pipewire_loop(
@@ -264,10 +545,10 @@ fn run_pipewire_loop(
     frame_tx: mpsc::Sender<CapturedFrame>,
     pw_receiver: pipewire::channel::Receiver<()>,
     config: StreamConfig,
+    passthrough: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), MediaError> {
     use pipewire::main_loop::MainLoop;
-    use pipewire::spa::pod::builder::Builder;
-    use pipewire::spa::pod::Pod;
+    use pipewire::spa::sys as spa;
 
     let mainloop = Rc::new(
         MainLoop::new(None)
@@ -288,308 +569,348 @@ fn run_pipewire_loop(
     let stream = pipewire::stream::Stream::new(&core, "lunaris-capture", props)
         .map_err(|e| MediaError::CaptureError(format!("Failed to create Stream: {}", e)))?;
 
-    // Attach the shutdown receiver
     let mainloop_clone = mainloop.clone();
-    let _receiver = pw_receiver.attach(&mainloop.loop_(), move |()| {
+    let _receiver = pw_receiver.attach(mainloop.loop_(), move |()| {
         mainloop_clone.quit();
     });
 
-    // Shared state for negotiated format (set in param_changed, read in process)
-    let negotiated = Rc::new(RefCell::new(NegotiatedFormat {
-        fourcc: 0x34325241, // DRM_FORMAT_ARGB8888 default
-        modifier: 0,
-        format_ready: false,
-    }));
+    // --- Capability discovery (which GPU, which modifiers) -----------------
+    let zero_copy = passthrough.load(std::sync::atomic::Ordering::Relaxed);
+    let render_node = super::dmabuf_caps::display_render_node();
+    let dmabuf_formats = render_node
+        .as_deref()
+        .map(super::dmabuf_caps::query_dmabuf_formats)
+        .unwrap_or_default();
+    log::info!(
+        "PipeWire: zero-copy={} render_node={:?} dmabuf formats with modifiers={}",
+        zero_copy,
+        render_node,
+        dmabuf_formats.iter().filter(|f| !f.modifiers.is_empty()).count()
+    );
 
-    // EGL importer (created lazily on first DMA-BUF frame)
+    let negotiated = Rc::new(RefCell::new(NegotiatedFormat::default()));
+    // The most recent DMA-BUF buffer handed to the encoder. It stays dequeued
+    // (so the compositor cannot draw into it) until a newer frame replaces it.
+    let held_buffer: Rc<RefCell<*mut pipewire::sys::pw_buffer>> =
+        Rc::new(RefCell::new(std::ptr::null_mut()));
+    // Legacy readback path (zero-copy disabled), created lazily.
     let egl_importer: Rc<RefCell<Option<super::egl_import::EglImporter>>> =
         Rc::new(RefCell::new(None));
 
-    let negotiated_clone = negotiated.clone();
-    let egl_clone = egl_importer.clone();
+    let negotiated_pc = negotiated.clone();
+    let negotiated_proc = negotiated.clone();
+    let held_proc = held_buffer.clone();
+    let held_state = held_buffer.clone();
+    let egl_proc = egl_importer.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(frame_tx)
-        .param_changed(move |_stream, _user_data, id, pod_opt| {
-            // id for Format param
-            const SPA_PARAM_FORMAT: u32 = 4;
-            if id != SPA_PARAM_FORMAT {
-                return;
-            }
-            let pod = match pod_opt {
-                Some(p) => p,
-                None => return,
-            };
-
-            // Parse format POD to extract DRM fourcc and modifier
-            let mut fourcc: u32 = 0x34325241; // default ARGB8888
-            let mut modifier: u64 = 0;
-            let mut found_format = false;
-            let mut found_modifier = false;
-
-            // Walk the POD body looking for property keys
-            let raw_pod = pod.as_raw_ptr();
-            let pod_ref = unsafe { &*raw_pod };
-
-            // Only handle Object type PODs
-            if pod_ref.type_ == pipewire::spa::sys::SPA_TYPE_Object {
-                let obj = raw_pod as *const pipewire::spa::sys::spa_pod_object;
-                let obj_ref = unsafe { &*obj };
-                let body = &obj_ref.body;
-                let body_ptr = body as *const _ as *const u8;
-                let body_size = pod_ref.size.saturating_sub(
-                    std::mem::size_of::<pipewire::spa::sys::spa_pod_object_body>() as u32,
-                );
-
-                let mut offset: u32 = 0;
-                while offset + 16 < body_size {
-                    let prop_ptr = unsafe {
-                        body_ptr
-                            .add(std::mem::size_of::<pipewire::spa::sys::spa_pod_object_body>())
-                            .add(offset as usize)
-                    } as *const pipewire::spa::sys::spa_pod_prop;
-                    let prop = unsafe { &*prop_ptr };
-                    let value_ptr = unsafe { prop_ptr.add(1) } as *const u8;
-
-                    // SPA_FORMAT_VIDEO_format = 2
-                    if prop.key == 2 {
-                        let val_pod =
-                            value_ptr as *const pipewire::spa::sys::spa_pod;
-                        let val = unsafe { &*val_pod };
-                        if val.type_ == pipewire::spa::sys::SPA_TYPE_Id && val.size >= 4 {
-                            let spa_fmt = unsafe {
-                                *(value_ptr.add(std::mem::size_of::<pipewire::spa::sys::spa_pod>())
-                                    as *const u32)
-                            };
-                            fourcc = spa_video_format_to_drm_fourcc(spa_fmt);
-                            found_format = true;
-                        }
-                    }
-                    // SPA_FORMAT_VIDEO_modifier = 3
-                    else if prop.key == 3 {
-                        let val_pod =
-                            value_ptr as *const pipewire::spa::sys::spa_pod;
-                        let val = unsafe { &*val_pod };
-                        if val.type_ == pipewire::spa::sys::SPA_TYPE_Long && val.size >= 8 {
-                            modifier = unsafe {
-                                *(value_ptr.add(std::mem::size_of::<pipewire::spa::sys::spa_pod>())
-                                    as *const u64)
-                            };
-                            found_modifier = true;
-                        }
-                    }
-
-                    // Advance to next property (aligned to 8 bytes)
-                    let val_pod = unsafe { &*(value_ptr as *const pipewire::spa::sys::spa_pod) };
-                    let prop_header = std::mem::size_of::<pipewire::spa::sys::spa_pod_prop>() as u32;
-                    let val_total = std::mem::size_of::<pipewire::spa::sys::spa_pod>() as u32
-                        + ((val_pod.size + 7) & !7);
-                    offset += prop_header + val_total;
+        .state_changed(move |stream, _, old, new| {
+            log::info!("PipeWire stream state: {:?} -> {:?}", old, new);
+            // Return a held buffer when the stream stops streaming.
+            if !matches!(new, pipewire::stream::StreamState::Streaming) {
+                let prev = std::mem::replace(&mut *held_state.borrow_mut(), std::ptr::null_mut());
+                if !prev.is_null() {
+                    unsafe { stream.queue_raw_buffer(prev) };
                 }
             }
+        })
+        .param_changed(move |stream, _user_data, id, pod_opt| {
+            if id != spa::SPA_PARAM_Format {
+                return;
+            }
+            let Some(pod) = pod_opt else { return };
 
+            let Ok((media_type, media_subtype)) =
+                pipewire::spa::param::format_utils::parse_format(pod)
+            else {
+                return;
+            };
+            if media_type != pipewire::spa::param::format::MediaType::Video
+                || media_subtype != pipewire::spa::param::format::MediaSubtype::Raw
+            {
+                return;
+            }
+
+            let mut info = pipewire::spa::param::video::VideoInfoRaw::new();
+            if let Err(e) = info.parse(pod) {
+                log::warn!("PipeWire: failed to parse video format: {:?}", e);
+                return;
+            }
+            let has_modifier = unsafe {
+                !spa::spa_pod_find_prop(
+                    pod.as_raw_ptr(),
+                    std::ptr::null(),
+                    spa::SPA_FORMAT_VIDEO_modifier,
+                )
+                .is_null()
+            };
+            let spa_format = info.format().as_raw();
+            let size = info.size();
+            let drm_format = super::dmabuf_caps::spa_to_drm_format(spa_format).unwrap_or(0);
+
+            let neg = NegotiatedFormat {
+                drm_format,
+                modifier: info.modifier(),
+                width: size.width,
+                height: size.height,
+                dmabuf: has_modifier && drm_format != 0,
+                ready: true,
+            };
             log::info!(
-                "PipeWire negotiated format: fourcc=0x{:08X}, modifier=0x{:016X} (found_format={}, found_modifier={})",
-                fourcc, modifier, found_format, found_modifier
+                "PipeWire negotiated: {}x{} spa_format={} drm=0x{:08X} modifier=0x{:016X} dmabuf={} max_fps={}/{}",
+                neg.width,
+                neg.height,
+                spa_format,
+                drm_format,
+                neg.modifier,
+                neg.dmabuf,
+                info.max_framerate().num,
+                info.max_framerate().denom,
             );
+            *negotiated_pc.borrow_mut() = neg;
 
-            let mut neg = negotiated_clone.borrow_mut();
-            neg.fourcc = fourcc;
-            neg.modifier = modifier;
-            neg.format_ready = true;
+            // Tell the producer which memory we accept for this format and
+            // ask for cursor metadata (with bitmap room).
+            let data_types: i32 = if neg.dmabuf {
+                1 << spa::SPA_DATA_DmaBuf
+            } else {
+                (1 << spa::SPA_DATA_MemFd) | (1 << spa::SPA_DATA_MemPtr)
+            };
+            match (pods::buffers(data_types), pods::cursor_meta()) {
+                (Ok(buffers), Ok(meta)) => {
+                    let mut params = [pods::as_pod(&buffers), pods::as_pod(&meta)];
+                    if let Err(e) = stream.update_params(&mut params) {
+                        log::warn!("PipeWire: update_params failed: {}", e);
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => log::warn!("PipeWire: building params: {}", e),
+            }
         })
         .process(move |stream, tx| {
-            // Use raw buffer to access both video data and spa_buffer metas (cursor)
             let raw_buf = unsafe { stream.dequeue_raw_buffer() };
             if raw_buf.is_null() {
                 return;
             }
-            let pw_buf = unsafe { &*raw_buf };
-            let spa_buf = pw_buf.buffer;
+            // Requeue `raw_buf` on every early exit below.
+            let requeue = |buf: *mut pipewire::sys::pw_buffer| unsafe {
+                stream.queue_raw_buffer(buf)
+            };
+
+            let spa_buf = unsafe { (*raw_buf).buffer };
             if spa_buf.is_null() {
+                requeue(raw_buf);
                 return;
             }
-            let spa = unsafe { &*spa_buf };
-
-            // Extract cursor metadata from spa_buffer if available
+            let spa_ref = unsafe { &*spa_buf };
+            if spa_ref.n_datas == 0 || spa_ref.datas.is_null() {
+                requeue(raw_buf);
+                return;
+            }
+            let spa_data = unsafe { &*spa_ref.datas };
+            if spa_data.chunk.is_null() {
+                requeue(raw_buf);
+                return;
+            }
+            let chunk = unsafe { &*spa_data.chunk };
             let cursor_meta = extract_cursor_meta(spa_buf);
+            if let Some(meta) = &cursor_meta {
+                publish_cursor(meta);
+            }
+            let neg = *negotiated_proc.borrow();
 
-            // Access the first spa_data for video frame data
-            if spa.n_datas == 0 || spa.datas.is_null() {
+            // Corrupted buffers and cursor-only updates (size 0) carry no new
+            // picture; the pipeline keeps re-encoding the previous frame.
+            if !neg.ready
+                || (chunk.flags & spa::SPA_CHUNK_FLAG_CORRUPTED as i32) != 0
+                || chunk.size == 0
+            {
+                requeue(raw_buf);
                 return;
             }
-            let spa_data = unsafe { &mut *spa.datas };
-            let memory_type = spa_data.type_;
 
-            if memory_type == pipewire::spa::sys::SPA_DATA_DmaBuf {
-                let fd = spa_data.fd as i32;
-                let chunk = unsafe { &*spa_data.chunk };
-                let offset = chunk.offset;
-                let stride = chunk.stride as u32;
+            let width = neg.width;
+            let height = neg.height;
 
-                // Read negotiated format
-                let neg = negotiated.borrow();
-                let fourcc = neg.fourcc;
-                let modifier = neg.modifier;
-                drop(neg);
-
-                // Initialize EGL importer lazily on first DMA-BUF frame
-                let mut egl_ref = egl_clone.borrow_mut();
-                if egl_ref.is_none() {
-                    log::info!(
-                        "PipeWire: receiving buffer type=3 (DmaBuf)"
+            if spa_data.type_ == spa::SPA_DATA_DmaBuf {
+                if spa_ref.n_datas > 1 {
+                    // Multi-plane layouts are filtered out during negotiation;
+                    // if one slips through we cannot describe it.
+                    log::warn!(
+                        "PipeWire: multi-plane DMA-BUF ({} planes) unsupported; dropping frame",
+                        spa_ref.n_datas
                     );
-                    log::info!(
-                        "PipeWire DMA-BUF: maxsize={} expected={} offset={} stride={} ({}x{})",
-                        spa_data.maxsize,
-                        config.width * config.height * 4,
-                        offset,
-                        stride,
-                        config.width,
-                        config.height
-                    );
-                    match super::egl_import::EglImporter::new() {
-                        Ok(importer) => {
-                            *egl_ref = Some(importer);
-                        }
-                        Err(e) => {
-                            log::warn!("EGL importer unavailable: {}", e);
-                            return;
-                        }
-                    }
+                    requeue(raw_buf);
+                    return;
                 }
 
-                // Import DMA-BUF via EGL → linear BGRA pixels
-                if let Some(ref mut importer) = *egl_ref {
-                    match importer.import_dmabuf(
-                        fd,
-                        config.width,
-                        config.height,
-                        stride,
-                        fourcc,
-                        offset,
-                        modifier,
-                    ) {
-                        Ok(bgra_data) => {
-                            let gpu_buf = GpuBuffer::CpuBuffer {
-                                data: bgra_data,
-                                stride: config.width * 4,
-                                format: PixelFormat::BGRA,
-                                width: config.width,
-                                height: config.height,
-                            };
-
-                            let frame = CapturedFrame {
-                                buffer: gpu_buf,
-                                timestamp_us: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros()
-                                    as u64,
-                                width: config.width,
-                                height: config.height,
-                                format: PixelFormat::BGRA,
-                                is_new_frame: true,
-                                cursor: cursor_meta,
-                            };
-
-                            let _ = tx.try_send(frame);
-                        }
-                        Err(e) => {
-                            log::warn!("EGL DMA-BUF import failed: {}", e);
-                        }
+                if passthrough.load(std::sync::atomic::Ordering::Relaxed) {
+                    let fd = unsafe { libc::fcntl(spa_data.fd as i32, libc::F_DUPFD_CLOEXEC, 0) };
+                    if fd < 0 {
+                        log::warn!("PipeWire: dup DMA-BUF fd failed: {}", std::io::Error::last_os_error());
+                        requeue(raw_buf);
+                        return;
                     }
-                }
-            } else if memory_type == pipewire::spa::sys::SPA_DATA_MemPtr
-                || memory_type == pipewire::spa::sys::SPA_DATA_MemFd
-            {
-                let chunk = unsafe { &*spa_data.chunk };
-                let stride = chunk.stride as u32;
-
-                if !spa_data.data.is_null() && spa_data.maxsize > 0 {
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(
-                            spa_data.data as *const u8,
-                            spa_data.maxsize as usize,
-                        )
-                    };
-                    let gpu_buf = GpuBuffer::CpuBuffer {
-                        data: slice.to_vec(),
-                        stride,
-                        format: PixelFormat::BGRA,
-                        width: config.width,
-                        height: config.height,
-                    };
-
                     let frame = CapturedFrame {
-                        buffer: gpu_buf,
-                        timestamp_us: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros()
-                            as u64,
-                        width: config.width,
-                        height: config.height,
+                        buffer: GpuBuffer::DmaBuf {
+                            fd,
+                            offset: chunk.offset,
+                            stride: chunk.stride as u32,
+                            modifier: neg.modifier,
+                            size: spa_data.maxsize as usize,
+                            width,
+                            height,
+                            fourcc: neg.drm_format,
+                        },
+                        timestamp_us: now_us(),
+                        width,
+                        height,
                         format: PixelFormat::BGRA,
                         is_new_frame: true,
                         cursor: cursor_meta,
                     };
-
-                    let _ = tx.try_send(frame);
+                    match tx.try_send(frame) {
+                        Ok(()) => {
+                            // Keep this buffer away from the compositor while
+                            // the encoder reads it; release the previous one.
+                            let prev = std::mem::replace(&mut *held_proc.borrow_mut(), raw_buf);
+                            if !prev.is_null() {
+                                requeue(prev);
+                            }
+                        }
+                        Err(_) => {
+                            // Encoder busy: frame (and its dup'd fd) dropped.
+                            requeue(raw_buf);
+                        }
+                    }
+                    return;
                 }
+
+                // Legacy: EGL import + glReadPixels into a CPU buffer.
+                let mut egl_ref = egl_proc.borrow_mut();
+                if egl_ref.is_none() {
+                    match super::egl_import::EglImporter::new() {
+                        Ok(importer) => *egl_ref = Some(importer),
+                        Err(e) => log::warn!("EGL importer unavailable: {}", e),
+                    }
+                }
+                if let Some(importer) = egl_ref.as_mut() {
+                    match importer.import_dmabuf(
+                        spa_data.fd as i32,
+                        width,
+                        height,
+                        chunk.stride as u32,
+                        neg.drm_format,
+                        chunk.offset,
+                        neg.modifier,
+                    ) {
+                        Ok(bgra) => {
+                            let _ = tx.try_send(CapturedFrame {
+                                buffer: GpuBuffer::CpuBuffer {
+                                    data: bgra,
+                                    stride: width * 4,
+                                    format: PixelFormat::BGRA,
+                                    width,
+                                    height,
+                                },
+                                timestamp_us: now_us(),
+                                width,
+                                height,
+                                format: PixelFormat::BGRA,
+                                is_new_frame: true,
+                                cursor: cursor_meta,
+                            });
+                        }
+                        Err(e) => log::warn!("EGL DMA-BUF import failed: {}", e),
+                    }
+                }
+                requeue(raw_buf);
+                return;
             }
+
+            // Shared-memory buffers (only BGRx/BGRA are offered for these).
+            let offset = chunk.offset as usize;
+            let size = chunk.size as usize;
+            let stride = chunk.stride as u32;
+            let data: Option<Vec<u8>> = if !spa_data.data.is_null()
+                && offset.saturating_add(size) <= spa_data.maxsize as usize
+            {
+                // MAP_BUFFERS maps MemFd too, so `data` is usually valid.
+                Some(unsafe {
+                    std::slice::from_raw_parts((spa_data.data as *const u8).add(offset), size)
+                        .to_vec()
+                })
+            } else if spa_data.type_ == spa::SPA_DATA_MemFd && spa_data.fd >= 0 {
+                let map_size = offset.saturating_add(size);
+                let mapped = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        map_size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        spa_data.fd as i32,
+                        0,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    log::warn!("PipeWire: MemFd mmap failed: {}", std::io::Error::last_os_error());
+                    None
+                } else {
+                    let v = unsafe {
+                        std::slice::from_raw_parts((mapped as *const u8).add(offset), size).to_vec()
+                    };
+                    unsafe { libc::munmap(mapped, map_size) };
+                    Some(v)
+                }
+            } else {
+                None
+            };
+
+            if let Some(data) = data {
+                let _ = tx.try_send(CapturedFrame {
+                    buffer: GpuBuffer::CpuBuffer {
+                        data,
+                        stride,
+                        format: PixelFormat::BGRA,
+                        width,
+                        height,
+                    },
+                    timestamp_us: now_us(),
+                    width,
+                    height,
+                    format: PixelFormat::BGRA,
+                    is_new_frame: true,
+                    cursor: cursor_meta,
+                });
+            }
+            requeue(raw_buf);
         })
         .register()
-        .map_err(|e| {
-            MediaError::CaptureError(format!("Failed to register process callback: {}", e))
-        })?;
+        .map_err(|e| MediaError::CaptureError(format!("Failed to register stream listener: {}", e)))?;
 
-    // Build ParamMeta pod to request SPA_META_Cursor from the compositor
-    let mut meta_pod_data = Vec::with_capacity(256);
-    let cursor_meta_size = std::mem::size_of::<pipewire::spa::sys::spa_meta_cursor>() as i32;
-    unsafe {
-        let mut builder = Builder::new(&mut meta_pod_data);
-        let mut frame = std::mem::MaybeUninit::<pipewire::spa::sys::spa_pod_frame>::uninit();
-        builder
-            .push_object(
-                &mut frame,
-                pipewire::spa::sys::SPA_TYPE_OBJECT_ParamMeta,
-                0,
-            )
-            .map_err(|e| {
-                MediaError::CaptureError(format!("Failed to push ParamMeta object: {}", e))
-            })?;
-        // SPA_PARAM_META_type = 1
-        builder
-            .add_prop(pipewire::spa::sys::SPA_PARAM_META_type, 0)
-            .map_err(|e| {
-                MediaError::CaptureError(format!("Failed to add meta type prop: {}", e))
-            })?;
-        builder
-            .add_id(pipewire::spa::utils::Id(
-                pipewire::spa::sys::SPA_META_Cursor,
-            ))
-            .map_err(|e| {
-                MediaError::CaptureError(format!("Failed to add SPA_META_Cursor id: {}", e))
-            })?;
-        // SPA_PARAM_META_size = 2
-        builder
-            .add_prop(pipewire::spa::sys::SPA_PARAM_META_size, 0)
-            .map_err(|e| {
-                MediaError::CaptureError(format!("Failed to add meta size prop: {}", e))
-            })?;
-        builder.add_int(cursor_meta_size).map_err(|e| {
-            MediaError::CaptureError(format!("Failed to add cursor meta size: {}", e))
-        })?;
-        let mut frame_val = frame.assume_init();
-        builder.pop(&mut frame_val);
+    // --- EnumFormat offers: DMA-BUF (with modifiers) first, SHM fallback ---
+    let mut format_pods: Vec<Vec<u8>> = Vec::new();
+    for f in &dmabuf_formats {
+        if f.modifiers.is_empty() {
+            continue;
+        }
+        let Some(spa_format) = super::dmabuf_caps::drm_to_spa_format(f.drm_format) else {
+            continue;
+        };
+        match pods::enum_format(spa_format, config.width, config.height, config.fps, &f.modifiers) {
+            Ok(p) => format_pods.push(p),
+            Err(e) => log::warn!("PipeWire: building DMA-BUF format pod: {}", e),
+        }
     }
-    let meta_pod = unsafe {
-        Pod::from_raw(meta_pod_data.as_ptr() as *const pipewire::spa::sys::spa_pod)
-    };
-    let mut params = vec![meta_pod];
+    for spa_format in [spa::SPA_VIDEO_FORMAT_BGRx, spa::SPA_VIDEO_FORMAT_BGRA] {
+        match pods::enum_format(spa_format, config.width, config.height, config.fps, &[]) {
+            Ok(p) => format_pods.push(p),
+            Err(e) => log::warn!("PipeWire: building SHM format pod: {}", e),
+        }
+    }
+    let mut params: Vec<&pipewire::spa::pod::Pod> =
+        format_pods.iter().map(|p| pods::as_pod(p)).collect();
 
-    // Connect stream with cursor metadata request
     stream
         .connect(
             pipewire::spa::utils::Direction::Input,
@@ -599,29 +920,19 @@ fn run_pipewire_loop(
         )
         .map_err(|e| MediaError::CaptureError(format!("Failed to connect Stream: {}", e)))?;
 
-    log::info!("Running PipeWire MainLoop (with cursor metadata)...");
+    log::info!(
+        "Running PipeWire MainLoop ({} format offers)...",
+        format_pods.len()
+    );
     mainloop.run();
-    log::info!("PipeWire MainLoop exited");
 
-    Ok(())
-}
-
-/// Map SPA video format enum to DRM fourcc code.
-fn spa_video_format_to_drm_fourcc(spa_fmt: u32) -> u32 {
-    use pipewire::spa::sys::*;
-    match spa_fmt {
-        SPA_VIDEO_FORMAT_BGRA => 0x41524742, // DRM_FORMAT_ARGB8888 (note: SPA BGRA = DRM ARGB)
-        SPA_VIDEO_FORMAT_RGBA => 0x34324241, // DRM_FORMAT_ABGR8888
-        SPA_VIDEO_FORMAT_BGRx => 0x34325258, // DRM_FORMAT_XRGB8888
-        SPA_VIDEO_FORMAT_RGBx => 0x34324258, // DRM_FORMAT_XBGR8888
-        SPA_VIDEO_FORMAT_ARGB => 0x34325241, // DRM_FORMAT_BGRA8888
-        // spa_format=4 is often ARGB on many compositors
-        4 => 0x34325241,                      // DRM_FORMAT_BGRA8888
-        _ => {
-            log::warn!("Unknown SPA video format {}, assuming DRM_FORMAT_ARGB8888", spa_fmt);
-            0x34325241
-        }
+    // Release a still-held buffer before the stream is torn down.
+    let prev = std::mem::replace(&mut *held_buffer.borrow_mut(), std::ptr::null_mut());
+    if !prev.is_null() {
+        unsafe { stream.queue_raw_buffer(prev) };
     }
+    log::info!("PipeWire MainLoop exited");
+    Ok(())
 }
 
 /// Extract cursor metadata from a PipeWire spa_buffer, if present.

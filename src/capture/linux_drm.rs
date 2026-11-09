@@ -265,10 +265,16 @@ impl DrmCapture {
 
     /// Try to open a DRM device node, attempting card1 first then card0.
     fn open_drm_device() -> Result<RawFd, MediaError> {
-        for device_path in Self::DRM_DEVICES {
+        // Open the GPU that actually scans out a display first (on multi-GPU
+        // systems that is frequently not card0/card1).
+        let mut devices = super::dmabuf_caps::card_nodes_display_first();
+        if devices.is_empty() {
+            devices = Self::DRM_DEVICES.iter().map(|s| s.to_string()).collect();
+        }
+        for device_path in &devices {
             log::info!("Trying DRM device: {}", device_path);
 
-            let c_path = std::ffi::CString::new(*device_path)
+            let c_path = std::ffi::CString::new(device_path.as_str())
                 .map_err(|_| MediaError::CaptureError("Invalid device path".into()))?;
 
             // SAFETY: c_path is a valid null-terminated C string. O_RDWR | O_CLOEXEC
@@ -642,6 +648,10 @@ impl ScreenCapture for DrmCapture {
     /// Returns whether capture is active.
     fn is_capturing(&self) -> bool {
         self.capturing
+    }
+
+    fn delivers_dmabuf(&self) -> bool {
+        true
     }
 }
 
