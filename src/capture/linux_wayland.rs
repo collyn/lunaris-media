@@ -22,7 +22,7 @@ use crate::types::*;
 ///
 /// Wayland has no global pointer query (XFixes only sees XWayland windows), so
 /// the cursor backend reads this instead. Coordinates are relative to the
-/// streamed monitor, in frame pixels.
+/// streamed monitor, in encoded-video pixels.
 #[derive(Clone, Debug, Default)]
 pub struct PipewireCursor {
     pub x: i32,
@@ -52,6 +52,15 @@ fn publish_cursor(meta: &FrameCursorMeta) {
             cur.image_serial = cur.image_serial.wrapping_add(1);
         }
     }
+}
+
+/// Rescale a coordinate from `from` pixels to `to` pixels (identity when
+/// either size is unknown).
+fn scale_coord(v: i32, from: u32, to: u32) -> i32 {
+    if from == 0 || to == 0 || from == to {
+        return v;
+    }
+    ((v as i64 * to as i64) / from as i64) as i32
 }
 
 fn clear_cursor() {
@@ -132,96 +141,25 @@ impl ScreenCapture for PipeWireCapture {
             config.fps
         );
 
-        // Open portal session via ashpd
-        use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
-        use ashpd::desktop::PersistMode;
-        use ashpd::WindowIdentifier;
-        use enumflags2::BitFlags;
-
-        log::info!("Connecting to Screencast portal...");
-        let screencast = Screencast::new().await.map_err(|e| {
-            MediaError::CaptureError(format!("Failed to create Screencast portal: {}", e))
-        })?;
-
-        let session = screencast.create_session().await.map_err(|e| {
-            MediaError::CaptureError(format!("Failed to create portal session: {}", e))
-        })?;
-
-        // Load saved restore token for seamless reconnect (no user prompt)
-        let config_dir =
-            std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-                format!("{}/.config", std::env::var("HOME").unwrap_or_default())
-            });
-        let restore_token_path = format!("{}/lunaris/screencast-token", config_dir);
-        let saved_token = std::fs::read_to_string(&restore_token_path).ok()
-            .and_then(|t| if t.trim().is_empty() { None } else { Some(t.trim().to_string()) });
-
-        log::info!("Requesting source selection...");
-        let cursor_mode = if crate::capture::should_embed_host_cursor() {
-            log::info!("PipeWireCapture: embedding host cursor in video stream");
-            CursorMode::Embedded
-        } else {
-            // Cursor as metadata (SPA_META_Cursor): not drawn into the video,
-            // forwarded to the client overlay instead. Fall back to embedding
-            // when the portal cannot provide metadata.
-            let available = screencast.available_cursor_modes().await.unwrap_or_default();
-            if available.contains(CursorMode::Metadata) {
-                log::info!("PipeWireCapture: cursor as metadata; browser overlay will render it");
-                CursorMode::Metadata
-            } else {
-                log::info!("PipeWireCapture: portal lacks cursor metadata; embedding cursor in video");
-                CursorMode::Embedded
-            }
-        };
-        let types = BitFlags::from(SourceType::Monitor);
-        screencast
-            .select_sources(
-                &session,
-                cursor_mode,
-                types,
-                false,
-                saved_token.as_deref(),
-                PersistMode::ExplicitlyRevoked,
-            )
+        // All portal (D-Bus) traffic runs on one long-lived runtime. ashpd
+        // caches a process-wide zbus connection whose helper tasks are spawned
+        // on whatever runtime first touches it; using short-lived runtimes
+        // (or aborted caller tasks) could leave that connection wedged and
+        // make every later session hang at "Connecting to Screencast portal".
+        let opened = portal_runtime()
+            .spawn(open_portal_session())
             .await
-            .map_err(|e| MediaError::CaptureError(format!("Failed to select sources: {}", e)))?;
+            .map_err(|e| MediaError::CaptureError(format!("Portal task failed: {}", e)))??;
+        let PortalSession { session, node_id, position, size } = opened;
 
-        log::info!("Starting screencast session (user prompt)...");
-        let start_response = screencast
-            .start(&session, &WindowIdentifier::default())
-            .await
-            .map_err(|e| MediaError::CaptureError(format!("Failed to start portal: {}", e)))?
-            .response()
-            .map_err(|e| MediaError::CaptureError(format!("Portal response error: {:?}", e)))?;
-
-        // Persist restore token for future sessions
-        if let Some(token) = start_response.restore_token() {
-            if !token.is_empty() {
-                if let Some(parent) = std::path::Path::new(&restore_token_path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&restore_token_path, token) {
-                    log::warn!("Failed to save screencast restore token: {}", e);
-                } else {
-                    log::info!("Screencast restore token saved for future sessions");
-                }
-            }
-        }
-
-        let streams = start_response.streams();
-        let stream_info = streams
-            .first()
-            .ok_or_else(|| MediaError::CaptureError("No stream returned from portal".into()))?;
-
-        let node_id = stream_info.pipe_wire_node_id();
         log::info!(
             "Screencast portal started. Node ID: {} position={:?} size={:?}",
             node_id,
-            stream_info.position(),
-            stream_info.size()
+            position,
+            size
         );
         // Map absolute pointer input onto the monitor the user picked.
-        if let (Some((x, y)), Some((w, h))) = (stream_info.position(), stream_info.size()) {
+        if let (Some((x, y)), Some((w, h))) = (position, size) {
             crate::input::set_capture_region(crate::input::ScreenRegion {
                 x,
                 y,
@@ -243,24 +181,16 @@ impl ScreenCapture for PipeWireCapture {
                 if let Err(e) = run_pipewire_loop(node_id, frame_tx, pw_receiver, config, passthrough) {
                     log::error!("PipeWire loop error: {:?}", e);
                 }
-                // Close the portal session after PipeWire stops.
-                // This tells the compositor to remove the screencast
-                // indicator and properly tear down the session.
-                // Note: the PipeWire thread does NOT have a tokio runtime
-                // context, so we create a lightweight one just for this call.
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        let _ = rt.block_on(session.close()).inspect_err(|e| {
-                            log::warn!("Failed to close screencast portal session: {}", e);
-                        });
-                        log::info!("Screencast portal session closed");
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to create tokio runtime for portal cleanup: {}", e);
-                    }
+                // Close the portal session after PipeWire stops (removes the
+                // compositor's screencast indicator). Runs on the portal
+                // runtime; this thread has no runtime of its own.
+                let closed = portal_runtime().block_on(async move {
+                    tokio::time::timeout(PORTAL_CALL_TIMEOUT, session.close()).await
+                });
+                match closed {
+                    Ok(Ok(())) => log::info!("Screencast portal session closed"),
+                    Ok(Err(e)) => log::warn!("Failed to close screencast portal session: {}", e),
+                    Err(_) => log::warn!("Timed out closing screencast portal session"),
                 }
             })
             .map_err(|e| {
@@ -374,6 +304,137 @@ impl Drop for PipeWireCapture {
             let _ = handle.join();
         }
     }
+}
+
+/// Timeout for portal calls that never involve the user.
+const PORTAL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Timeout for `Start`, which may show the source picker to the user.
+const PORTAL_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Dedicated, never-dropped runtime for all XDG portal traffic.
+fn portal_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("lunaris-portal")
+            .enable_all()
+            .build()
+            .expect("failed to build portal runtime")
+    })
+}
+
+type ScreencastSession = ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>;
+
+struct PortalSession {
+    session: ScreencastSession,
+    node_id: u32,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+}
+
+async fn portal_step<T, E: std::fmt::Display>(
+    what: &str,
+    timeout: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, MediaError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(MediaError::CaptureError(format!("{}: {}", what, e))),
+        Err(_) => Err(MediaError::CaptureError(format!(
+            "{}: timed out after {}s (is xdg-desktop-portal running?)",
+            what,
+            timeout.as_secs()
+        ))),
+    }
+}
+
+/// Open a ScreenCast portal session for one monitor, reusing the saved
+/// restore token so reconnects do not prompt the user.
+async fn open_portal_session() -> Result<PortalSession, MediaError> {
+    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+    use ashpd::desktop::PersistMode;
+    use ashpd::WindowIdentifier;
+    use enumflags2::BitFlags;
+
+    log::info!("Connecting to Screencast portal...");
+    let screencast = portal_step("Failed to create Screencast portal", PORTAL_CALL_TIMEOUT, Screencast::new()).await?;
+    let session = portal_step("Failed to create portal session", PORTAL_CALL_TIMEOUT, screencast.create_session()).await?;
+
+    let config_dir = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    let restore_token_path = format!("{}/lunaris/screencast-token", config_dir);
+    let saved_token = std::fs::read_to_string(&restore_token_path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
+    log::info!("Requesting source selection...");
+    let cursor_mode = if crate::capture::should_embed_host_cursor() {
+        log::info!("PipeWireCapture: embedding host cursor in video stream");
+        CursorMode::Embedded
+    } else {
+        // Cursor as metadata (SPA_META_Cursor): not drawn into the video,
+        // forwarded to the client overlay instead. Fall back to embedding
+        // when the portal cannot provide metadata.
+        let available = tokio::time::timeout(PORTAL_CALL_TIMEOUT, screencast.available_cursor_modes())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        if available.contains(CursorMode::Metadata) {
+            log::info!("PipeWireCapture: cursor as metadata; browser overlay will render it");
+            CursorMode::Metadata
+        } else {
+            log::info!("PipeWireCapture: portal lacks cursor metadata; embedding cursor in video");
+            CursorMode::Embedded
+        }
+    };
+    portal_step(
+        "Failed to select sources",
+        PORTAL_CALL_TIMEOUT,
+        screencast.select_sources(
+            &session,
+            cursor_mode,
+            BitFlags::from(SourceType::Monitor),
+            false,
+            saved_token.as_deref(),
+            PersistMode::ExplicitlyRevoked,
+        ),
+    )
+    .await?;
+
+    log::info!("Starting screencast session (user prompt)...");
+    let request = portal_step(
+        "Failed to start portal",
+        PORTAL_START_TIMEOUT,
+        screencast.start(&session, &WindowIdentifier::default()),
+    )
+    .await?;
+    let start_response = request
+        .response()
+        .map_err(|e| MediaError::CaptureError(format!("Portal response error: {:?}", e)))?;
+
+    if let Some(token) = start_response.restore_token().filter(|t| !t.is_empty()) {
+        if let Some(parent) = std::path::Path::new(&restore_token_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&restore_token_path, token) {
+            Ok(()) => log::info!("Screencast restore token saved for future sessions"),
+            Err(e) => log::warn!("Failed to save screencast restore token: {}", e),
+        }
+    }
+
+    let stream = start_response
+        .streams()
+        .first()
+        .ok_or_else(|| MediaError::CaptureError("No stream returned from portal".into()))?;
+    Ok(PortalSession {
+        node_id: stream.pipe_wire_node_id(),
+        position: stream.position(),
+        size: stream.size(),
+        session,
+    })
 }
 
 /// Format fixed by the compositor in `param_changed`, read by `process`.
@@ -714,10 +775,17 @@ fn run_pipewire_loop(
             }
             let chunk = unsafe { &*spa_data.chunk };
             let cursor_meta = extract_cursor_meta(spa_buf);
-            if let Some(meta) = &cursor_meta {
-                publish_cursor(meta);
-            }
             let neg = *negotiated_proc.borrow();
+            if let Some(meta) = &cursor_meta {
+                // Clients place the overlay in *encoded video* pixels; the
+                // compositor reports frame pixels, which differ when the
+                // monitor resolution is not the stream resolution.
+                let (sx, sy) = (
+                    scale_coord(meta.x, neg.width, config.width),
+                    scale_coord(meta.y, neg.height, config.height),
+                );
+                publish_cursor(&FrameCursorMeta { x: sx, y: sy, ..meta.clone() });
+            }
 
             // Corrupted buffers and cursor-only updates (size 0) carry no new
             // picture; the pipeline keeps re-encoding the previous frame.
@@ -1094,4 +1162,17 @@ fn convert_cursor_bitmap_to_rgba(
     }
 
     Some(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_coord;
+
+    #[test]
+    fn cursor_coordinates_follow_encoder_size() {
+        assert_eq!(scale_coord(1280, 2560, 1920), 960);
+        assert_eq!(scale_coord(720, 1440, 1080), 540);
+        assert_eq!(scale_coord(500, 1920, 1920), 500);
+        assert_eq!(scale_coord(500, 0, 1920), 500);
+    }
 }
