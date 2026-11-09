@@ -50,10 +50,11 @@ const VA_FOURCC_RGBX: u32 = 0x5842_4752;
 const VA_FOURCC_RGBA: u32 = 0x4142_4752;
 
 const VA_PROC_COLOR_STANDARD_BT709: u32 = 2;
-const VA_PROC_COLOR_STANDARD_SRGB: u32 = 8;
 const VA_SOURCE_RANGE_FULL: u8 = 2;
 /// ISO/IEC 23001-8 code points used in `VAProcColorProperties`.
 const CICP_BT709: u8 = 1;
+/// Matrix coefficients 0 = identity (the data is RGB, not YCbCr).
+const CICP_IDENTITY: u8 = 0;
 
 /// Size of `VAProcPipelineParameterBuffer` (fixed by `VA_PADDING_LARGE`).
 const PIPELINE_PARAM_SIZE: usize = 224;
@@ -487,10 +488,15 @@ impl VaapiDmabufConverter {
         };
         put_u32(&mut params, PP_SURFACE, src);
         put_ptr(&mut params, PP_SURFACE_REGION, &src_rect);
+        // Desktop pixels must keep their code values: only the RGB→YCbCr
+        // matrix may change. Declaring the input as sRGB made the VPP convert
+        // the transfer curve (sRGB → BT.709), lifting mid-tones (grey 128 was
+        // encoded as ~136). So the input uses the same primaries/transfer as
+        // the output, with the identity (RGB) matrix — what Sunshine does too.
         put_u32(
             &mut params,
             PP_SURFACE_COLOR_STANDARD,
-            VA_PROC_COLOR_STANDARD_SRGB,
+            VA_PROC_COLOR_STANDARD_BT709,
         );
         put_ptr(&mut params, PP_OUTPUT_REGION, &dst_rect);
         put_u32(&mut params, PP_OUTPUT_BACKGROUND_COLOR, 0xff00_0000);
@@ -499,9 +505,12 @@ impl VaapiDmabufConverter {
             PP_OUTPUT_COLOR_STANDARD,
             VA_PROC_COLOR_STANDARD_BT709,
         );
-        // Input: full-range sRGB desktop. Output: full-range BT.709, matching
-        // the colour description the encoder signals (AVCOL_RANGE_JPEG).
+        // Full range in and out, matching the colour description the encoder
+        // signals (AVCOL_RANGE_JPEG).
         params[PP_INPUT_COLOR_PROPERTIES + CP_COLOR_RANGE] = VA_SOURCE_RANGE_FULL;
+        params[PP_INPUT_COLOR_PROPERTIES + CP_PRIMARIES] = CICP_BT709;
+        params[PP_INPUT_COLOR_PROPERTIES + CP_TRANSFER] = CICP_BT709;
+        params[PP_INPUT_COLOR_PROPERTIES + CP_MATRIX] = CICP_IDENTITY;
         params[PP_OUTPUT_COLOR_PROPERTIES + CP_COLOR_RANGE] = VA_SOURCE_RANGE_FULL;
         params[PP_OUTPUT_COLOR_PROPERTIES + CP_PRIMARIES] = CICP_BT709;
         params[PP_OUTPUT_COLOR_PROPERTIES + CP_TRANSFER] = CICP_BT709;
