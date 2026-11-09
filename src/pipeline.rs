@@ -220,8 +220,10 @@ impl MediaPipeline {
             }
         }
 
+        // Raising the panel refresh via xrandr only applies to X11 outputs;
+        // with portal/PipeWire capture the compositor owns the refresh rate.
         #[cfg(target_os = "linux")]
-        if self.config.fps > 60 {
+        if self.config.fps > 60 && !capture.paces_frames() {
             if let Ok(displays) = capture.list_displays().await {
                 if let Some(display) = displays
                     .iter()
@@ -410,7 +412,23 @@ impl MediaPipeline {
         let start_time = Instant::now();
         let event_capacity = 64usize; // must match mpsc::channel capacity above
         let mut target_interval = Duration::from_nanos(1_000_000_000 / self.config.fps as u64);
-        let mut frame_ticker = tokio::time::interval(target_interval);
+        // Backends that pace themselves (PipeWire: wait for the compositor's
+        // next frame, pad when idle) must not be throttled by a second
+        // fixed-rate ticker; give them a ticker that is effectively always
+        // ready.
+        let self_paced = capture.paces_frames();
+        let tick_interval = |interval: Duration| {
+            if self_paced {
+                Duration::from_millis(1)
+            } else {
+                interval
+            }
+        };
+        log::info!(
+            "Pipeline pacing: {}",
+            if self_paced { "frame-driven (capture paces)" } else { "fixed-rate ticker" }
+        );
+        let mut frame_ticker = tokio::time::interval(tick_interval(target_interval));
         frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Constant-FPS output pads the stream with duplicate frames so it always
         // reaches the target FPS, instead of only emitting frames when the screen
@@ -611,7 +629,7 @@ impl MediaPipeline {
                                 log::warn!("Failed to update capture FPS: {}", e);
                             }
                             target_interval = Duration::from_nanos(1_000_000_000 / new_fps as u64);
-                            frame_ticker = tokio::time::interval(target_interval);
+                            frame_ticker = tokio::time::interval(tick_interval(target_interval));
                             frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             keyframe_requested = true;
                         }

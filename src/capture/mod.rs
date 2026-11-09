@@ -142,6 +142,16 @@ pub trait ScreenCapture: Send {
         false
     }
 
+    /// `true` when [`next_frame`](Self::next_frame) itself waits for the next
+    /// compositor frame (or a padding deadline of one frame interval). The
+    /// pipeline then encodes each frame as soon as it arrives instead of
+    /// sampling on its own fixed-rate ticker, which would drop/duplicate
+    /// frames whenever the compositor cadence (e.g. a 75 Hz panel) does not
+    /// line up with the stream FPS.
+    fn paces_frames(&self) -> bool {
+        false
+    }
+
     /// Called once the encoder is known: `true` when it consumes DMA-BUFs
     /// zero-copy (VAAPI on the display GPU). Backends that can read frames
     /// back themselves switch to CPU frames when `false`, which is cheaper

@@ -82,6 +82,9 @@ pub struct PipeWireCapture {
     fps: u32,
     /// Forward DMA-BUFs untouched (zero-copy) instead of reading them back.
     passthrough: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Fixed emission schedule: when `next_frame` may return next (advances
+    /// by exactly one interval per frame, so timer rounding never drifts).
+    next_due: Option<tokio::time::Instant>,
 }
 
 impl PipeWireCapture {
@@ -110,6 +113,7 @@ impl PipeWireCapture {
             passthrough: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 pipewire_zero_copy_enabled(),
             )),
+            next_due: None,
         })
     }
 }
@@ -201,6 +205,7 @@ impl ScreenCapture for PipeWireCapture {
         self.shutdown_tx = Some(pw_sender);
         self.frame_rx = Some(frame_rx);
         self.capturing = true;
+        self.next_due = None;
 
         log::info!("PipeWire screen capture started successfully");
         Ok(())
@@ -216,11 +221,36 @@ impl ScreenCapture for PipeWireCapture {
             .as_mut()
             .ok_or(MediaError::CaptureNotStarted)?;
 
-        // Compositors only push frames on damage. Wait at most one frame
-        // interval; on timeout hand back an empty buffer so the pipeline
-        // re-encodes its last frame (constant FPS) instead of stalling.
-        let interval = std::time::Duration::from_micros(1_000_000 / self.fps.max(1) as u64);
-        let mut frame = match tokio::time::timeout(interval, rx.recv()).await {
+        // Frame-driven pacing (see `paces_frames`), capped at the stream FPS:
+        // - never emit earlier than one interval after the previous frame
+        //   (KWin ignores maxFramerate and pushes at the panel rate, e.g. 75 Hz);
+        // - at that point take the newest frame; if none is queued yet, wait a
+        //   short grace (¼ interval) so a frame that is just about to arrive
+        //   is not missed (this also phase-locks to the compositor);
+        // - otherwise return an empty buffer so the pipeline re-encodes the
+        //   last picture (constant FPS while the screen is idle).
+        // Sampling on a separate fixed ticker instead lost frames (~45-54 FPS
+        // on a 60 FPS stream).
+        let interval = std::time::Duration::from_nanos(1_000_000_000 / self.fps.max(1) as u64);
+        let grace = interval / 4;
+        let first = self.next_due.is_none();
+        let due = self.next_due.unwrap_or_else(tokio::time::Instant::now);
+        tokio::time::sleep_until(due).await;
+        let received = match rx.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // First call: allow a full interval for the first frame.
+                tokio::time::timeout(if first { interval } else { grace }, rx.recv()).await
+            }
+        };
+        // Advance the schedule by exactly one interval; if we fell more than
+        // an interval behind (slow encode, system hiccup), resynchronise
+        // instead of bursting to catch up.
+        let now = tokio::time::Instant::now();
+        let next = due + interval;
+        self.next_due = Some(if next + interval < now { now } else { next });
+        let mut frame = match received {
             Ok(Some(frame)) => frame,
             Ok(None) => return Err(MediaError::CaptureError("Frame channel closed".into())),
             Err(_) => {
@@ -281,6 +311,10 @@ impl ScreenCapture for PipeWireCapture {
 
     fn delivers_dmabuf(&self) -> bool {
         self.passthrough.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn paces_frames(&self) -> bool {
+        true
     }
 
     fn set_dmabuf_passthrough(&mut self, enabled: bool) {
