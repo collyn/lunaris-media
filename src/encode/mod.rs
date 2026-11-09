@@ -414,6 +414,39 @@ pub fn describe_host_gpu(d3d11_device: Option<usize>) -> Option<String> {
     }
 }
 
+/// Describe the GPU the given encoder actually runs on.
+///
+/// On multi-GPU Linux hosts [`describe_host_gpu`] reports the first NVIDIA
+/// card even when VAAPI encodes on the AMD/Intel GPU driving the displays;
+/// this picks the device matching the encoder backend instead.
+pub fn describe_encoder_gpu(hw_type: HwAccelType, d3d11_device: Option<usize>) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let specific = match hw_type {
+            HwAccelType::Vaapi => crate::capture::dmabuf_caps::display_render_node()
+                .and_then(|node| describe_drm_device(&render_node_device_dir(&node))),
+            HwAccelType::Nvenc => describe_nvidia_proc_gpu(),
+            HwAccelType::Qsv => describe_drm_gpu_matching(|vendor| vendor == "0x8086"),
+            _ => None,
+        };
+        if specific.is_some() {
+            return specific;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = hw_type;
+    describe_host_gpu(d3d11_device)
+}
+
+#[cfg(target_os = "linux")]
+fn render_node_device_dir(node: &str) -> std::path::PathBuf {
+    let name = std::path::Path::new(node)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    std::path::PathBuf::from(format!("/sys/class/drm/{}/device", name))
+}
+
 #[cfg(target_os = "linux")]
 fn describe_linux_gpu() -> Option<String> {
     describe_nvidia_proc_gpu().or_else(describe_drm_gpu)
@@ -429,7 +462,12 @@ fn describe_nvidia_proc_gpu() -> Option<String> {
             .find_map(|line| line.strip_prefix("Model:").map(str::trim))
         {
             if !model.is_empty() {
-                return Some(format!("NVIDIA {model}"));
+                // /proc already reports e.g. "NVIDIA GeForce RTX 2060".
+                return Some(if model.to_ascii_lowercase().starts_with("nvidia") {
+                    model.to_string()
+                } else {
+                    format!("NVIDIA {model}")
+                });
             }
         }
     }
@@ -438,50 +476,130 @@ fn describe_nvidia_proc_gpu() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn describe_drm_gpu() -> Option<String> {
-    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
-    for entry in entries.flatten() {
+    describe_drm_gpu_matching(|_| true)
+}
+
+/// First DRM card whose PCI vendor id satisfies `want`.
+#[cfg(target_os = "linux")]
+fn describe_drm_gpu_matching(want: impl Fn(&str) -> bool) -> Option<String> {
+    let mut entries: Vec<_> = std::fs::read_dir("/sys/class/drm").ok()?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         if !file_name.starts_with("card") || file_name.contains('-') {
             continue;
         }
-
         let device_dir = entry.path().join("device");
-        let vendor = read_trimmed(device_dir.join("vendor"))?;
-        let device =
-            read_trimmed(device_dir.join("device")).unwrap_or_else(|| "unknown".to_string());
-        let vendor_name = match vendor.as_str() {
-            "0x10de" => "NVIDIA",
-            "0x1002" | "0x1022" => "AMD",
-            "0x8086" => "Intel",
-            _ => "GPU",
+        let Some(vendor) = read_trimmed(device_dir.join("vendor")) else {
+            continue;
         };
-
-        if let Some(product_name) = read_trimmed(device_dir.join("product_name"))
-            .or_else(|| read_trimmed(device_dir.join("product_info")))
-            .filter(|name| !name.is_empty())
-        {
-            return Some(format!(
-                "{vendor_name} {product_name} (vendor={vendor}, device={device})"
-            ));
+        if !want(&vendor) {
+            continue;
         }
-
-        let driver = read_trimmed(device_dir.join("uevent"))
-            .and_then(|uevent| {
-                uevent
-                    .lines()
-                    .find_map(|line| line.strip_prefix("DRIVER=").map(str::to_string))
-            })
-            .filter(|driver| !driver.is_empty());
-
-        return Some(match driver {
-            Some(driver) => {
-                format!("{vendor_name} GPU ({driver}, vendor={vendor}, device={device})")
-            }
-            None => format!("{vendor_name} GPU (vendor={vendor}, device={device})"),
-        });
+        if let Some(desc) = describe_drm_device(&device_dir) {
+            return Some(desc);
+        }
     }
     None
+}
+
+/// Human-readable name for a DRM device directory (`.../device`).
+#[cfg(target_os = "linux")]
+fn describe_drm_device(device_dir: &std::path::Path) -> Option<String> {
+    let vendor = read_trimmed(device_dir.join("vendor"))?;
+    let device = read_trimmed(device_dir.join("device")).unwrap_or_else(|| "unknown".to_string());
+    let vendor_name = match vendor.as_str() {
+        "0x10de" => "NVIDIA",
+        "0x1002" | "0x1022" => "AMD",
+        "0x8086" => "Intel",
+        _ => "GPU",
+    };
+
+    if let Some(product_name) = read_trimmed(device_dir.join("product_name"))
+        .or_else(|| read_trimmed(device_dir.join("product_info")))
+        .filter(|name| !name.is_empty())
+    {
+        return Some(format!("{vendor_name} {product_name} (vendor={vendor}, device={device})"));
+    }
+
+    // Marketing name from the PCI ID database, e.g. "Radeon RX 6600/6600 XT/6600M".
+    if let Some(model) = pci_ids_model_name(&vendor, &device) {
+        return Some(format!("{vendor_name} {model}"));
+    }
+
+    let driver = read_trimmed(device_dir.join("uevent"))
+        .and_then(|uevent| {
+            uevent
+                .lines()
+                .find_map(|line| line.strip_prefix("DRIVER=").map(str::to_string))
+        })
+        .filter(|driver| !driver.is_empty());
+
+    Some(match driver {
+        Some(driver) => format!("{vendor_name} GPU ({driver}, vendor={vendor}, device={device})"),
+        None => format!("{vendor_name} GPU (vendor={vendor}, device={device})"),
+    })
+}
+
+/// Look up a device in pci.ids; prefers the bracketed marketing name.
+#[cfg(target_os = "linux")]
+fn pci_ids_model_name(vendor: &str, device: &str) -> Option<String> {
+    let vendor = vendor.trim_start_matches("0x").to_ascii_lowercase();
+    let device = device.trim_start_matches("0x").to_ascii_lowercase();
+    let db = ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())?;
+    parse_pci_ids_model(&db, &vendor, &device)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pci_ids_model(db: &str, vendor: &str, device: &str) -> Option<String> {
+    let mut in_vendor = false;
+    for line in db.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('\t') {
+            if in_vendor {
+                return None; // left the vendor block without a match
+            }
+            in_vendor = line.to_ascii_lowercase().starts_with(&format!("{vendor} "));
+            continue;
+        }
+        if in_vendor && !line.starts_with("\t\t") {
+            let entry = &line[1..];
+            if entry.to_ascii_lowercase().starts_with(&format!("{device} ")) {
+                let name = entry[device.len()..].trim();
+                let model = match (name.find('['), name.rfind(']')) {
+                    (Some(a), Some(b)) if b > a => &name[a + 1..b],
+                    _ => name,
+                };
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gpu_name_tests {
+    use super::parse_pci_ids_model;
+
+    const DB: &str = "# comment\n1002  Advanced Micro Devices, Inc. [AMD/ATI]\n\t73df  Navi 22 [Radeon RX 6700/6700 XT/6750 XT]\n\t73ff  Navi 23 [Radeon RX 6600/6600 XT/6600M]\n\t\t1002 0e3b  sub\n10de  NVIDIA Corporation\n\t1f08  TU106 [GeForce RTX 2060 Rev. A]\n\t1234  Plain Name\n";
+
+    #[test]
+    fn finds_bracketed_marketing_name() {
+        assert_eq!(parse_pci_ids_model(DB, "1002", "73ff").as_deref(), Some("Radeon RX 6600/6600 XT/6600M"));
+        assert_eq!(parse_pci_ids_model(DB, "10de", "1f08").as_deref(), Some("GeForce RTX 2060 Rev. A"));
+    }
+
+    #[test]
+    fn falls_back_to_plain_name_and_misses() {
+        assert_eq!(parse_pci_ids_model(DB, "10de", "1234").as_deref(), Some("Plain Name"));
+        assert_eq!(parse_pci_ids_model(DB, "1002", "ffff"), None);
+        assert_eq!(parse_pci_ids_model(DB, "8086", "73ff"), None);
+    }
 }
 
 #[cfg(target_os = "linux")]

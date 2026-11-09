@@ -291,7 +291,7 @@ impl MediaPipeline {
         // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the
         // capture backend read frames back (once per new frame).
         capture.set_dmabuf_passthrough(encoder_info.hw_type == HwAccelType::Vaapi);
-        let gpu_name = encode::describe_host_gpu(d3d11_device);
+        let gpu_name = encode::describe_encoder_gpu(encoder_info.hw_type, d3d11_device);
         log::info!(
             "Encoder initialized: {} ({}) on {}",
             encoder_info.name,
