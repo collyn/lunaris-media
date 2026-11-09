@@ -437,6 +437,32 @@ impl DrmCapture {
             )));
         }
 
+        // Without CAP_SYS_ADMIN (or DRM master) the kernel still answers
+        // GETFB2 but zeroes the GEM handles, so no frame could be exported.
+        if fb2.handles[0] == 0 {
+            return Err(MediaError::PermissionDenied(
+                "DRM_IOCTL_MODE_GETFB2 returned no buffer handle (needs CAP_SYS_ADMIN: \
+                 sudo setcap cap_sys_admin+p <binary>)"
+                    .into(),
+            ));
+        }
+        // Only single-plane framebuffers can be described downstream; layouts
+        // with auxiliary planes (e.g. AMD DCC metadata) would encode garbage.
+        if fb2.pitches[1] != 0 || fb2.handles[1] != 0 {
+            let mut close = DrmGemClose { handle: fb2.handles[0], pad: 0 };
+            // SAFETY: closing the GEM handle we just received.
+            unsafe { libc::ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &mut close) };
+            if fb2.handles[1] != 0 && fb2.handles[1] != fb2.handles[0] {
+                let mut close = DrmGemClose { handle: fb2.handles[1], pad: 0 };
+                // SAFETY: as above, for the auxiliary plane handle.
+                unsafe { libc::ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &mut close) };
+            }
+            return Err(MediaError::CaptureError(format!(
+                "scan-out framebuffer is multi-plane (modifier 0x{:016X}); KMS capture unsupported",
+                fb2.modifier[0]
+            )));
+        }
+
         log::info!(
             "GETFB2 verified: fb_id={} {}x{} fourcc=0x{:08X} modifier=0x{:016X}",
             fb2.fb_id,
