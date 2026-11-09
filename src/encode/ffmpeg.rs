@@ -1030,9 +1030,17 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 num: config.fps as libc::c_int,
                 den: 1,
             };
-            (*codec_ctx).gop_size = if config.keyframe_interval > 0 {
+            let software_av1 = config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software;
+            (*codec_ctx).gop_size = if config.keyframe_interval == super::KEYFRAME_INTERVAL_ON_DEMAND
+                && !software_av1
+            {
+                // No periodic IDR: keyframes only when requested (PLI/new
+                // client). Periodic IDRs under a small VBV are heavily
+                // compressed and show up as a visible blur "pulse".
+                libc::c_int::MAX
+            } else if config.keyframe_interval > 0 && config.keyframe_interval != super::KEYFRAME_INTERVAL_ON_DEMAND {
                 config.keyframe_interval as libc::c_int
-            } else if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
+            } else if software_av1 {
                 config.fps.max(1) as libc::c_int
             } else {
                 (config.fps * 5) as libc::c_int // 5 seconds GOP (allows dynamic keyframe insertion on HW encoders)

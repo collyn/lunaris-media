@@ -24,6 +24,10 @@ use crate::capture::gpu_buffer::GpuBuffer;
 use crate::error::MediaError;
 use crate::types::*;
 
+/// [`EncoderConfig::keyframe_interval`] value meaning "no periodic IDR":
+/// keyframes are only produced on request (`request_keyframe`, e.g. on PLI).
+pub const KEYFRAME_INTERVAL_ON_DEMAND: u32 = u32::MAX;
+
 /// Configuration for initializing a [`VideoEncoder`].
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
