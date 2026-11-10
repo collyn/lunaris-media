@@ -21,6 +21,9 @@ pub mod dmabuf_caps;
 pub mod linux_drm;
 #[cfg(target_os = "linux")]
 pub mod linux_nvfbc;
+/// NvFBC bindings, loaded with dlopen so the agent runs without the NVIDIA driver.
+#[cfg(target_os = "linux")]
+mod nvfbc;
 #[cfg(target_os = "linux")]
 pub mod linux_wayland;
 #[cfg(target_os = "linux")]

@@ -1,0 +1,30 @@
+// Vendored from the `nvfbc-sys` 0.2.0 crate (BSD-2-Clause, Copyright (c) Hans Gaiser;
+// see src/capture/nvfbc/LICENSE). Changed so NvFBC is loaded with dlopen at
+// runtime instead of being linked, like Sunshine does.
+
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, clippy::all)]
+
+mod dl;
+mod generated;
+pub use dl::*;
+pub use generated::*;
+
+pub const NVFBC_VERSION: u32 = NVFBC_VERSION_MINOR | (NVFBC_VERSION_MAJOR << 8);
+
+pub const NVFBC_CREATE_HANDLE_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_CREATE_HANDLE_PARAMS>(2);
+pub const NVFBC_DESTROY_HANDLE_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_DESTROY_HANDLE_PARAMS>(1);
+pub const NVFBC_GET_STATUS_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_GET_STATUS_PARAMS>(2);
+pub const NVFBC_CREATE_CAPTURE_SESSION_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_CREATE_CAPTURE_SESSION_PARAMS>(6);
+pub const NVFBC_DESTROY_CAPTURE_SESSION_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_DESTROY_CAPTURE_SESSION_PARAMS>(1);
+pub const NVFBC_TOGL_SETUP_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOGL_SETUP_PARAMS>(2);
+pub const NVFBC_TOGL_GRAB_FRAME_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOGL_GRAB_FRAME_PARAMS>(2);
+pub const NVFBC_TOCUDA_SETUP_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOCUDA_SETUP_PARAMS>(1);
+pub const NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOCUDA_GRAB_FRAME_PARAMS>(2);
+pub const NVFBC_TOSYS_SETUP_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOSYS_SETUP_PARAMS>(3);
+pub const NVFBC_TOSYS_GRAB_FRAME_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_TOSYS_GRAB_FRAME_PARAMS>(2);
+pub const NVFBC_RELEASE_CONTEXT_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_RELEASE_CONTEXT_PARAMS>(1);
+pub const NVFBC_BIND_CONTEXT_PARAMS_VER: u32 = nvfbc_struct_version::<NVFBC_BIND_CONTEXT_PARAMS>(1);
+
+pub const fn nvfbc_struct_version<T>(version: u32) -> u32 {
+	std::mem::size_of::<T>() as u32 | ((version) << 16 | NVFBC_VERSION << 24)
+}

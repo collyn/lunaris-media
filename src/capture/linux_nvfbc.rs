@@ -10,9 +10,10 @@
 //! Capture pacing uses NvFBC's native blocking frame-grab mode, synchronizing screen
 //! capture directly with rendering events on the GPU for minimal mouse cursor delay.
 
-use nvfbc::cuda::CudaCapturer;
-use nvfbc::{BufferFormat, SystemCapturer};
-use nvfbc_sys;
+use super::nvfbc;
+use super::nvfbc::cuda::CudaCapturer;
+use super::nvfbc::{BufferFormat, SystemCapturer};
+use super::nvfbc::sys as nvfbc_sys;
 use std::time::Instant;
 
 use crate::capture::gpu_buffer::GpuBuffer;
