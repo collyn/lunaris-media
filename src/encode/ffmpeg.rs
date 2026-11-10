@@ -189,6 +189,18 @@ unsafe extern "C" fn ffmpeg_log_callback(
     }
 }
 
+/// Constant QP used when a VAAPI driver offers no bitrate control, picked from
+/// the requested bitrate (lower QP = higher quality and more bits).
+fn vaapi_cqp_for_bitrate(bitrate_kbps: u32) -> u32 {
+    match bitrate_kbps {
+        30_000.. => 20,
+        15_000..=29_999 => 23,
+        8_000..=14_999 => 26,
+        4_000..=7_999 => 29,
+        _ => 32,
+    }
+}
+
 fn ensure_ffmpeg_init() {
     FFMPEG_INIT.call_once(|| {
         ffmpeg_next::init().expect("Failed to initialize FFmpeg");
@@ -769,6 +781,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         hw_type: HwAccelType,
         codec: VideoCodec,
         low_latency: bool,
+        vaapi_cqp: Option<u32>,
     ) {
         // Helper to call av_opt_set on the codec's private data.
         let opt_set = |key: &str, value: &str| {
@@ -814,7 +827,15 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 );
             }
             HwAccelType::Vaapi => {
-                opt_set("rc_mode", "CBR");
+                match vaapi_cqp {
+                    // Some drivers only offer constant QP (e.g. Intel iHD
+                    // without HuC firmware: "supported modes: CQP").
+                    Some(qp) => {
+                        opt_set("rc_mode", "CQP");
+                        opt_set("qp", &qp.to_string());
+                    }
+                    None => opt_set("rc_mode", "CBR"),
+                }
                 if codec == VideoCodec::H264 {
                     // Match SDP 42e0xx (CBP). h264_vaapi has no "baseline"
                     // profile name, only "constrained_baseline".
@@ -1055,6 +1076,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         config: &EncoderConfig,
         encoder_name: &str,
         hw_type: HwAccelType,
+        vaapi_cqp: Option<u32>,
     ) -> Result<(), MediaError> {
         // Step 2: Find the FFmpeg encoder by name.
         let cname = CString::new(encoder_name).unwrap();
@@ -1079,7 +1101,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             (*codec_ctx).rc_max_rate = bitrate;
             (*codec_ctx).rc_buffer_size = ((bitrate * 2) / config.fps as i64) as libc::c_int;
             if config.codec == VideoCodec::AV1 && encoder_name == "libsvtav1" {
-                (*codec_ctx).rc_max_rate = bitrate.saturating_mul(2);
+                // SVT-AV1 2.x only accepts a max bitrate in CRF mode.
+                (*codec_ctx).rc_max_rate = 0;
                 (*codec_ctx).rc_buffer_size = bitrate
                     .saturating_mul(2)
                     .min(libc::c_int::MAX as i64) as libc::c_int;
@@ -1342,7 +1365,7 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
         }
 
-        Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency);
+        Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency, vaapi_cqp);
         if config.yuv444 && config.codec == VideoCodec::H264 {
             Self::apply_yuv444_options(codec_ctx, hw_type);
         }
@@ -1976,7 +1999,22 @@ impl VideoEncoder for FfmpegEncoder {
         let mut last_err = MediaError::EncoderInitFailed("No encoders available".into());
 
         for (encoder_name, hw_type) in &candidates {
-            match self.try_initialize_encoder(config, encoder_name, *hw_type) {
+            let mut result = self.try_initialize_encoder(config, encoder_name, *hw_type, None);
+            // VAAPI drivers without bitrate control reject CBR with EINVAL
+            // ("Driver does not support CBR RC mode (supported modes: CQP)").
+            // Constant QP still beats falling back to a software encoder.
+            if *hw_type == HwAccelType::Vaapi
+                && matches!(result, Err(MediaError::FfmpegError { code: -22, .. }))
+            {
+                let qp = vaapi_cqp_for_bitrate(config.bitrate_kbps);
+                log::info!(
+                    "'{}': driver refused CBR; retrying with constant QP {} (no bitrate control)",
+                    encoder_name,
+                    qp
+                );
+                result = self.try_initialize_encoder(config, encoder_name, *hw_type, Some(qp));
+            }
+            match result {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!(
@@ -2931,7 +2969,7 @@ impl VideoEncoder for FfmpegEncoder {
                 .map(|info| info.name == "libsvtav1")
                 .unwrap_or(false);
             (*self.codec_ctx).rc_max_rate = if is_svt_av1 {
-                bitrate.saturating_mul(2)
+                0 // SVT-AV1 2.x only accepts a max bitrate in CRF mode
             } else {
                 bitrate
             };
