@@ -3,7 +3,7 @@ name = "lunaris-media"
 version = "0.1.0"
 edition = "2021"
 description = "Zero-copy GPU screen capture and hardware-accelerated encoding library"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 thiserror = "2"

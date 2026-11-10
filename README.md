@@ -315,4 +315,8 @@ GitHub Actions runs on every push and PR:
 
 ## License
 
-MIT, as declared in `Cargo.toml`.
+GNU General Public License v3.0 or later (`GPL-3.0-or-later`) — see [LICENSE](LICENSE).
+Versions before this change were published under the MIT licence.
+
+`src/capture/nvfbc/` is derived from the BSD-2-Clause `nvfbc`/`nvfbc-sys` crates;
+see its own LICENSE file.
