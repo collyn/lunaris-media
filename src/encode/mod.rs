@@ -401,6 +401,31 @@ pub fn describe_d3d11_device(_device_ptr: Option<usize>) -> Option<String> {
 }
 
 /// Return a human-readable GPU description for the active host.
+/// Opens a real encoder for `codec` at the given size and immediately drops
+/// it, returning the encoder that worked (the same choice a pipeline would
+/// make). FFmpeg listing an encoder (e.g. `hevc_vaapi`) does not mean the
+/// GPU driver accepts it, so callers use this before offering a codec.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Option<EncoderInfo> {
+    let mut encoder = ffmpeg::FfmpegEncoder::new().ok()?;
+    let config = EncoderConfig {
+        codec,
+        width,
+        height,
+        fps,
+        bitrate_kbps: 8_000,
+        keyframe_interval: KEYFRAME_INTERVAL_ON_DEMAND,
+        ..EncoderConfig::default()
+    };
+    match encoder.initialize(&config) {
+        Ok(()) => Some(encoder.encoder_info()),
+        Err(e) => {
+            log::info!("Encoder probe for {:?} {}x{}: no usable encoder ({})", codec, width, height, e);
+            None
+        }
+    }
+}
+
 pub fn describe_host_gpu(d3d11_device: Option<usize>) -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     let _ = d3d11_device;

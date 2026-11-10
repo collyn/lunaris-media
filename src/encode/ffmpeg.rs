@@ -149,9 +149,55 @@ fn get_cuda_copier() -> Option<&'static CudaCopier> {
 static FFMPEG_INIT: Once = Once::new();
 static FFMPEG_INIT_OK: AtomicBool = AtomicBool::new(false);
 
+/// Routes FFmpeg's own warnings/errors (e.g. why `hevc_vaapi` refused to
+/// open) into the `log` crate, so they show up in the agent's log instead of
+/// only on stderr. (x86_64 Linux: `va_list` is passed as `*mut __va_list_tag`
+/// there; other targets keep FFmpeg's default stderr logging.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe extern "C" fn ffmpeg_log_callback(
+    avcl: *mut libc::c_void,
+    level: libc::c_int,
+    fmt: *const libc::c_char,
+    args: *mut ffi::__va_list_tag,
+) {
+    if level > ffi::AV_LOG_WARNING || fmt.is_null() {
+        return;
+    }
+    let mut buf = [0 as libc::c_char; 1024];
+    let mut print_prefix: libc::c_int = 1;
+    let n = ffi::av_log_format_line2(
+        avcl,
+        level,
+        fmt,
+        args,
+        buf.as_mut_ptr(),
+        buf.len() as libc::c_int,
+        &mut print_prefix,
+    );
+    if n < 0 {
+        return;
+    }
+    let line = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
+    let line = line.trim_end();
+    if line.is_empty() {
+        return;
+    }
+    if level <= ffi::AV_LOG_ERROR {
+        log::warn!(target: "ffmpeg", "{}", line);
+    } else {
+        log::info!(target: "ffmpeg", "{}", line);
+    }
+}
+
 fn ensure_ffmpeg_init() {
     FFMPEG_INIT.call_once(|| {
         ffmpeg_next::init().expect("Failed to initialize FFmpeg");
+        // SAFETY: the callback only formats the message with FFmpeg's own
+        // helper into a stack buffer; it never unwinds into C.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe {
+            ffi::av_log_set_callback(Some(ffmpeg_log_callback))
+        };
         FFMPEG_INIT_OK.store(true, Ordering::SeqCst);
         log::info!("FFmpeg initialized successfully");
     });
@@ -770,7 +816,9 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             HwAccelType::Vaapi => {
                 opt_set("rc_mode", "CBR");
                 if codec == VideoCodec::H264 {
-                    opt_set("profile", "baseline"); // Match SDP 42e033 (CBP)
+                    // Match SDP 42e0xx (CBP). h264_vaapi has no "baseline"
+                    // profile name, only "constrained_baseline".
+                    opt_set("profile", "constrained_baseline");
                 } else if codec == VideoCodec::H265 {
                     opt_set("profile", "main");
                 } else if codec == VideoCodec::AV1 {
