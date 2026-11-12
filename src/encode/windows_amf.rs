@@ -578,6 +578,8 @@ pub struct WindowsAmfEncoder {
     cached_input_view: Option<ID3D11VideoProcessorInputView>,
     flush_each_frame: bool,
     codec: AmfVideoCodec,
+    /// Surfaces submitted whose encoded frame hasn't been taken out yet.
+    pending: usize,
 }
 
 unsafe impl Send for WindowsAmfEncoder {}
@@ -606,6 +608,7 @@ impl WindowsAmfEncoder {
             initialized: false,
             force_keyframe: false,
             frame_count: 0,
+            pending: 0,
             cached_input_texture: 0,
             cached_input_index: 0,
             cached_input_view: None,
@@ -1113,23 +1116,38 @@ impl WindowsAmfEncoder {
         }
     }
 
-    fn drain_output(&mut self, pts_us: u64) -> Result<Vec<EncodedVideoFrame>, MediaError> {
-        let config = self
+    /// Takes the encoded frames out. With `wait`, waits (a few ms, at most
+    /// OUTPUT_WAIT) until every submitted surface came out: AMF needs a moment
+    /// per frame, and returning without it left each frame in the encoder
+    /// until the next one was captured. That added a frame of delay, and on
+    /// a desktop that changes unevenly (Windows only captures changes) it
+    /// held frames back until the next change: stutter and lag.
+    fn drain_output(&mut self, pts_us: u64, wait: bool) -> Result<Vec<EncodedVideoFrame>, MediaError> {
+        const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
+        let fps = self
             .config
             .as_ref()
-            .ok_or(MediaError::EncoderNotInitialized)?;
+            .ok_or(MediaError::EncoderNotInitialized)?
+            .fps;
+        let started = std::time::Instant::now();
         let mut frames = Vec::new();
         loop {
             let mut data = ptr::null_mut();
             let res =
                 unsafe { ((*(*self.component).vtbl).query_output)(self.component, &mut data) };
             if res == AMF_REPEAT || data.is_null() {
+                let not_ready = res == AMF_REPEAT || res == AMF_OK;
+                if wait && not_ready && self.pending > 0 && started.elapsed() < OUTPUT_WAIT {
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    continue;
+                }
                 break;
             }
             if res == AMF_EOF {
                 break;
             }
             amf_ok(res, "AMFComponent::QueryOutput")?;
+            self.pending = self.pending.saturating_sub(1);
             let mut buffer_ptr: *mut c_void = ptr::null_mut();
             let qi = unsafe {
                 ((*(*data).vtbl).query_interface)(data, &IID_AMF_BUFFER, &mut buffer_ptr)
@@ -1164,8 +1182,8 @@ impl WindowsAmfEncoder {
                         FrameType::Inter
                     },
                     pts: pts_us,
-                    duration: if config.fps > 0 {
-                        1_000_000 / config.fps as u64
+                    duration: if fps > 0 {
+                        1_000_000 / fps as u64
                     } else {
                         0
                     },
@@ -1210,6 +1228,7 @@ impl VideoEncoder for WindowsAmfEncoder {
         self.initialized = true;
         self.force_keyframe = true;
         self.frame_count = 0;
+        self.pending = 0;
         self.cached_input_texture = 0;
         self.cached_input_index = 0;
         self.cached_input_view = None;
@@ -1255,20 +1274,22 @@ impl VideoEncoder for WindowsAmfEncoder {
         };
         unsafe { ((*(*surface).vtbl).release)(surface) };
         if submit == AMF_INPUT_FULL {
-            let mut frames = self.drain_output(pts_us)?;
+            let mut frames = self.drain_output(pts_us, true)?;
             let surface = self.wrap_surface(&slot_texture, pts_us)?;
             let retry = unsafe {
                 ((*(*self.component).vtbl).submit_input)(self.component, surface as *mut AmfData)
             };
             unsafe { ((*(*surface).vtbl).release)(surface) };
             amf_ok(retry, "AMFComponent::SubmitInput retry")?;
-            frames.extend(self.drain_output(pts_us)?);
+            self.pending += 1;
+            frames.extend(self.drain_output(pts_us, true)?);
             self.frame_count += 1;
             self.force_keyframe = false;
             return Ok(frames);
         }
         amf_ok(submit, "AMFComponent::SubmitInput")?;
-        let frames = self.drain_output(pts_us)?;
+        self.pending += 1;
+        let frames = self.drain_output(pts_us, true)?;
         self.frame_count += 1;
         self.force_keyframe = false;
         Ok(frames)
@@ -1335,13 +1356,14 @@ impl VideoEncoder for WindowsAmfEncoder {
         let mut frames = Vec::new();
         let mut drain = unsafe { ((*(*self.component).vtbl).drain)(self.component) };
         while drain == AMF_INPUT_FULL {
-            frames.extend(self.drain_output(0)?);
+            frames.extend(self.drain_output(0, true)?);
             drain = unsafe { ((*(*self.component).vtbl).drain)(self.component) };
         }
         if drain != AMF_EOF {
             amf_ok(drain, "AMFComponent::Drain")?;
         }
-        frames.extend(self.drain_output(0)?);
+        frames.extend(self.drain_output(0, true)?);
+        self.pending = 0;
         Ok(frames)
     }
 
