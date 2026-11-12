@@ -2360,6 +2360,8 @@ impl VideoEncoder for FfmpegEncoder {
                                 let processor = video_device.CreateVideoProcessor(&enumerator, 0).map_err(|e| {
                                     MediaError::EncodeError(format!("CreateVideoProcessor failed: {e}"))
                                 })?;
+                                // Hardware encoders are tagged BT.709 full range (codec_ctx).
+                                super::set_bt709_conversion(video_context, &processor, true);
                                 self.video_enumerator = Some(enumerator);
                                 self.video_processor = Some(processor);
                             }
