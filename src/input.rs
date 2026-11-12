@@ -18,7 +18,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC,
+    VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC, KEYEVENTF_UNICODE,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::GetLastError;
@@ -445,6 +445,17 @@ struct X11Backend {
     monitor_y: i32,
     monitor_width: i32,
     monitor_height: i32,
+    /// Keycodes without keysyms, borrowed to type characters the keyboard
+    /// layout doesn't have (é, ệ, emoji…), like xdotool does.
+    spare_keys: std::sync::Mutex<SpareKeys>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct SpareKeys {
+    /// None until looked up.
+    codes: Option<Vec<u8>>,
+    next: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -558,6 +569,7 @@ impl InputInjector {
                             monitor_y,
                             monitor_width,
                             monitor_height,
+                            spare_keys: std::sync::Mutex::new(SpareKeys::default()),
                         }),
                     });
                 }
@@ -860,6 +872,65 @@ impl InputInjector {
         }
     }
 
+    /// Types text as the user would (any Unicode character, independent of
+    /// the keyboard layout where the platform allows it). Used for text from
+    /// phone keyboards, which send characters rather than keys.
+    pub fn type_text(&self, text: &str) {
+        #[cfg(target_os = "linux")]
+        match &self.backend {
+            Backend::X11(x11) => {
+                let _lock = crate::X11_MUTEX.lock().unwrap();
+                for ch in text.chars() {
+                    unsafe { x11_type_char(x11, ch) };
+                }
+                unsafe { xlib::XFlush(x11.display) };
+            }
+            Backend::Uinput(u) => {
+                for ch in text.chars() {
+                    uinput_type_char(u, ch);
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let mut inputs: Vec<INPUT> = Vec::new();
+            for ch in text.chars() {
+                if ch == '\n' || ch == '\r' {
+                    // Enter as a key: some apps ignore a Unicode newline.
+                    for up in [false, true] {
+                        inputs.push(INPUT {
+                            r#type: INPUT_TYPE(1),
+                            Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(0x0D), wScan: 0,
+                                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                                time: 0, dwExtraInfo: 0,
+                            } },
+                        });
+                    }
+                    continue;
+                }
+                let mut units = [0u16; 2];
+                for &unit in ch.encode_utf16(&mut units).iter() {
+                    for up in [false, true] {
+                        let mut flags = KEYEVENTF_UNICODE;
+                        if up { flags |= KEYEVENTF_KEYUP; }
+                        inputs.push(INPUT {
+                            r#type: INPUT_TYPE(1),
+                            Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(0), wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0,
+                            } },
+                        });
+                    }
+                }
+            }
+            if !inputs.is_empty() {
+                send_input_checked(&inputs, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let _ = text;
+    }
+
     /// Flushes any pending input events to the display server.
     pub fn flush(&self) {
         #[cfg(target_os = "linux")]
@@ -903,6 +974,205 @@ fn mouse_button_to_linux_keycode(button: u32) -> Option<Key> {
         _ => return None,
     };
     Some(code)
+}
+
+/// X keysym of a character: Latin-1 keysyms equal the code point, the rest
+/// are 0x0100_0000 + code point.
+#[cfg(target_os = "linux")]
+fn char_keysym(ch: char) -> xlib::KeySym {
+    match ch {
+        '\n' | '\r' => 0xff0d, // Return
+        '\t' => 0xff09,         // Tab
+        '\u{8}' => 0xff08,      // BackSpace
+        c if (c as u32) >= 0x20 && (c as u32) <= 0x7e => c as xlib::KeySym,
+        c if (c as u32) >= 0xa0 && (c as u32) <= 0xff => c as xlib::KeySym,
+        c => 0x0100_0000 + c as xlib::KeySym,
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn x11_key(x11: &X11Backend, keycode: u8, shift: bool) {
+    let d = x11.display;
+    let shift_code = if shift { xlib::XKeysymToKeycode(d, 0xffe1 /* Shift_L */) } else { 0 };
+    if shift_code > 0 {
+        xtest::XTestFakeKeyEvent(d, shift_code as u32, 1, 0);
+    }
+    xtest::XTestFakeKeyEvent(d, keycode as u32, 1, 0);
+    xtest::XTestFakeKeyEvent(d, keycode as u32, 0, 0);
+    if shift_code > 0 {
+        xtest::XTestFakeKeyEvent(d, shift_code as u32, 0, 0);
+    }
+}
+
+/// Types one character with XTest: through the key that has it in the
+/// current layout, else by giving a spare keycode that keysym for a moment.
+#[cfg(target_os = "linux")]
+unsafe fn x11_type_char(x11: &X11Backend, ch: char) {
+    let d = x11.display;
+    let keysym = char_keysym(ch);
+    let keycode = xlib::XKeysymToKeycode(d, keysym);
+    if keycode > 0 {
+        if xlib::XKeycodeToKeysym(d, keycode, 0) == keysym {
+            x11_key(x11, keycode, false);
+            return;
+        }
+        if xlib::XKeycodeToKeysym(d, keycode, 1) == keysym {
+            x11_key(x11, keycode, true);
+            return;
+        }
+    }
+    let Ok(mut spare) = x11.spare_keys.lock() else { return };
+    if spare.codes.is_none() {
+        spare.codes = Some(x11_spare_keycodes(d));
+    }
+    let codes = spare.codes.as_ref().unwrap();
+    if codes.is_empty() {
+        log::warn!("No spare X keycode to type {:?}", ch);
+        return;
+    }
+    // Rotate through the spare keycodes so an app still reading the
+    // previous character's mapping isn't given this one's.
+    let code = codes[spare.next % codes.len()];
+    spare.next = spare.next.wrapping_add(1);
+    let mut syms: [libc::c_ulong; 2] = [keysym as libc::c_ulong, keysym as libc::c_ulong];
+    xlib::XChangeKeyboardMapping(d, code as i32, 2, syms.as_mut_ptr(), 1);
+    xlib::XSync(d, 0);
+    x11_key(x11, code, false);
+    xlib::XSync(d, 0);
+}
+
+/// Keycodes that have no keysym at all (up to 8).
+#[cfg(target_os = "linux")]
+unsafe fn x11_spare_keycodes(d: *mut xlib::Display) -> Vec<u8> {
+    let (mut min, mut max) = (0, 0);
+    xlib::XDisplayKeycodes(d, &mut min, &mut max);
+    let count = max - min + 1;
+    let mut per = 0;
+    let map = xlib::XGetKeyboardMapping(d, min as u8, count, &mut per);
+    if map.is_null() || per <= 0 {
+        return Vec::new();
+    }
+    let mut spare = Vec::new();
+    for i in (0..count).rev() {
+        let syms = std::slice::from_raw_parts(map.add((i * per) as usize), per as usize);
+        if syms.iter().all(|&s| s == 0) {
+            spare.push((min + i) as u8);
+            if spare.len() == 8 {
+                break;
+            }
+        }
+    }
+    xlib::XFree(map as *mut _);
+    spare
+}
+
+/// A printable ASCII character on a US keyboard: (key, with Shift).
+#[cfg(target_os = "linux")]
+fn ascii_us_key(ch: char) -> Option<(Key, bool)> {
+    const LETTERS: [Key; 26] = [
+        Key::KEY_A, Key::KEY_B, Key::KEY_C, Key::KEY_D, Key::KEY_E, Key::KEY_F, Key::KEY_G,
+        Key::KEY_H, Key::KEY_I, Key::KEY_J, Key::KEY_K, Key::KEY_L, Key::KEY_M, Key::KEY_N,
+        Key::KEY_O, Key::KEY_P, Key::KEY_Q, Key::KEY_R, Key::KEY_S, Key::KEY_T, Key::KEY_U,
+        Key::KEY_V, Key::KEY_W, Key::KEY_X, Key::KEY_Y, Key::KEY_Z,
+    ];
+    const DIGITS: [Key; 10] = [
+        Key::KEY_0, Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4,
+        Key::KEY_5, Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9,
+    ];
+    Some(match ch {
+        'a'..='z' => (LETTERS[ch as usize - 'a' as usize], false),
+        'A'..='Z' => (LETTERS[ch as usize - 'A' as usize], true),
+        '0'..='9' => (DIGITS[ch as usize - '0' as usize], false),
+        ' ' => (Key::KEY_SPACE, false),
+        '\n' | '\r' => (Key::KEY_ENTER, false),
+        '\t' => (Key::KEY_TAB, false),
+        '-' => (Key::KEY_MINUS, false), '_' => (Key::KEY_MINUS, true),
+        '=' => (Key::KEY_EQUAL, false), '+' => (Key::KEY_EQUAL, true),
+        '[' => (Key::KEY_LEFTBRACE, false), '{' => (Key::KEY_LEFTBRACE, true),
+        ']' => (Key::KEY_RIGHTBRACE, false), '}' => (Key::KEY_RIGHTBRACE, true),
+        '\\' => (Key::KEY_BACKSLASH, false), '|' => (Key::KEY_BACKSLASH, true),
+        ';' => (Key::KEY_SEMICOLON, false), ':' => (Key::KEY_SEMICOLON, true),
+        '\'' => (Key::KEY_APOSTROPHE, false), '"' => (Key::KEY_APOSTROPHE, true),
+        '`' => (Key::KEY_GRAVE, false), '~' => (Key::KEY_GRAVE, true),
+        ',' => (Key::KEY_COMMA, false), '<' => (Key::KEY_COMMA, true),
+        '.' => (Key::KEY_DOT, false), '>' => (Key::KEY_DOT, true),
+        '/' => (Key::KEY_SLASH, false), '?' => (Key::KEY_SLASH, true),
+        '!' => (Key::KEY_1, true), '@' => (Key::KEY_2, true), '#' => (Key::KEY_3, true),
+        '$' => (Key::KEY_4, true), '%' => (Key::KEY_5, true), '^' => (Key::KEY_6, true),
+        '&' => (Key::KEY_7, true), '*' => (Key::KEY_8, true), '(' => (Key::KEY_9, true),
+        ')' => (Key::KEY_0, true),
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn uinput_tap(u: &UinputInjector, key: Key, shift: bool) {
+    let mut events = Vec::new();
+    if shift {
+        events.push(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 1));
+    }
+    events.push(InputEvent::new(evdev::EventType::KEY, key.0, 1));
+    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0));
+    events.push(InputEvent::new(evdev::EventType::KEY, key.0, 0));
+    if shift {
+        events.push(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 0));
+    }
+    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0));
+    if let Ok(mut dev) = u.keyboard.lock() {
+        let _ = dev.emit(&events);
+    }
+}
+
+/// uinput only has keys: ASCII is typed on a US layout; other characters
+/// through Ctrl+Shift+U <hex> Space (GTK and IBus/Fcitx apps).
+#[cfg(target_os = "linux")]
+fn uinput_type_char(u: &UinputInjector, ch: char) {
+    if let Some((key, shift)) = ascii_us_key(ch) {
+        uinput_tap(u, key, shift);
+        return;
+    }
+    let mut events = vec![
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.0, 1),
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 1),
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_U.0, 1),
+        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_U.0, 0),
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 0),
+        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.0, 0),
+        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+    ];
+    if let Ok(mut dev) = u.keyboard.lock() {
+        let _ = dev.emit(&events);
+    }
+    events.clear();
+    for digit in format!("{:x}", ch as u32).chars() {
+        if let Some((key, shift)) = ascii_us_key(digit) {
+            uinput_tap(u, key, shift);
+        }
+    }
+    uinput_tap(u, Key::KEY_SPACE, false);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod type_text_tests {
+    use super::*;
+
+    #[test]
+    fn keysyms_follow_x11_rules() {
+        assert_eq!(char_keysym('a'), 0x61);
+        assert_eq!(char_keysym('é'), 0xe9);
+        assert_eq!(char_keysym('ệ'), 0x0100_0000 + 0x1ec7);
+        assert_eq!(char_keysym('\n'), 0xff0d);
+    }
+
+    #[test]
+    fn ascii_on_a_us_keyboard() {
+        assert_eq!(ascii_us_key('a'), Some((Key::KEY_A, false)));
+        assert_eq!(ascii_us_key('Z'), Some((Key::KEY_Z, true)));
+        assert_eq!(ascii_us_key('?'), Some((Key::KEY_SLASH, true)));
+        assert_eq!(ascii_us_key('@'), Some((Key::KEY_2, true)));
+        assert_eq!(ascii_us_key('ệ'), None);
+    }
 }
 
 #[cfg(target_os = "linux")]
