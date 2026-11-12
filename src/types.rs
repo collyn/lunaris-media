@@ -72,6 +72,8 @@ pub struct StreamConfig {
     /// Encode with full-resolution chroma (YUV 4:4:4, H.264 High 4:4:4).
     /// Sharper coloured text; needs NVENC or the software encoder.
     pub yuv444: bool,
+    /// Also record the computer's microphone, mixed into its sound.
+    pub microphone: bool,
 }
 
 impl Default for StreamConfig {
@@ -86,6 +88,7 @@ impl Default for StreamConfig {
             preferred_encoder: None,
             virtual_display: false,
             yuv444: false,
+            microphone: false,
         }
     }
 }
@@ -362,6 +365,8 @@ pub struct AudioCaptureConfig {
     pub channels: u16,
     /// Audio frame size in milliseconds (e.g., 20).
     pub frame_size_ms: u32,
+    /// Mix the default microphone into the captured output sound.
+    pub microphone: bool,
 }
 
 impl Default for AudioCaptureConfig {
@@ -370,6 +375,7 @@ impl Default for AudioCaptureConfig {
             sample_rate: 48_000,
             channels: 2,
             frame_size_ms: 20,
+            microphone: false,
         }
     }
 }

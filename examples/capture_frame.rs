@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         preferred_encoder: None,
         virtual_display: false,
         yuv444: false,
+        microphone: false,
     };
 
     println!("Starting capture...");

@@ -328,6 +328,7 @@ impl MediaPipeline {
         // 4. Start audio on a separate blocking task (cpal is !Send for Stream)
         let mut audio_config = AudioCaptureConfig::default();
         audio_config.frame_size_ms = 10;
+        audio_config.microphone = self.config.microphone;
         let audio_event_tx = self.event_tx.clone();
         let audio_shutdown = self.audio_shutdown.clone();
         let audio_shutdown_clone = audio_shutdown.clone();
