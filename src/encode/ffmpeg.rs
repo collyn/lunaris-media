@@ -94,12 +94,12 @@ struct AVD3D11VADeviceContext {
 
 #[cfg(target_os = "windows")]
 #[repr(C)]
+/// `AVD3D11VAFramesContext` of FFmpeg 8.1 (libavutil/hwcontext_d3d11va.h:166-189).
 struct AVD3D11VAFramesContext {
     texture: *mut std::ffi::c_void,
-    textures: *mut *mut std::ffi::c_void,
-    nb_textures: std::ffi::c_int,
     bind_flags: std::ffi::c_uint,
     misc_flags: std::ffi::c_uint,
+    texture_infos: *mut std::ffi::c_void,
 }
 
 #[cfg(target_os = "linux")]
@@ -1316,7 +1316,9 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                         if sw_format == ffi::AVPixelFormat::AV_PIX_FMT_BGRA {
                             (*d3d11_frames).bind_flags = 40; // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
                         } else {
-                            (*d3d11_frames).bind_flags = 512 | 32; // D3D11_BIND_DECODER (512) | D3D11_BIND_RENDER_TARGET (32)
+                            // Sunshine display_vram.cpp:1157-1159 (init_hwframes): "The
+                            // encoder requires textures with D3D11_BIND_RENDER_TARGET set".
+                            (*d3d11_frames).bind_flags = 32; // D3D11_BIND_RENDER_TARGET
                         }
                         (*d3d11_frames).misc_flags = 0;
                     }
@@ -1337,8 +1339,6 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                         let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
                         let d3d11_frames = (*frames_ctx).hwctx as *mut AVD3D11VAFramesContext;
                         (*d3d11_frames).texture = ptr::null_mut();
-                        (*d3d11_frames).textures = ptr::null_mut();
-                        (*d3d11_frames).nb_textures = 0;
                     }
                     ffi::av_buffer_unref(&mut hw_frames_ctx);
                     ffi::av_buffer_unref(&mut hw_device_ctx);
