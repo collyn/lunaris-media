@@ -341,8 +341,10 @@ fn run_cpal_stream(
     let host = cpal::default_host();
     let monitor = host.input_devices().ok().and_then(|mut devs| {
         devs.find(|d| {
-            d.name()
-                .map(|n| n.to_lowercase().contains("monitor"))
+            // cpal 0.15's `name()` was the ALSA PCM name; in 0.18 that is
+            // the device id (`description().name()` is now a human label).
+            d.id()
+                .map(|id| id.id().to_lowercase().contains("monitor"))
                 .unwrap_or(false)
         })
     });
@@ -363,18 +365,25 @@ fn run_cpal_stream(
         }
     };
 
-    let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+    let device_name = device
+        .id()
+        .map(|id| id.id().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
     log::info!("Audio thread: using device '{device_name}'");
 
     let stream_config = cpal::StreamConfig {
         channels: cpal::ChannelCount::from(channels),
-        sample_rate: cpal::SampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(encoder.frame_size_samples as u32),
+        sample_rate,
+        // cpal 0.15 set the ALSA ring buffer to this many frames (one Opus
+        // frame) and the period to a quarter of it. 0.18 reads `Fixed(x)` as
+        // the period and sizes the ring at two periods, so half a frame keeps
+        // the ring at one frame, as before.
+        buffer_size: cpal::BufferSize::Fixed((encoder.frame_size_samples / 2) as u32),
     };
 
     let stream = device
         .build_input_stream(
-            &stream_config,
+            stream_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| encoder.push(data),
             |err| log::error!("cpal stream error: {err}"),
             None,

@@ -11,8 +11,8 @@ log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time", "rt-multi-thread"] }
 async-trait = "0.1"
-opus = "0.3"
-cpal = "0.15"
+opus = "0.4"
+cpal = "0.18"
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -141,7 +141,11 @@ fn run_audio_stream(
         .default_output_device()
         .ok_or_else(|| MediaError::AudioError("No default output device for loopback".into()))?;
 
-    let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+    // `description().name()` is the endpoint's friendly name, as `name()` was.
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
     log::info!(
         "Audio thread: using device '{}' for WASAPI loopback",
         device_name
@@ -168,13 +172,13 @@ fn run_audio_stream(
 
     let stream_config = cpal::StreamConfig {
         channels: cpal::ChannelCount::from(channels),
-        sample_rate: cpal::SampleRate(sample_rate),
+        sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
     let stream = device
         .build_input_stream(
-            &stream_config,
+            stream_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 pcm_buffer.extend_from_slice(data);
 
