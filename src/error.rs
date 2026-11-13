@@ -40,6 +40,14 @@ pub enum MediaError {
     #[error("Capture error: {0}")]
     CaptureError(String),
 
+    /// The capture backend lost or invalidated its display (mode change, desktop
+    /// switch, GPU/HDR change, ...): the display object and everything built on
+    /// it (the encoder session) must be re-created. Port of Sunshine's
+    /// `platf::capture_e::reinit` (platform/common.h; returned by
+    /// display_base.cpp `duplication_t::next_frame` / `release_frame`).
+    #[error("the capture has to be re-initialised")]
+    CaptureReinit,
+
     /// An error occurred during video encoding.
     #[error("Encode error: {0}")]
     EncodeError(String),

@@ -11,8 +11,14 @@
 //!     → Map staging → BGRA bytes → CpuBuffer
 //! ```
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::{GENERIC_ALL, WAIT_ABANDONED};
+use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+    DF_ALLOWOTHERACCOUNTHOOK,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -24,7 +30,143 @@ use crate::capture::gpu_buffer::GpuBuffer;
 use crate::error::MediaError;
 use crate::types::*;
 
+/// Port of Sunshine `syncThreadDesktop()` (src/platform/windows/misc.cpp:247-264):
+/// attach the CALLING thread to the desktop that currently receives input, so
+/// that `DuplicateOutput` is not refused (E_ACCESSDENIED) after a desktop
+/// switch (lock screen, UAC prompt, sleeping monitor).
+///
+/// Adaptation: it acts on the calling thread only. Lunaris runs on tokio worker
+/// threads and a task may move to another thread at any `.await`, so every
+/// caller must invoke this in the same synchronous stretch of code as the
+/// `DuplicateOutput` it protects, with no `.await` in between.
+fn sync_thread_desktop() {
+    unsafe {
+        let desk = match OpenInputDesktop(
+            DF_ALLOWOTHERACCOUNTHOOK,
+            false,
+            DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to Open Input Desktop [{e}]");
+                return;
+            }
+        };
+        if let Err(e) = SetThreadDesktop(desk) {
+            log::error!("Failed to sync desktop to thread [{e}]");
+        }
+        let _ = CloseDesktop(desk);
+    }
+}
+
+/// Keeps the display awake while capturing.
+///
+/// Port of Sunshine `display_base_t::capture` (display_base.cpp:254-261):
+/// `SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)` for the whole
+/// capture, `SetThreadExecutionState(ES_CONTINUOUS)` on exit.
+///
+/// Adaptation: the execution state belongs to the calling thread. Sunshine's
+/// capture runs on one dedicated thread, Lunaris's `next_frame` on whatever
+/// tokio worker polls it, so the state is held by this small dedicated thread
+/// instead; it lives until the object is dropped (stop / Drop).
+struct KeepAwake {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAwake {
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("lunaris-keep-display-awake".into())
+            .spawn(move || {
+                unsafe {
+                    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+                }
+                // Blocks until the sender is dropped or a message is sent.
+                let _ = rx.recv();
+                unsafe {
+                    SetThreadExecutionState(ES_CONTINUOUS);
+                }
+            })
+            .ok();
+        if handle.is_none() {
+            log::warn!("Could not start the keep-display-awake thread");
+        }
+        Self { stop_tx: Some(tx), handle }
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        self.stop_tx.take(); // wakes the thread
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Result of `AcquireNextFrame`, mapped as Sunshine's `duplication_t::next_frame`
+/// (display_base.cpp:158-182) maps it to `capture_e`.
+enum AcquireStatus {
+    Ok,
+    Timeout,
+    Reinit,
+    Error,
+}
+
+fn classify_acquire(code: windows::core::HRESULT) -> AcquireStatus {
+    if code.is_ok() {
+        AcquireStatus::Ok
+    } else if code == DXGI_ERROR_WAIT_TIMEOUT {
+        AcquireStatus::Timeout
+    } else if code.0 == WAIT_ABANDONED.0 as i32
+        || code == DXGI_ERROR_ACCESS_LOST
+        || code == DXGI_ERROR_ACCESS_DENIED
+    {
+        AcquireStatus::Reinit
+    } else {
+        AcquireStatus::Error
+    }
+}
+
+/// Port of `duplication_t::release_frame` (display_base.cpp:195-218).
+/// Ok for S_OK and DXGI_ERROR_INVALID_CALL ("already released"), Reinit for
+/// DXGI_ERROR_ACCESS_LOST, Error otherwise.
+fn release_frame(duplication: &IDXGIOutputDuplication) -> AcquireStatus {
+    match unsafe { duplication.ReleaseFrame() } {
+        Ok(()) => AcquireStatus::Ok,
+        Err(e) if e.code() == DXGI_ERROR_INVALID_CALL => {
+            log::warn!("Duplication frame already released");
+            AcquireStatus::Ok
+        }
+        Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => AcquireStatus::Reinit,
+        Err(e) => {
+            log::error!("Error while releasing duplication frame [{e}]");
+            AcquireStatus::Error
+        }
+    }
+}
+
+/// A duplication together with what was found while creating it.
+struct Duplicated {
+    factory: IDXGIFactory1,
+    duplication: IDXGIOutputDuplication,
+    /// `DXGI_OUTPUT_DESC::DesktopCoordinates` (the whole desc holds an HMONITOR
+    /// raw pointer, which would make the async futures non-`Send`).
+    rect: windows::Win32::Foundation::RECT,
+    index: usize,
+    /// `IDXGIOutputDuplication::GetDesc().ModeDesc` size = size of the textures
+    /// `AcquireNextFrame` delivers.
+    tex_width: u32,
+    tex_height: u32,
+}
+
 pub struct DxgiCapture {
+    keep_awake: Option<KeepAwake>,
+    factory: Option<IDXGIFactory1>,
+    tex_width: u32,
+    tex_height: u32,
     device: Option<ID3D11Device>,
     context: Option<ID3D11DeviceContext>,
     duplication: Option<IDXGIOutputDuplication>,
@@ -45,6 +187,10 @@ pub struct DxgiCapture {
 impl DxgiCapture {
     pub fn new() -> Result<Self, MediaError> {
         Ok(Self {
+            keep_awake: None,
+            factory: None,
+            tex_width: 0,
+            tex_height: 0,
             device: None,
             context: None,
             duplication: None,
@@ -189,6 +335,211 @@ impl DxgiCapture {
 
         texture.ok_or_else(|| MediaError::CaptureError("GPU texture is None".into()))
     }
+
+    /// One pass of Sunshine's output search (display_base.cpp:~520-557): pick
+    /// the wanted output, require `AttachedToDesktop`, and make sure Desktop
+    /// Duplication works on it.
+    ///
+    /// Sunshine runs `test_dxgi_duplication` (display_base.cpp:~395-445: two
+    /// `DuplicateOutput` tries, `syncThreadDesktop()` before each, 200 ms
+    /// sleep after each failure) as part of the search condition and then
+    /// duplicates again in `duplication_t::init` (display_base.cpp:111-122,
+    /// same two tries). Adaptation: Lunaris has one device and no separate
+    /// test device, so the two tries (also `syncThreadDesktop()` before each
+    /// and 200 ms after each failure) produce the duplication that is kept.
+    /// A failed duplication makes the pass fail, as in Sunshine, where a failed
+    /// test means the output is not found.
+    ///
+    /// Each `DuplicateOutput` is immediately preceded by `sync_thread_desktop()`
+    /// with no `.await` in between (the sleep comes after a failed try, and the
+    /// loop calls `sync_thread_desktop()` again afterwards).
+    async fn output_pass(
+        device: &ID3D11Device,
+        id: &str,
+        factory: &IDXGIFactory1,
+        last_err: &mut String,
+    ) -> Option<Duplicated> {
+        // Synchronous helper: DXGI_OUTPUT_DESC holds an HMONITOR raw pointer and
+        // must not live across an `.await` (the futures must stay `Send`).
+        let (output, rect, index) = Self::select_output(device, id, last_err)?;
+
+        for _ in 0..2 {
+            // Ensure we can duplicate the current display (display_base.cpp:115)
+            sync_thread_desktop();
+            match unsafe { output.DuplicateOutput(device) } {
+                Ok(duplication) => {
+                    let dup_desc = unsafe { duplication.GetDesc() };
+                    return Some(Duplicated {
+                        factory: factory.clone(),
+                        duplication,
+                        rect,
+                        index,
+                        tex_width: dup_desc.ModeDesc.Width,
+                        tex_height: dup_desc.ModeDesc.Height,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("DuplicateOutput failed [{e}]");
+                    *last_err = format!(
+                        "DuplicateOutput failed: {e}. Ensure no other app is using Desktop Duplication."
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        None
+    }
+
+    /// Output choice of one search pass (see `output_pass`).
+    fn select_output(
+        device: &ID3D11Device,
+        id: &str,
+        last_err: &mut String,
+    ) -> Option<(IDXGIOutput1, windows::Win32::Foundation::RECT, usize)> {
+        let outputs = match Self::enumerate_outputs(device) {
+            Ok(o) => o,
+            Err(e) => {
+                *last_err = e.to_string();
+                return None;
+            }
+        };
+
+        // "default" (no explicit selection) must map to the PRIMARY output, not
+        // output index 0 — DXGI EnumOutputs order is not guaranteed to be
+        // primary-first, which left the default stream capturing a blank/wrong
+        // monitor. The primary output's desktop rect is always at the origin.
+        let index: usize = if id == "default" || id.is_empty() {
+            outputs
+                .iter()
+                .position(|(_, d)| d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0)
+                .unwrap_or(0)
+        } else {
+            id.parse().unwrap_or(0)
+        };
+
+        let (output, desc) = match outputs.into_iter().nth(index) {
+            Some(o) => o,
+            None => {
+                *last_err = format!("Display {index} not found");
+                return None;
+            }
+        };
+
+        // display_base.cpp:541 `desc.AttachedToDesktop && test_dxgi_duplication(...)`
+        if !desc.AttachedToDesktop.as_bool() {
+            *last_err = format!("Display {index} is not attached to the desktop");
+            return None;
+        }
+
+        let rect = desc.DesktopCoordinates;
+        Some((output, rect, index))
+    }
+
+    /// Create the DXGI factory and find + duplicate the wanted output.
+    ///
+    /// Port of `display_base_t::init` (display_base.cpp:~505-567): the factory
+    /// is created first (kept for `IsCurrent`, display_base.cpp:267), the
+    /// output search runs at most twice, and when the first pass finds nothing
+    /// `SetThreadExecutionState(ES_DISPLAY_REQUIRED); Sleep(500);` tries to
+    /// power the display on before the second pass (lines 563-567).
+    /// Adaptation: `tokio::time::sleep` instead of `Sleep` (this is async code).
+    async fn find_and_duplicate(
+        device: &ID3D11Device,
+        id: &str,
+    ) -> Result<Duplicated, MediaError> {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+            .map_err(|e| MediaError::CaptureError(format!("Failed to create DXGIFactory1: {e}")))?;
+
+        let mut last_err = String::from("no output found");
+        for tries in 0..2 {
+            if let Some(found) = Self::output_pass(device, id, &factory, &mut last_err).await {
+                return Ok(found);
+            }
+            // If we made it here without finding an output, try to power on the
+            // display and retry.
+            if tries == 0 {
+                unsafe {
+                    SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        Err(MediaError::CaptureError(format!(
+            "Failed to locate an output device: {last_err}"
+        )))
+    }
+
+    /// What the caller already understands as "no new frame yet": the frame
+    /// `DXGI_ERROR_WAIT_TIMEOUT` produces (`is_new_frame: false`).
+    fn timeout_frame(&mut self) -> CapturedFrame {
+        let timestamp = self.start_time.as_ref().map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        // Return a keepalive frame at most once every 500ms when screen is static
+        let need_keepalive = self
+            .last_returned_time
+            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(500));
+
+        if self.use_zero_copy {
+            if need_keepalive && self.gpu_texture.is_some() {
+                self.last_returned_time = Some(std::time::Instant::now());
+                return CapturedFrame {
+                    buffer: GpuBuffer::D3D11Texture {
+                        texture: self.gpu_texture.as_ref().unwrap().as_raw(),
+                        array_index: 0,
+                    },
+                    timestamp_us: timestamp,
+                    width: self.width,
+                    height: self.height,
+                    format: PixelFormat::BGRA,
+                    is_new_frame: false,
+                    cursor: None,
+                };
+            } else {
+                return CapturedFrame {
+                    buffer: GpuBuffer::CpuBuffer {
+                        data: Vec::new(),
+                        stride: 0,
+                        format: PixelFormat::BGRA,
+                        width: self.width,
+                        height: self.height,
+                    },
+                    timestamp_us: timestamp,
+                    width: self.width,
+                    height: self.height,
+                    format: PixelFormat::BGRA,
+                    is_new_frame: false,
+                    cursor: None,
+                };
+            }
+        }
+
+        let (data, stride) = if need_keepalive {
+            if let Some((d, s)) = &self.last_frame_data {
+                self.last_returned_time = Some(std::time::Instant::now());
+                (d.clone(), *s)
+            } else {
+                (Vec::new(), 0)
+            }
+        } else {
+            (Vec::new(), 0)
+        };
+
+        CapturedFrame {
+            buffer: GpuBuffer::CpuBuffer {
+                data,
+                stride,
+                format: PixelFormat::BGRA,
+                width: self.width,
+                height: self.height,
+            },
+            timestamp_us: timestamp,
+            width: self.width,
+            height: self.height,
+            format: PixelFormat::BGRA,
+            is_new_frame: false,
+            cursor: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -224,29 +575,19 @@ impl ScreenCapture for DxgiCapture {
             return Err(MediaError::CaptureAlreadyStarted);
         }
 
+        // Started BEFORE the duplication attempts so that a sleeping monitor is
+        // being woken while they run. Dropped (execution state released) if
+        // start fails. See `KeepAwake` (display_base.cpp:254-261).
+        let keep_awake = KeepAwake::start();
+
         let (device, context) = Self::create_d3d11_device()?;
-        let outputs = Self::enumerate_outputs(&device)?;
 
-        // "default" (no explicit selection) must map to the PRIMARY output, not
-        // output index 0 — DXGI EnumOutputs order is not guaranteed to be
-        // primary-first, which left the default stream capturing a blank/wrong
-        // monitor. The primary output's desktop rect is always at the origin.
-        let output_index: usize = if display_id == "default" || display_id.is_empty() {
-            outputs
-                .iter()
-                .position(|(_, d)| {
-                    d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0
-                })
-                .unwrap_or(0)
-        } else {
-            display_id.parse().unwrap_or(0)
-        };
-        let (output, desc) = outputs
-            .into_iter()
-            .nth(output_index)
-            .ok_or_else(|| MediaError::CaptureError(format!("Display {} not found", display_id)))?;
+        // Output search, `DuplicateOutput` x2 with `syncThreadDesktop()`, and the
+        // wake-and-retry pass: see `find_and_duplicate`.
+        let found = Self::find_and_duplicate(&device, display_id).await?;
 
-        let rect = desc.DesktopCoordinates;
+        let output_index = found.index;
+        let rect = found.rect;
         self.width = (rect.right - rect.left) as u32;
         self.height = (rect.bottom - rect.top) as u32;
 
@@ -257,11 +598,7 @@ impl ScreenCapture for DxgiCapture {
             self.height
         );
 
-        let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|e| {
-            MediaError::CaptureError(format!(
-                "DuplicateOutput failed: {e}. Ensure no other app is using Desktop Duplication."
-            ))
-        })?;
+        let duplication = found.duplication;
 
         let staging = Self::create_staging_texture(&device, self.width, self.height)?;
 
@@ -276,6 +613,10 @@ impl ScreenCapture for DxgiCapture {
             None
         };
 
+        self.keep_awake = Some(keep_awake);
+        self.factory = Some(found.factory);
+        self.tex_width = found.tex_width;
+        self.tex_height = found.tex_height;
         self.device = Some(device);
         self.context = Some(context);
         self.duplication = Some(duplication);
@@ -294,12 +635,28 @@ impl ScreenCapture for DxgiCapture {
     }
 
     async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
+        if !self.capturing {
+            return Err(MediaError::CaptureError("Not capturing".into()));
+        }
+
+        // display_base.cpp:264-271: "This will return false if the HDR state
+        // changes or for any number of other display or GPU changes. We should
+        // reinit to examine the updated state of the display subsystem."
+        if let Some(factory) = &self.factory {
+            if !unsafe { factory.IsCurrent() }.as_bool() {
+                log::info!("DXGI factory is no longer current: capture has to be re-initialised");
+                return Err(MediaError::CaptureReinit);
+            }
+        }
+
+        // Cloned (cheap COM AddRef) so that `self` stays free for `timeout_frame()`
+        // below.
         let duplication = self
             .duplication
-            .as_ref()
+            .clone()
             .ok_or_else(|| MediaError::CaptureError("Not capturing".into()))?;
-        let context = self.context.as_ref().unwrap();
-        let staging = self.staging_texture.as_ref().unwrap();
+        let context = self.context.clone().unwrap();
+        let staging = self.staging_texture.clone().unwrap();
 
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource = None;
@@ -308,79 +665,28 @@ impl ScreenCapture for DxgiCapture {
             duplication.AcquireNextFrame(5, &mut frame_info, &mut desktop_resource)
         };
 
-        match result {
-            Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                let timestamp =
-                    self.start_time.as_ref().map_or(0, |t| t.elapsed().as_micros() as u64);
-                
-                // Return a keepalive frame at most once every 500ms when screen is static
-                let need_keepalive = self.last_returned_time.map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(500));
-
-                if self.use_zero_copy {
-                    if need_keepalive && self.gpu_texture.is_some() {
-                        self.last_returned_time = Some(std::time::Instant::now());
-                        return Ok(CapturedFrame {
-                            buffer: GpuBuffer::D3D11Texture {
-                                texture: self.gpu_texture.as_ref().unwrap().as_raw(),
-                                array_index: 0,
-                            },
-                            timestamp_us: timestamp,
-                            width: self.width,
-                            height: self.height,
-                            format: PixelFormat::BGRA,
-                            is_new_frame: false,
-                            cursor: None,
-                        });
-                    } else {
-                        return Ok(CapturedFrame {
-                            buffer: GpuBuffer::CpuBuffer {
-                                data: Vec::new(),
-                                stride: 0,
-                                format: PixelFormat::BGRA,
-                                width: self.width,
-                                height: self.height,
-                            },
-                            timestamp_us: timestamp,
-                            width: self.width,
-                            height: self.height,
-                            format: PixelFormat::BGRA,
-                            is_new_frame: false,
-                            cursor: None,
-                        });
-                    }
-                }
-
-                let (data, stride) = if need_keepalive {
-                    if let Some((d, s)) = &self.last_frame_data {
-                        self.last_returned_time = Some(std::time::Instant::now());
-                        (d.clone(), *s)
-                    } else {
-                        (Vec::new(), 0)
-                    }
-                } else {
-                    (Vec::new(), 0)
-                };
-
-                return Ok(CapturedFrame {
-                    buffer: GpuBuffer::CpuBuffer {
-                        data,
-                        stride,
-                        format: PixelFormat::BGRA,
-                        width: self.width,
-                        height: self.height,
-                    },
-                    timestamp_us: timestamp,
-                    width: self.width,
-                    height: self.height,
-                    format: PixelFormat::BGRA,
-                    is_new_frame: false,
-                    cursor: None,
-                });
+        // Mapping of duplication_t::next_frame (display_base.cpp:158-182):
+        //   S_OK -> ok; DXGI_ERROR_WAIT_TIMEOUT -> timeout;
+        //   WAIT_ABANDONED / DXGI_ERROR_ACCESS_LOST / DXGI_ERROR_ACCESS_DENIED -> reinit
+        //   (`MediaError::CaptureReinit`, handled by the pipeline);
+        //   anything else -> capture_error.
+        let code = match &result {
+            Ok(()) => windows::core::HRESULT(0),
+            Err(e) => e.code(),
+        };
+        match classify_acquire(code) {
+            AcquireStatus::Ok => {}
+            AcquireStatus::Timeout => return Ok(self.timeout_frame()),
+            AcquireStatus::Reinit => {
+                log::warn!(
+                    "AcquireNextFrame returned {code:?}: capture has to be re-initialised (display_base.cpp:175)"
+                );
+                return Err(MediaError::CaptureReinit);
             }
-            Err(e) => {
+            AcquireStatus::Error => {
+                // Sunshine: "Couldn't acquire next frame" -> capture_e::capture_error
                 return Err(MediaError::CaptureError(format!(
-                    "AcquireNextFrame failed: {e}"
+                    "AcquireNextFrame failed: {code:?}"
                 )));
             }
         }
@@ -391,6 +697,31 @@ impl ScreenCapture for DxgiCapture {
         let texture: ID3D11Texture2D = resource
             .cast()
             .map_err(|e| MediaError::CaptureError(format!("Cast to Texture2D failed: {e}")))?;
+
+        // display_vram.cpp:1430-1438: "It's possible for our display enumeration
+        // to race with mode changes and result in mismatched image pool and
+        // desktop texture sizes. If this happens, just reinit again."
+        // (capture_e::reinit -> MediaError::CaptureReinit)
+        // Adaptation: the expected size is the one `IDXGIOutputDuplication::GetDesc`
+        // reported (`tex_width/tex_height`), not Sunshine's width_before_rotation:
+        // it is the true pixel size of the delivered texture whatever the
+        // rotation or the process's DPI awareness (DesktopCoordinates can be
+        // DPI-virtualised, which would make this check fire on every frame).
+        let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut tex_desc) };
+        if tex_desc.Width != self.tex_width || tex_desc.Height != self.tex_height {
+            log::info!(
+                "Capture size changed [{}x{} -> {}x{}]",
+                self.tex_width,
+                self.tex_height,
+                tex_desc.Width,
+                tex_desc.Height
+            );
+            drop(texture);
+            drop(resource);
+            let _ = release_frame(&duplication);
+            return Err(MediaError::CaptureReinit);
+        }
 
         let timestamp = self
             .start_time
@@ -407,15 +738,15 @@ impl ScreenCapture for DxgiCapture {
 
             let is_black = if self.frame_count <= 3 {
                 unsafe {
-                    context.CopyResource(staging, &texture);
+                    context.CopyResource(&staging, &texture);
                     context.Flush();
                     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                    if context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).is_ok() {
+                    if context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).is_ok() {
                         let stride = mapped.RowPitch;
                         let data_size = (stride * self.height) as usize;
                         let data_slice = std::slice::from_raw_parts(mapped.pData as *const u8, data_size);
                         let black = is_buffer_black(data_slice);
-                        context.Unmap(staging, 0);
+                        context.Unmap(&staging, 0);
                         black
                     } else {
                         false
@@ -425,8 +756,15 @@ impl ScreenCapture for DxgiCapture {
                 false
             };
 
-            unsafe {
-                let _ = duplication.ReleaseFrame();
+            // display_base.cpp:~350 release_snapshot(): the frame is delivered,
+            // then ACCESS_LOST from ReleaseFrame means reinit. The frame is dropped
+            // (the encoder session is rebuilt right after anyway).
+            match release_frame(&duplication) {
+                AcquireStatus::Reinit => return Err(MediaError::CaptureReinit),
+                AcquireStatus::Error => {
+                    return Err(MediaError::CaptureError("ReleaseFrame failed".into()));
+                }
+                _ => {}
             }
 
             if is_black {
@@ -465,17 +803,21 @@ impl ScreenCapture for DxgiCapture {
         }
 
         unsafe {
-            context.CopyResource(staging, &texture);
+            context.CopyResource(&staging, &texture);
         }
 
-        unsafe {
-            let _ = duplication.ReleaseFrame();
+        match release_frame(&duplication) {
+            AcquireStatus::Reinit => return Err(MediaError::CaptureReinit),
+            AcquireStatus::Error => {
+                return Err(MediaError::CaptureError("ReleaseFrame failed".into()));
+            }
+            _ => {}
         }
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
             context
-                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|e| MediaError::CaptureError(format!("Map failed: {e}")))?;
         }
 
@@ -486,7 +828,7 @@ impl ScreenCapture for DxgiCapture {
         };
 
         unsafe {
-            context.Unmap(staging, 0);
+            context.Unmap(&staging, 0);
         }
 
         // Overlay Windows cursor directly on the captured staging texture
@@ -531,8 +873,12 @@ impl ScreenCapture for DxgiCapture {
     }
 
     async fn stop(&mut self) -> Result<(), MediaError> {
+        self.keep_awake = None; // SetThreadExecutionState(ES_CONTINUOUS), display_base.cpp:259
+        self.factory = None;
         self.duplication = None;
         self.staging_texture = None;
+        self.gpu_texture = None;
+        self.last_frame_data = None;
         self.context = None;
         self.device = None;
         self.capturing = false;
@@ -934,7 +1280,11 @@ impl ScreenCapture for WindowsScreenCapture {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("Failed to start DXGI capture: {}. Falling back to GDI capture.", e);
+                    log::warn!(
+                        "Failed to start DXGI capture: {}. Falling back to GDI capture \
+                         (last resort: GDI frames are CPU buffers that the hardware encoders cannot encode).",
+                        e
+                    );
                 }
             }
         }

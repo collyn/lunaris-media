@@ -246,85 +246,17 @@ impl MediaPipeline {
         capture.start(&capture_display_id, &self.config).await?;
         log::info!("Screen capture started on '{}'", capture_display_id);
 
-        let (d3d11_device, d3d11_context) = if cfg!(target_os = "windows") {
-            if let Some((device, context)) = capture.get_d3d11_device() {
-                log::info!(
-                    "Retrieved shared D3D11 device from capture backend (device={:#x}, context={:#x})",
-                    device,
-                    context
-                );
-                (Some(device), Some(context))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
-        // Zero-copy: a DMA-BUF from the display GPU can only be consumed
-        // without a copy by VAAPI on that same GPU. In "auto" mode prefer it
-        // (other encoders remain as fallbacks via EGL readback).
-        // 4:4:4 needs NVENC (or the software encoder); VAAPI on AMD/Intel and
-        // QSV only encode 4:2:0, so don't steer towards them.
-        let yuv444 = self.config.yuv444 && self.config.codec == VideoCodec::H264;
-        if self.config.yuv444 && !yuv444 {
-            log::warn!("YUV 4:4:4 is only supported with H.264; encoding 4:2:0");
-        }
-        let preferred_hw = if yuv444 && preferred_hw.is_none() {
-            log::info!("YUV 4:4:4 requested — preferring NVENC (falls back to software)");
-            Some(HwAccelType::Nvenc)
-        } else if preferred_hw.is_none() && capture.delivers_dmabuf() {
-            log::info!("Capture delivers DMA-BUF frames — preferring VAAPI for zero-copy encode");
-            Some(HwAccelType::Vaapi)
-        } else {
-            preferred_hw
-        };
-
         // 3. Initialize encoder
-        encoder.initialize(&EncoderConfig {
-            codec: self.config.codec,
-            width: self.config.width,
-            height: self.config.height,
-            fps: self.config.fps,
-            bitrate_kbps: self.config.bitrate_kbps,
-            low_latency: true,
-            // FFmpeg (Linux/macOS): no periodic IDR, like Sunshine — every
-            // periodic IDR caused a visible quality "pulse" (measured: frame
-            // error 0.5 → 15 for ~20 frames every 4 s). Keyframes are still
-            // produced on demand (PLI on join / packet loss).
-            // Native Windows encoders keep the previous 4 s period.
-            keyframe_interval: if cfg!(target_os = "windows") {
-                240
-            } else {
-                encode::KEYFRAME_INTERVAL_ON_DEMAND
-            },
+        Self::start_encoder(
+            &self.config,
+            capture.as_mut(),
+            encoder.as_mut(),
             preferred_hw,
             force_ffmpeg,
-            d3d11_device,
-            d3d11_context,
-            yuv444,
-            colorspace: self.config.colorspace,
-        })?;
-        let encoder_info = encoder.encoder_info();
-        // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the
-        // capture backend read frames back (once per new frame).
-        capture.set_dmabuf_passthrough(encoder_info.hw_type == HwAccelType::Vaapi);
-        let gpu_name = encode::describe_encoder_gpu(encoder_info.hw_type, d3d11_device);
-        log::info!(
-            "Encoder initialized: {} ({}) on {} chroma={}",
-            encoder_info.name,
-            encoder_info.hw_type,
-            gpu_name.as_deref().unwrap_or("unknown GPU"),
-            if yuv444 { "4:4:4" } else { "4:2:0" }
-        );
-        let _ = self
-            .event_tx
-            .send(MediaEvent::EncoderStarted {
-                encoder: encoder_info,
-                gpu_name,
-                requested_encoder,
-            })
-            .await;
+            &requested_encoder,
+            &self.event_tx,
+        )
+        .await?;
 
         // 4. Start audio on a separate blocking task (cpal is !Send for Stream)
         let mut audio_config = AudioCaptureConfig::default();
@@ -450,6 +382,7 @@ impl MediaPipeline {
         let mut last_sent_time = Instant::now() - Duration::from_secs(5);
         let mut keyframe_requested = true; // Force first frame immediately
         let mut last_frame: Option<crate::capture::CapturedFrame> = None;
+        let mut log_size_after_reinit = false;
         let mut metrics_started = Instant::now();
         let mut metrics_ticks: u64 = 0;
         let mut metrics_new_captures: u64 = 0;
@@ -466,6 +399,116 @@ impl MediaPipeline {
                 _ = frame_ticker.tick() => {
                     metrics_ticks += 1;
                     let frame_result = capture.next_frame().await;
+                    if matches!(frame_result, Err(MediaError::CaptureReinit)) {
+                        // Port of Sunshine's handling of `capture_e::reinit`
+                        // (video.cpp:1752-1810; encode session rebuilt on the new
+                        // display: video.cpp:2847-2853 / 2931-2975).
+                        log::info!("Capture re-initialisation started: rebuilding display and encoder session");
+                        // The encoder holds raw pointers to the capture's D3D11
+                        // device, so it goes first (Sunshine waits until nothing
+                        // references the display any more, video.cpp:1759-1775).
+                        encoder.shutdown();
+                        // disp.reset() (video.cpp:1794)
+                        capture.stop().await.ok();
+                        // The last frame references the old device's texture.
+                        last_frame = None;
+
+                        // `while (capture_ctx_queue->running())` (video.cpp:1793)
+                        // around `reset_display` (video.cpp:1491-1503: two
+                        // attempts, 200 ms sleep after a failed one; the sleep is
+                        // inside `attempt`). Adaptation: every await point is
+                        // raced against the command channel so that Stop (and the
+                        // other commands) are still served while the display
+                        // cannot be created.
+                        let start_config = self.config.clone();
+                        let mut stop_requested = false;
+                        let mut restarted = false;
+                        'rounds: loop {
+                            for _ in 0..2 {
+                                let attempt = async {
+                                    match capture.start(&capture_display_id, &start_config).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            log::warn!("Display re-initialisation attempt failed: {e}");
+                                            // "The capture code depends on us to sleep between failures"
+                                            tokio::time::sleep(Duration::from_millis(200)).await;
+                                            false
+                                        }
+                                    }
+                                };
+                                tokio::pin!(attempt);
+                                let started = loop {
+                                    tokio::select! {
+                                        ok = &mut attempt => break ok,
+                                        Some(cmd) = self.command_rx.recv() => match cmd {
+                                            PipelineCommand::Stop => {
+                                                log::info!("Stop command received");
+                                                stop_requested = true;
+                                                break false;
+                                            }
+                                            // No encoder exists right now: the new
+                                            // one starts with an IDR and with the
+                                            // parameters stored here.
+                                            PipelineCommand::RequestKeyframe => {}
+                                            PipelineCommand::SetBitrate(kbps) => {
+                                                self.config.bitrate_kbps = kbps;
+                                            }
+                                            PipelineCommand::SetFps(new_fps) => {
+                                                self.config.fps = new_fps.clamp(1, 240);
+                                            }
+                                        },
+                                    }
+                                };
+                                if stop_requested {
+                                    break 'rounds;
+                                }
+                                if started {
+                                    restarted = true;
+                                    break 'rounds;
+                                }
+                            }
+                        }
+                        if stop_requested {
+                            break;
+                        }
+                        debug_assert!(restarted);
+
+                        // New encoder session on the new capture device.
+                        match encode::create_encoder() {
+                            Ok(new_encoder) => encoder = new_encoder,
+                            Err(e) => {
+                                log::error!("Capture re-initialisation: cannot create encoder: {}", e);
+                                let _ = self.event_tx.try_send(MediaEvent::Error(e.to_string()));
+                                break;
+                            }
+                        }
+                        if let Err(e) = Self::start_encoder(
+                            &self.config,
+                            capture.as_mut(),
+                            encoder.as_mut(),
+                            preferred_hw,
+                            force_ffmpeg,
+                            &requested_encoder,
+                            &self.event_tx,
+                        )
+                        .await
+                        {
+                            log::error!("Capture re-initialisation: cannot start encoder: {}", e);
+                            let _ = self.event_tx.try_send(MediaEvent::Error(e.to_string()));
+                            break;
+                        }
+                        // A new session starts with an IDR frame.
+                        encoder.request_keyframe();
+                        keyframe_requested = true;
+                        last_sent_time = Instant::now() - Duration::from_secs(5);
+                        // SetFps may have arrived meanwhile.
+                        target_interval = Duration::from_nanos(1_000_000_000 / self.config.fps as u64);
+                        frame_ticker = tokio::time::interval(tick_interval(target_interval));
+                        frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        log_size_after_reinit = true;
+                        log::info!("Capture re-initialisation completed: capture and encoder session rebuilt");
+                        continue;
+                    }
                     // Backpressure: skip encode if downstream is congested.
                     // This prevents unbounded queue growth and keeps latency low.
                     let queue_len = event_capacity - self.event_tx.capacity();
@@ -491,6 +534,16 @@ impl MediaPipeline {
                             }
 
                             if !is_empty {
+                                if log_size_after_reinit {
+                                    log_size_after_reinit = false;
+                                    log::info!(
+                                        "Capture re-initialised: capture size {}x{} (stream {}x{})",
+                                        captured.width,
+                                        captured.height,
+                                        self.config.width,
+                                        self.config.height
+                                    );
+                                }
                                 last_frame = Some(captured);
                             }
 
@@ -684,6 +737,102 @@ impl MediaPipeline {
         );
 
         let _ = self.event_tx.send(MediaEvent::Stopped).await;
+        Ok(())
+    }
+
+    /// Build the encoder session on the running capture and report it.
+    ///
+    /// Used at start-up and after a capture re-initialisation (Sunshine builds
+    /// the encode session again with `make_encode_device` on the new display,
+    /// video.cpp:2947-2951): takes the D3D11 device of the capture backend
+    /// (Windows), initialises the encoder with the stream's parameters and
+    /// emits [`MediaEvent::EncoderStarted`].
+    async fn start_encoder(
+        stream: &StreamConfig,
+        capture: &mut dyn capture::ScreenCapture,
+        encoder: &mut dyn encode::VideoEncoder,
+        preferred_hw: Option<HwAccelType>,
+        force_ffmpeg: bool,
+        requested_encoder: &Option<String>,
+        event_tx: &mpsc::Sender<MediaEvent>,
+    ) -> Result<(), MediaError> {
+        let (d3d11_device, d3d11_context) = if cfg!(target_os = "windows") {
+            if let Some((device, context)) = capture.get_d3d11_device() {
+                log::info!(
+                    "Retrieved shared D3D11 device from capture backend (device={:#x}, context={:#x})",
+                    device,
+                    context
+                );
+                (Some(device), Some(context))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Zero-copy: a DMA-BUF from the display GPU can only be consumed
+        // without a copy by VAAPI on that same GPU. In "auto" mode prefer it
+        // (other encoders remain as fallbacks via EGL readback).
+        // 4:4:4 needs NVENC (or the software encoder); VAAPI on AMD/Intel and
+        // QSV only encode 4:2:0, so don't steer towards them.
+        let yuv444 = stream.yuv444 && stream.codec == VideoCodec::H264;
+        if stream.yuv444 && !yuv444 {
+            log::warn!("YUV 4:4:4 is only supported with H.264; encoding 4:2:0");
+        }
+        let preferred_hw = if yuv444 && preferred_hw.is_none() {
+            log::info!("YUV 4:4:4 requested — preferring NVENC (falls back to software)");
+            Some(HwAccelType::Nvenc)
+        } else if preferred_hw.is_none() && capture.delivers_dmabuf() {
+            log::info!("Capture delivers DMA-BUF frames — preferring VAAPI for zero-copy encode");
+            Some(HwAccelType::Vaapi)
+        } else {
+            preferred_hw
+        };
+
+        encoder.initialize(&EncoderConfig {
+            codec: stream.codec,
+            width: stream.width,
+            height: stream.height,
+            fps: stream.fps,
+            bitrate_kbps: stream.bitrate_kbps,
+            low_latency: true,
+            // FFmpeg (Linux/macOS): no periodic IDR, like Sunshine — every
+            // periodic IDR caused a visible quality "pulse" (measured: frame
+            // error 0.5 → 15 for ~20 frames every 4 s). Keyframes are still
+            // produced on demand (PLI on join / packet loss).
+            // Native Windows encoders keep the previous 4 s period.
+            keyframe_interval: if cfg!(target_os = "windows") {
+                240
+            } else {
+                encode::KEYFRAME_INTERVAL_ON_DEMAND
+            },
+            preferred_hw,
+            force_ffmpeg,
+            d3d11_device,
+            d3d11_context,
+            yuv444,
+            colorspace: stream.colorspace,
+        })?;
+        let encoder_info = encoder.encoder_info();
+        // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the
+        // capture backend read frames back (once per new frame).
+        capture.set_dmabuf_passthrough(encoder_info.hw_type == HwAccelType::Vaapi);
+        let gpu_name = encode::describe_encoder_gpu(encoder_info.hw_type, d3d11_device);
+        log::info!(
+            "Encoder initialized: {} ({}) on {} chroma={}",
+            encoder_info.name,
+            encoder_info.hw_type,
+            gpu_name.as_deref().unwrap_or("unknown GPU"),
+            if yuv444 { "4:4:4" } else { "4:2:0" }
+        );
+        let _ = event_tx
+            .send(MediaEvent::EncoderStarted {
+                encoder: encoder_info,
+                gpu_name,
+                requested_encoder: requested_encoder.clone(),
+            })
+            .await;
         Ok(())
     }
 
