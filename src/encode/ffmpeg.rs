@@ -35,6 +35,8 @@ use std::sync::Once;
 
 use ffmpeg_next::sys as ffi;
 
+use crate::encode::sunshine_tables;
+
 #[cfg(target_os = "windows")]
 const SWS_FAST_BILINEAR: libc::c_int = ffi::SwsFlags::SWS_FAST_BILINEAR as libc::c_int;
 
@@ -249,6 +251,15 @@ fn hw_pix_fmt(hw_type: HwAccelType) -> ffi::AVPixelFormat {
 /// software-only.
 fn is_hw_encoder(hw_type: HwAccelType) -> bool {
     !matches!(hw_type, HwAccelType::Software)
+}
+
+/// `config.videoFormat` of Sunshine: 0 H.264, 1 HEVC, 2 AV1 (video.cpp:2061-2082).
+fn sunshine_video_format(codec: VideoCodec) -> i32 {
+    match codec {
+        VideoCodec::H264 => 0,
+        VideoCodec::H265 => 1,
+        VideoCodec::AV1 => 2,
+    }
 }
 
 fn software_av1_threads() -> usize {
@@ -773,6 +784,182 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         log::info!("YUV 4:4:4 enabled ({:?}, H.264 High 4:4:4)", hw_type);
     }
 
+    /// `SessionParams` of the AMF session (Sunshine `config_t`, video.h:36-49).
+    fn sunshine_session_params(config: &EncoderConfig) -> sunshine_tables::SessionParams {
+        sunshine_tables::SessionParams {
+            width: config.width as i32,
+            height: config.height as i32,
+            framerate: config.fps as i32,
+            // Sunshine's config.bitrate is in kbps too (video.cpp:2247 multiplies by 1000).
+            bitrate: config.bitrate_kbps as i32,
+            // Deviation 2 (Lunaris): Lunaris clients do not send GameStream's
+            // videoEncoderSlicesPerFrame. Sunshine's rtsp.cpp:1150 reads it with
+            // `args.at(...)` and has no `try_emplace` default for it (the defaults
+            // are at rtsp.cpp:1077-1091), so 1 (the fewest slices) is Lunaris's choice.
+            slices_per_frame: 1,
+            num_ref_frames: 0, // not requested
+            video_format: sunshine_video_format(config.codec),
+            dynamic_range: 0,
+            chroma_sampling_type: if config.yuv444 { 1 } else { 0 },
+        }
+    }
+
+    /// `config::video.amd.amd_coder` as used for the profile and the `coder` option.
+    ///
+    /// Deviation 1 (Lunaris, WebRTC): for H.264 4:2:0 the coder is CAVLC, so
+    /// `select_h264_profile` (video.cpp:157-159) returns Constrained Baseline.
+    /// The agent's SDP offers `profile-level-id=42002a` (Constrained Baseline);
+    /// High needs an SDP change, which is a later step of Phase 3. 4:4:4 keeps
+    /// Sunshine's rule (High 4:4:4, video.cpp:153-155) and the table's coder default.
+    fn sunshine_amd_coder(config: &EncoderConfig) -> (i32, bool) {
+        if config.codec == VideoCodec::H264 && !config.yuv444 {
+            (sunshine_tables::AMF_CODER_CAVLC, true)
+        } else {
+            let default = match sunshine_tables::config_default(sunshine_tables::ConfigKey::AmdCoder) {
+                Some(sunshine_tables::ConfigDefault::Int(v)) => v as i32,
+                _ => 0,
+            };
+            (default, false)
+        }
+    }
+
+    /// Port of the `AVCodecContext` setup of `make_avcodec_encode_session`
+    /// (Sunshine video.cpp:2046-2305) for the encoders configured from a
+    /// Sunshine table (currently AMF), steps before the options. The fields
+    /// that Lunaris sets elsewhere (size, time base, colour tags, pixel format,
+    /// hw contexts) are not touched.
+    fn apply_sunshine_context(codec_ctx: *mut ffi::AVCodecContext, config: &EncoderConfig) {
+        use sunshine_tables as st;
+        let def = &st::AMDVCE;
+        let params = Self::sunshine_session_params(config);
+        let (amd_coder, _) = Self::sunshine_amd_coder(config);
+        let format = def.codec_from_video_format(params.video_format);
+
+        // SAFETY: codec_ctx is a valid, not yet opened context.
+        unsafe {
+            // video.cpp:2061-2082 (profile switch).
+            match st::profile(
+                params.video_format,
+                params.dynamic_range,
+                params.chroma_sampling_type,
+                format.name,
+                amd_coder,
+            ) {
+                st::Profile::H264High444Predictive => (*codec_ctx).profile = ffi::AV_PROFILE_H264_HIGH_444_PREDICTIVE,
+                st::Profile::H264ConstrainedBaseline => (*codec_ctx).profile = ffi::AV_PROFILE_H264_CONSTRAINED_BASELINE,
+                st::Profile::H264High => (*codec_ctx).profile = ffi::AV_PROFILE_H264_HIGH,
+                st::Profile::HevcRext => (*codec_ctx).profile = ffi::AV_PROFILE_HEVC_REXT,
+                st::Profile::HevcMain10 => (*codec_ctx).profile = ffi::AV_PROFILE_HEVC_MAIN_10,
+                st::Profile::HevcMain => (*codec_ctx).profile = ffi::AV_PROFILE_HEVC_MAIN,
+                st::Profile::Av1High => (*codec_ctx).profile = ffi::AV_PROFILE_AV1_HIGH,
+                st::Profile::Av1Main => (*codec_ctx).profile = ffi::AV_PROFILE_AV1_MAIN,
+                st::Profile::Unset => {}
+            }
+
+            // video.cpp:2085.
+            (*codec_ctx).max_b_frames = st::MAX_B_FRAMES;
+
+            // video.cpp:2087-2098.
+            let (gop_size, keyint_min) = st::gop(def.flags);
+            (*codec_ctx).gop_size = gop_size;
+            (*codec_ctx).keyint_min = keyint_min;
+
+            // video.cpp:2109-2113 (flags reset, then CLOSED_GOP | LOW_DELAY; flags2 FAST).
+            (*codec_ctx).flags = 0;
+            let cf = st::CONTEXT_FLAGS;
+            if cf.closed_gop {
+                (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_CLOSED_GOP as libc::c_int;
+            }
+            if cf.low_delay {
+                (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as libc::c_int;
+            }
+            if cf.flag2_fast {
+                (*codec_ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST;
+            }
+
+            // video.cpp:2178-2193 (hardware branch of the slices, then thread setup).
+            let sl = st::slices(def.flags, def.is_hardware(), params.slices_per_frame, st::DEFAULT_MIN_THREADS);
+            (*codec_ctx).slices = sl.slices;
+            if sl.thread_type_slice {
+                (*codec_ctx).thread_type = ffi::FF_THREAD_SLICE;
+            }
+            (*codec_ctx).thread_count = sl.thread_count;
+
+            // video.cpp:2247-2279.
+            let rc = st::rate_control(
+                def.flags,
+                def.name,
+                def.is_hardware(),
+                sl.slices,
+                &params,
+                st::DEFAULT_MAX_BITRATE,
+                st::DEFAULT_NV_LEGACY_VBV_PERCENTAGE_INCREASE,
+            );
+            (*codec_ctx).rc_max_rate = rc.rc_max_rate;
+            (*codec_ctx).bit_rate = rc.bit_rate;
+            if let Some(min) = rc.rc_min_rate {
+                (*codec_ctx).rc_min_rate = min;
+            }
+            if rc.compliance_unofficial {
+                (*codec_ctx).strict_std_compliance = ffi::FF_COMPLIANCE_UNOFFICIAL;
+            }
+            if let Some(size) = rc.rc_buffer_size {
+                (*codec_ctx).rc_buffer_size = size as libc::c_int;
+            }
+        }
+    }
+
+    /// The option list of `make_avcodec_encode_session` (video.cpp:2196-2245)
+    /// for the AMF encoders, applied in order with `av_opt_set` on `priv_data`
+    /// before `avcodec_open2` (Sunshine hands the same list to `avcodec_open2`
+    /// as an AVDictionary, which applies it with `av_opt_set` to the same
+    /// private data). An option that is rejected is logged and skipped.
+    fn apply_sunshine_options(codec_ctx: *mut ffi::AVCodecContext, config: &EncoderConfig, retry: bool) {
+        use sunshine_tables as st;
+        let params = Self::sunshine_session_params(config);
+        let (amd_coder, override_coder) = Self::sunshine_amd_coder(config);
+        let format = st::AMDVCE.codec_from_video_format(params.video_format);
+        for (name, value) in Self::sunshine_option_list(&params, amd_coder, override_coder, retry) {
+            let ckey = CString::new(name).unwrap();
+            let cval = CString::new(value.clone()).unwrap();
+            // SAFETY: codec_ctx is valid and not yet opened.
+            let ret = unsafe { ffi::av_opt_set((*codec_ctx).priv_data, ckey.as_ptr(), cval.as_ptr(), 0) };
+            if ret < 0 {
+                log::warn!("av_opt_set({}, {}) failed: {} (non-fatal)", name, value, ret);
+            } else {
+                log::debug!("av_opt_set({}, {})", name, value);
+            }
+        }
+        log::info!("Applied Sunshine {} options (retry={})", format.name, retry);
+    }
+
+    /// `options_for` resolved to decimal/string values. With `override_coder`
+    /// the `coder` option takes `amd_coder` (Deviation 1, see
+    /// [`Self::sunshine_amd_coder`]) instead of the table's config default.
+    fn sunshine_option_list(
+        params: &sunshine_tables::SessionParams,
+        amd_coder: i32,
+        override_coder: bool,
+        retry: bool,
+    ) -> Vec<(&'static str, String)> {
+        use sunshine_tables as st;
+        let format = st::AMDVCE.codec_from_video_format(params.video_format);
+        st::options_for(format, params, retry)
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    st::ConfigDefault::Int(v) => v.to_string(),
+                    st::ConfigDefault::Str(s) => s.to_string(),
+                };
+                if override_coder && name == "coder" {
+                    (name, amd_coder.to_string())
+                } else {
+                    (name, value)
+                }
+            })
+            .collect()
+    }
+
     /// Set encoder-specific private options via `av_opt_set`.
     ///
     /// This applies tuning parameters that differ per encoder backend.
@@ -799,11 +986,15 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
         };
 
-        if codec == VideoCodec::H264 || codec == VideoCodec::H265 {
-            opt_set("repeat-headers", "1");
-        }
-        if codec == VideoCodec::H265 {
-            opt_set("annexb", "1");
+        // AMF is configured by `apply_sunshine_options`, never through here;
+        // `repeat-headers` / `annexb` are not AMF options.
+        if hw_type != HwAccelType::Amf {
+            if codec == VideoCodec::H264 || codec == VideoCodec::H265 {
+                opt_set("repeat-headers", "1");
+            }
+            if codec == VideoCodec::H265 {
+                opt_set("annexb", "1");
+            }
         }
 
         match hw_type {
@@ -867,23 +1058,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 }
                 log::info!("Applied QSV encoder options");
             }
-            HwAccelType::Amf => {
-                opt_set("usage", "ultralowlatency");
-                opt_set("rc", "cbr");
-                opt_set("forced_idr", "1");
-                opt_set("header_insertion_mode", "idr");
-                if codec == VideoCodec::H264 {
-                    // constrained_baseline matches SDP profile-level-id=42e033
-                    // AMF encoder: CAVLC entropy coding for CBP compatibility
-                    opt_set("profile", "constrained_baseline");
-                    opt_set("level", "3.1");
-                } else if codec == VideoCodec::H265 {
-                    opt_set("profile", "main");
-                } else if codec == VideoCodec::AV1 {
-                    opt_set("profile", "main");
-                }
-                log::info!("Applied AMF encoder options (forced_idr=1)");
-            }
+            // AMF: see `apply_sunshine_options`.
+            HwAccelType::Amf => {}
             HwAccelType::VideoToolbox => {
                 opt_set("realtime", "1");
                 if codec == VideoCodec::H264 {
@@ -1079,6 +1255,47 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
         hw_type: HwAccelType,
         vaapi_cqp: Option<u32>,
     ) -> Result<(), MediaError> {
+        let mut open_failed = false;
+        let result =
+            self.try_initialize_encoder_once(config, encoder_name, hw_type, vaapi_cqp, false, &mut open_failed);
+        // Port of the retry of make_avcodec_encode_session (Sunshine
+        // video.cpp:2052, 2283-2297): when `avcodec_open2` fails and the
+        // codec has fallback options, everything is built again (a fresh
+        // AVCodecContext) and opened once more with the fallback options.
+        if result.is_err() && open_failed && hw_type == HwAccelType::Amf {
+            let format = sunshine_tables::AMDVCE.codec_from_video_format(sunshine_video_format(config.codec));
+            if !format.fallback.is_empty() {
+                log::info!(
+                    "Retrying with fallback configuration options for [{}] after error: {:?}",
+                    format.name,
+                    result.as_ref().err()
+                );
+                let mut open_failed = false;
+                return self.try_initialize_encoder_once(
+                    config,
+                    encoder_name,
+                    hw_type,
+                    vaapi_cqp,
+                    true,
+                    &mut open_failed,
+                );
+            }
+        }
+        result
+    }
+
+    /// One attempt of [`Self::try_initialize_encoder`]. `retry` is Sunshine's
+    /// `retries > 0` (video.cpp:2241); `open_failed` is set when the attempt
+    /// failed in `avcodec_open2`.
+    fn try_initialize_encoder_once(
+        &mut self,
+        config: &EncoderConfig,
+        encoder_name: &str,
+        hw_type: HwAccelType,
+        vaapi_cqp: Option<u32>,
+        retry: bool,
+        open_failed: &mut bool,
+    ) -> Result<(), MediaError> {
         // Step 2: Find the FFmpeg encoder by name.
         let cname = CString::new(encoder_name).unwrap();
         let codec = unsafe { ffi::avcodec_find_encoder_by_name(cname.as_ptr()) };
@@ -1155,7 +1372,8 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                 1
             };
 
-            if config.codec == VideoCodec::H264 {
+            // AMF is configured from Sunshine's table below, which sets no level.
+            if config.codec == VideoCodec::H264 && hw_type != HwAccelType::Amf {
                 // 4:4:4 is negotiated as profile-level-id=f4002a (Level 4.2).
                 (*codec_ctx).level = if config.yuv444 { 42 } else { 31 }; // 4:2:0: SDP 42001f (Level 3.1)
             }
@@ -1185,6 +1403,12 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             if config.low_latency {
                 (*codec_ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as libc::c_int;
             }
+        }
+
+        // Encoders configured from a Sunshine table (video.cpp:2046-2305) take
+        // this path; the others keep the code above and below unchanged.
+        if hw_type == HwAccelType::Amf {
+            Self::apply_sunshine_context(codec_ctx, config);
         }
 
         let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -1368,13 +1592,18 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
         }
 
-        Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency, vaapi_cqp);
+        if hw_type == HwAccelType::Amf {
+            Self::apply_sunshine_options(codec_ctx, config, retry);
+        } else {
+            Self::set_encoder_options(codec_ctx, encoder_name, hw_type, config.codec, config.low_latency, vaapi_cqp);
+        }
         if config.yuv444 && config.codec == VideoCodec::H264 {
             Self::apply_yuv444_options(codec_ctx, hw_type);
         }
 
         let ret = unsafe { ffi::avcodec_open2(codec_ctx, codec, ptr::null_mut()) };
         if ret < 0 {
+            *open_failed = true;
             log::error!(
                 "avcodec_open2 failed for '{}': {} (e.g. NVENC session limit)",
                 encoder_name,
