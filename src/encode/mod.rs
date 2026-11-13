@@ -11,6 +11,7 @@
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod ffmpeg;
+pub mod sunshine_tables;
 #[cfg(target_os = "linux")]
 pub mod vaapi_dmabuf;
 #[cfg(target_os = "windows")]
