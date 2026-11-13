@@ -252,6 +252,34 @@ impl VideoEncoder for WindowsAutoEncoder {
         }
 
         if Self::should_try_native_amf(config) {
+            // AMD goes through FFmpeg's AMF encoders on D3D11 frames, as in
+            // Sunshine (`amdvce`, video.cpp:983-1092). The hand-written AMF
+            // encoder below stays for one release as the fallback for H.264
+            // (it cannot create HEVC or AV1).
+            let ffmpeg_config = EncoderConfig {
+                preferred_hw: Some(HwAccelType::Amf),
+                ..config.clone()
+            };
+            match ffmpeg::FfmpegEncoder::new().and_then(|mut encoder| {
+                encoder.initialize(&ffmpeg_config)?;
+                Ok(encoder)
+            }) {
+                Ok(encoder) if encoder.encoder_info().hw_type == HwAccelType::Amf => {
+                    log::info!("Selected FFmpeg AMF encoder ({})", encoder.encoder_info().name);
+                    self.backend = Some(WindowsEncoderBackend::Ffmpeg(encoder));
+                    return Ok(());
+                }
+                Ok(mut encoder) => {
+                    log::warn!(
+                        "FFmpeg picked {} instead of AMF; trying the native AMF encoder",
+                        encoder.encoder_info().name
+                    );
+                    encoder.shutdown();
+                }
+                Err(err) => {
+                    log::warn!("FFmpeg AMF initialization failed: {}", err);
+                }
+            }
             match windows_amf::WindowsAmfEncoder::new().and_then(|mut encoder| {
                 encoder.initialize(config)?;
                 Ok(encoder)
