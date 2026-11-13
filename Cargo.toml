@@ -28,6 +28,8 @@ evdev = "0.11"
 libloading = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# FFmpeg raw FFI for hardware contexts
+ffmpeg-next = "8"
 windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

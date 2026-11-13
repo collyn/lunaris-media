@@ -9,7 +9,7 @@
 //! platform, or [`list_available_encoders`] to enumerate all detected hardware
 //! encoders.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod ffmpeg;
 #[cfg(target_os = "linux")]
 pub mod vaapi_dmabuf;
@@ -134,6 +134,7 @@ enum WindowsEncoderBackend {
     NativeNvenc(windows_nvenc::WindowsNvencEncoder),
     NativeAmf(windows_amf::WindowsAmfEncoder),
     NativeQsv(windows_qsv::WindowsQsvEncoder),
+    Ffmpeg(ffmpeg::FfmpegEncoder),
 }
 
 #[cfg(target_os = "windows")]
@@ -224,9 +225,13 @@ impl WindowsAutoEncoder {
 impl VideoEncoder for WindowsAutoEncoder {
     fn initialize(&mut self, config: &EncoderConfig) -> Result<(), MediaError> {
         if config.force_ffmpeg {
-            return Err(MediaError::EncoderInitFailed(
-                "FFmpeg backend is not compiled on Windows; select native_nvenc_d3d11, native_amf_d3d11, gpu, or auto".into(),
-            ));
+            log::info!(
+                "FFmpeg encoder backend explicitly requested; skipping native Windows encoders"
+            );
+            let mut encoder = ffmpeg::FfmpegEncoder::new()?;
+            encoder.initialize(config)?;
+            self.backend = Some(WindowsEncoderBackend::Ffmpeg(encoder));
+            return Ok(());
         }
 
         if Self::should_try_native_nvenc(config) {
@@ -305,6 +310,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encode(buffer, pts_us),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.encode(buffer, pts_us),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.encode(buffer, pts_us),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encode(buffer, pts_us),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -314,6 +320,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.request_keyframe(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.request_keyframe(),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.request_keyframe(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.request_keyframe(),
             None => {}
         }
     }
@@ -323,6 +330,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_bitrate(bitrate_kbps),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_bitrate(bitrate_kbps),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.set_bitrate(bitrate_kbps),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_bitrate(bitrate_kbps),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -332,6 +340,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.set_fps(fps),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.set_fps(fps),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.set_fps(fps),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.set_fps(fps),
             None => Err(MediaError::EncoderNotInitialized),
         }
     }
@@ -341,6 +350,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.encoder_info(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.encoder_info(),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.encoder_info(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.encoder_info(),
             None => EncoderInfo {
                 name: "uninitialized".to_string(),
                 hw_type: HwAccelType::Software,
@@ -354,6 +364,7 @@ impl VideoEncoder for WindowsAutoEncoder {
             Some(WindowsEncoderBackend::NativeNvenc(encoder)) => encoder.flush(),
             Some(WindowsEncoderBackend::NativeAmf(encoder)) => encoder.flush(),
             Some(WindowsEncoderBackend::NativeQsv(encoder)) => encoder.flush(),
+            Some(WindowsEncoderBackend::Ffmpeg(encoder)) => encoder.flush(),
             None => Ok(vec![]),
         }
     }
@@ -364,6 +375,7 @@ impl VideoEncoder for WindowsAutoEncoder {
                 WindowsEncoderBackend::NativeNvenc(encoder) => encoder.shutdown(),
                 WindowsEncoderBackend::NativeAmf(encoder) => encoder.shutdown(),
                 WindowsEncoderBackend::NativeQsv(encoder) => encoder.shutdown(),
+                WindowsEncoderBackend::Ffmpeg(encoder) => encoder.shutdown(),
             }
         }
         self.backend = None;

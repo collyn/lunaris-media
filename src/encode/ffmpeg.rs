@@ -3172,7 +3172,6 @@ impl VideoEncoder for FfmpegEncoder {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl FfmpegEncoder {
     /// Stamp, send and drain one frame (shared tail of all encode paths).
     fn submit_frame(
