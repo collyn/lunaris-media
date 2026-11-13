@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
+use crate::colorspace::{codec_colorspace, Colorspace, StreamColorspace};
 use crate::error::MediaError;
 
 type VADisplay = *mut libc::c_void;
@@ -49,11 +50,17 @@ const VA_FOURCC_BGRA: u32 = 0x4152_4742;
 const VA_FOURCC_RGBX: u32 = 0x5842_4752;
 const VA_FOURCC_RGBA: u32 = 0x4142_4752;
 
+/// `VAProcColorStandardBT601` (va_vpp.h:319, enum `_VAProcColorStandardType`).
+const VA_PROC_COLOR_STANDARD_BT601: u32 = 1;
+/// `VAProcColorStandardBT709` (va_vpp.h:327).
 const VA_PROC_COLOR_STANDARD_BT709: u32 = 2;
+/// `VAProcColorStandardBT2020` (va_vpp.h:404).
+const VA_PROC_COLOR_STANDARD_BT2020: u32 = 12;
+/// `VA_SOURCE_RANGE_REDUCED` (va_vpp.h:560).
+const VA_SOURCE_RANGE_REDUCED: u8 = 1;
+/// `VA_SOURCE_RANGE_FULL` (va_vpp.h:561).
 const VA_SOURCE_RANGE_FULL: u8 = 2;
-/// ISO/IEC 23001-8 code points used in `VAProcColorProperties`.
-const CICP_BT709: u8 = 1;
-/// Matrix coefficients 0 = identity (the data is RGB, not YCbCr).
+/// Matrix coefficients 0 = identity (the data is RGB, not YCbCr); ISO/IEC 23001-8.
 const CICP_IDENTITY: u8 = 0;
 
 /// Size of `VAProcPipelineParameterBuffer` (fixed by `VA_PADDING_LARGE`).
@@ -285,6 +292,8 @@ pub struct VaapiDmabufConverter {
     context: VAContextID,
     out_width: u32,
     out_height: u32,
+    /// Colourspace and range the NV12 output is converted to.
+    colorspace: StreamColorspace,
     surfaces: HashMap<SurfaceKey, VASurfaceID>,
 }
 
@@ -313,6 +322,7 @@ impl VaapiDmabufConverter {
         display: VADisplay,
         out_width: u32,
         out_height: u32,
+        colorspace: StreamColorspace,
     ) -> Result<Self, MediaError> {
         if display.is_null() {
             return Err(MediaError::EncodeError("VADisplay is null".into()));
@@ -359,6 +369,7 @@ impl VaapiDmabufConverter {
             context,
             out_width,
             out_height,
+            colorspace,
             surfaces: HashMap::new(),
         })
     }
@@ -493,28 +504,31 @@ impl VaapiDmabufConverter {
         // the transfer curve (sRGB → BT.709), lifting mid-tones (grey 128 was
         // encoded as ~136). So the input uses the same primaries/transfer as
         // the output, with the identity (RGB) matrix — what Sunshine does too.
-        put_u32(
-            &mut params,
-            PP_SURFACE_COLOR_STANDARD,
-            VA_PROC_COLOR_STANDARD_BT709,
-        );
+        let color_standard = match self.colorspace.colorspace {
+            Colorspace::Rec601 => VA_PROC_COLOR_STANDARD_BT601,
+            Colorspace::Rec709 => VA_PROC_COLOR_STANDARD_BT709,
+            Colorspace::Bt2020Sdr | Colorspace::Bt2020 => VA_PROC_COLOR_STANDARD_BT2020,
+        };
+        let codec = codec_colorspace(&self.colorspace);
+        let range = if codec.full_range {
+            VA_SOURCE_RANGE_FULL
+        } else {
+            VA_SOURCE_RANGE_REDUCED
+        };
+        put_u32(&mut params, PP_SURFACE_COLOR_STANDARD, color_standard);
         put_ptr(&mut params, PP_OUTPUT_REGION, &dst_rect);
         put_u32(&mut params, PP_OUTPUT_BACKGROUND_COLOR, 0xff00_0000);
-        put_u32(
-            &mut params,
-            PP_OUTPUT_COLOR_STANDARD,
-            VA_PROC_COLOR_STANDARD_BT709,
-        );
-        // Full range in and out, matching the colour description the encoder
-        // signals (AVCOL_RANGE_JPEG).
+        put_u32(&mut params, PP_OUTPUT_COLOR_STANDARD, color_standard);
+        // The input is full-range RGB; the output range and code points are
+        // the colour description the encoder signals (codec_colorspace).
         params[PP_INPUT_COLOR_PROPERTIES + CP_COLOR_RANGE] = VA_SOURCE_RANGE_FULL;
-        params[PP_INPUT_COLOR_PROPERTIES + CP_PRIMARIES] = CICP_BT709;
-        params[PP_INPUT_COLOR_PROPERTIES + CP_TRANSFER] = CICP_BT709;
+        params[PP_INPUT_COLOR_PROPERTIES + CP_PRIMARIES] = codec.primaries;
+        params[PP_INPUT_COLOR_PROPERTIES + CP_TRANSFER] = codec.transfer;
         params[PP_INPUT_COLOR_PROPERTIES + CP_MATRIX] = CICP_IDENTITY;
-        params[PP_OUTPUT_COLOR_PROPERTIES + CP_COLOR_RANGE] = VA_SOURCE_RANGE_FULL;
-        params[PP_OUTPUT_COLOR_PROPERTIES + CP_PRIMARIES] = CICP_BT709;
-        params[PP_OUTPUT_COLOR_PROPERTIES + CP_TRANSFER] = CICP_BT709;
-        params[PP_OUTPUT_COLOR_PROPERTIES + CP_MATRIX] = CICP_BT709;
+        params[PP_OUTPUT_COLOR_PROPERTIES + CP_COLOR_RANGE] = range;
+        params[PP_OUTPUT_COLOR_PROPERTIES + CP_PRIMARIES] = codec.primaries;
+        params[PP_OUTPUT_COLOR_PROPERTIES + CP_TRANSFER] = codec.transfer;
+        params[PP_OUTPUT_COLOR_PROPERTIES + CP_MATRIX] = codec.matrix;
 
         unsafe {
             let mut buffer: VABufferID = VA_INVALID_ID;

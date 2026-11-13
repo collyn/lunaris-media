@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         virtual_display: false,
         yuv444: args.iter().any(|a| a == "--yuv444"),
         microphone: false,
+        ..Default::default()
     };
 
     println!("╔══════════════════════════════════════════════════╗");

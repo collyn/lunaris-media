@@ -739,7 +739,8 @@ impl WindowsQsvEncoder {
             })?;
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .map_err(|e| MediaError::EncodeError(format!("CreateVideoProcessor failed: {e}")))?;
-        super::set_bt709_conversion(&video_context, &processor, false);
+        // The bitstream carries no colour description yet (Phase 3).
+        super::set_video_processor_colorspace(&video_context, &processor, &config.colorspace);
         self.video_device = Some(video_device);
         self.video_context = Some(video_context);
         self.video_enumerator = Some(enumerator);

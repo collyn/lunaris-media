@@ -62,6 +62,7 @@ use windows::core::Interface;
 const SWS_FAST_BILINEAR: libc::c_int = 1; // SWS_FAST_BILINEAR = 1 in all FFmpeg versions
 
 use crate::capture::gpu_buffer::GpuBuffer;
+use crate::colorspace::{codec_colorspace, software_format, SoftwareFormat, StreamColorspace};
 use crate::encode::{EncoderConfig, VideoEncoder};
 use crate::error::MediaError;
 use crate::types::*;
@@ -1109,14 +1110,16 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
             }
             (*codec_ctx).width = config.width as libc::c_int;
             (*codec_ctx).height = config.height as libc::c_int;
-            (*codec_ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-            (*codec_ctx).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
-                ffi::AVColorRange::AVCOL_RANGE_MPEG
-            } else {
+            // Port of Sunshine video.cpp:2115-2120.
+            let avcodec_colorspace = codec_colorspace(&config.colorspace);
+            (*codec_ctx).color_range = if avcodec_colorspace.full_range {
                 ffi::AVColorRange::AVCOL_RANGE_JPEG
+            } else {
+                ffi::AVColorRange::AVCOL_RANGE_MPEG
             };
-            (*codec_ctx).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-            (*codec_ctx).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            (*codec_ctx).color_primaries = av_color_primaries(avcodec_colorspace.primaries);
+            (*codec_ctx).color_trc = av_color_trc(avcodec_colorspace.transfer);
+            (*codec_ctx).colorspace = av_color_space(avcodec_colorspace.matrix);
             (*codec_ctx).time_base = ffi::AVRational {
                 num: 1,
                 den: config.fps as libc::c_int,
@@ -1511,6 +1514,70 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
 }
 
 /// Normalize encoder extradata to Annex-B parameter sets for prepending to IDR keyframes.
+/// H.273 colour primaries code point (from `codec_colorspace`) to the FFmpeg
+/// enumerator (`AVCOL_PRI_*`, values equal the code points).
+fn av_color_primaries(code: u8) -> ffi::AVColorPrimaries {
+    match code {
+        1 => ffi::AVColorPrimaries::AVCOL_PRI_BT709,
+        6 => ffi::AVColorPrimaries::AVCOL_PRI_SMPTE170M,
+        9 => ffi::AVColorPrimaries::AVCOL_PRI_BT2020,
+        _ => {
+            debug_assert!(false, "unexpected colour primaries code point {code}");
+            ffi::AVColorPrimaries::AVCOL_PRI_UNSPECIFIED
+        }
+    }
+}
+
+/// H.273 transfer characteristics code point to `AVCOL_TRC_*`.
+fn av_color_trc(code: u8) -> ffi::AVColorTransferCharacteristic {
+    match code {
+        1 => ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709,
+        6 => ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE170M,
+        14 => ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT2020_10,
+        16 => ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084,
+        _ => {
+            debug_assert!(false, "unexpected transfer characteristics code point {code}");
+            ffi::AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED
+        }
+    }
+}
+
+/// H.273 matrix coefficients code point to `AVCOL_SPC_*`.
+fn av_color_space(code: u8) -> ffi::AVColorSpace {
+    match code {
+        1 => ffi::AVColorSpace::AVCOL_SPC_BT709,
+        6 => ffi::AVColorSpace::AVCOL_SPC_SMPTE170M,
+        9 => ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL,
+        _ => {
+            debug_assert!(false, "unexpected matrix coefficients code point {code}");
+            ffi::AVColorSpace::AVCOL_SPC_UNSPECIFIED
+        }
+    }
+}
+
+/// Port of `avcodec_software_encode_device_t::apply_colorspace`
+/// (Sunshine video.cpp:318-321): source table default, srcRange 0, destination
+/// table from `software_format`, dstRange `range - 1` (1 full, 0 limited).
+fn apply_colorspace(sws_ctx: *mut ffi::SwsContext, colorspace: &StreamColorspace) {
+    let software_format = match software_format(colorspace) {
+        SoftwareFormat::Smpte170m => ffi::SWS_CS_SMPTE170M,
+        SoftwareFormat::Itu709 => ffi::SWS_CS_ITU709,
+        SoftwareFormat::Bt2020 => ffi::SWS_CS_BT2020,
+    };
+    unsafe {
+        ffi::sws_setColorspaceDetails(
+            sws_ctx,
+            ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT),
+            0,
+            ffi::sws_getCoefficients(software_format),
+            colorspace.full_range as libc::c_int,
+            0,
+            1 << 16,
+            1 << 16,
+        );
+    }
+}
+
 fn parameter_sets_to_annexb(extra: &[u8], codec: VideoCodec) -> Vec<u8> {
     match codec {
         VideoCodec::H264 => h264_avcc_extradata_to_annexb(extra),
@@ -2211,18 +2278,7 @@ impl VideoEncoder for FfmpegEncoder {
                                     (*context).Unmap(&dst_res, 0);
                                     return Err(MediaError::EncodeError("Failed to create SwsContext for BGRA→YUV/NV12".into()));
                                 }
-                                let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
-                                let table = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
-                                ffi::sws_setColorspaceDetails(
-                                    self.sws_ctx,
-                                    inv_table,
-                                    1, // srcRange = Full
-                                    table,
-                                    1,       // dstRange = Full
-                                    0,       // brightness
-                                    1 << 16, // contrast
-                                    1 << 16, // saturation
-                                );
+                                apply_colorspace(self.sws_ctx, &config.colorspace);
                             }
 
                             let src_data: [*const u8; 4] = [src_ptr, ptr::null(), ptr::null(), ptr::null()];
@@ -2360,8 +2416,8 @@ impl VideoEncoder for FfmpegEncoder {
                                 let processor = video_device.CreateVideoProcessor(&enumerator, 0).map_err(|e| {
                                     MediaError::EncodeError(format!("CreateVideoProcessor failed: {e}"))
                                 })?;
-                                // Hardware encoders are tagged BT.709 full range (codec_ctx).
-                                super::set_bt709_conversion(video_context, &processor, true);
+                                // Same colourspace as the codec context tags (codec_ctx).
+                                super::set_video_processor_colorspace(video_context, &processor, &config.colorspace);
                                 self.video_enumerator = Some(enumerator);
                                 self.video_processor = Some(processor);
                             }
@@ -2575,18 +2631,7 @@ impl VideoEncoder for FfmpegEncoder {
                             if self.sws_ctx.is_null() {
                                 return Err(MediaError::EncodeError("Failed to create SwsContext for CUDA software fallback".into()));
                             }
-                            let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
-                            let table = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
-                            ffi::sws_setColorspaceDetails(
-                                self.sws_ctx,
-                                inv_table,
-                                1, // RGB/BGRA source is full range.
-                                table,
-                                0,       // WebRTC decoders expect limited-range YUV by default.
-                                0,       // brightness
-                                1 << 16, // contrast
-                                1 << 16, // saturation
-                            );
+                            apply_colorspace(self.sws_ctx, &config.colorspace);
                             log::info!(
                                 "Created CUDA software fallback SwsContext {:?}->{:?} {}x{}",
                                 src_pix_fmt,
@@ -2870,21 +2915,15 @@ impl VideoEncoder for FfmpegEncoder {
                                         "Failed to create SwsContext for BGRA→NV12".into(),
                                     ));
                                 }
-                                unsafe {
-                                    let inv_table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT);
-                                    let table = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
-                                    ffi::sws_setColorspaceDetails(
-                                        self.sws_ctx,
-                                        inv_table,
-                                        1, // srcRange = Full
-                                        table,
-                                        1,       // dstRange = Full
-                                        0,       // brightness
-                                        1 << 16, // contrast
-                                        1 << 16, // saturation
-                                    );
-                                }
-                                log::info!("Created SIMD SwsContext for BGRA→{:?} {}x{} with BT.709 colorspace", sw_format, w, h);
+                                apply_colorspace(self.sws_ctx, &config.colorspace);
+                                log::info!(
+                                    "Created SIMD SwsContext for BGRA→{:?} {}x{} with {} colorspace ({} range)",
+                                    sw_format,
+                                    w,
+                                    h,
+                                    config.colorspace.colorspace.label(),
+                                    if config.colorspace.full_range { "full" } else { "limited" }
+                                );
                             }
 
                             let src_data: [*const u8; 4] =
@@ -3142,21 +3181,17 @@ impl FfmpegEncoder {
         pts_us: u64,
     ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
         let config = self.config.as_ref().unwrap();
-        let hw_type = self.info.as_ref().unwrap().hw_type;
         let codec = config.codec;
         let fps = config.fps;
 
         // Set PTS and colorspace characteristics.
         unsafe {
             (*send_frame).pts = self.frame_count as i64;
-            (*send_frame).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-            (*send_frame).color_range = if config.codec == VideoCodec::AV1 && hw_type == HwAccelType::Software {
-                ffi::AVColorRange::AVCOL_RANGE_MPEG
-            } else {
-                ffi::AVColorRange::AVCOL_RANGE_JPEG
-            };
-            (*send_frame).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-            (*send_frame).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            // Port of Sunshine video.cpp:2311-2314: copied from the codec context.
+            (*send_frame).color_range = (*self.codec_ctx).color_range;
+            (*send_frame).color_primaries = (*self.codec_ctx).color_primaries;
+            (*send_frame).color_trc = (*self.codec_ctx).color_trc;
+            (*send_frame).colorspace = (*self.codec_ctx).colorspace;
         }
 
         // Force keyframe if requested.
@@ -3282,9 +3317,9 @@ impl FfmpegEncoder {
         &mut self,
         frame: &super::vaapi_dmabuf::DmabufFrame,
     ) -> Result<(), MediaError> {
-        let (out_w, out_h) = {
+        let (out_w, out_h, colorspace) = {
             let c = self.config.as_ref().unwrap();
-            (c.width, c.height)
+            (c.width, c.height, c.colorspace)
         };
         if self.vaapi_dmabuf.is_none() {
             let display = unsafe {
@@ -3293,7 +3328,7 @@ impl FfmpegEncoder {
                 *((*device_ctx).hwctx as *mut *mut libc::c_void)
             };
             self.vaapi_dmabuf = Some(unsafe {
-                super::vaapi_dmabuf::VaapiDmabufConverter::new(display, out_w, out_h)?
+                super::vaapi_dmabuf::VaapiDmabufConverter::new(display, out_w, out_h, colorspace)?
             });
         }
 

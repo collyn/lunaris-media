@@ -303,6 +303,7 @@ impl MediaPipeline {
             d3d11_device,
             d3d11_context,
             yuv444,
+            colorspace: self.config.colorspace,
         })?;
         let encoder_info = encoder.encoder_info();
         // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the

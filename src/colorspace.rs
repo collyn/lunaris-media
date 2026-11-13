@@ -147,8 +147,8 @@ pub fn from_client_config(encoder_csc_mode: i32, dynamic_range: i32, hdr_display
 ///
 /// Port of `video::avcodec_colorspace_t` (video_colorspace.h:65-71) without
 /// `software_format`: that field is the swscale constant `SWS_CS_*` (reference
-/// lines 119, 127, 136, 145). It is omitted here because this crate has no
-/// swscale dependency; it is not replaced by anything else.
+/// lines 119, 127, 136, 145). The crate root has no swscale type, so it is
+/// exposed separately as [`SoftwareFormat`] / [`software_format`].
 ///
 /// `full_range` corresponds to the reference `range` field: `AVCOL_RANGE_JPEG`
 /// when true, `AVCOL_RANGE_MPEG` when false (reference line 149).
@@ -204,6 +204,28 @@ pub fn codec_colorspace(sunshine_colorspace: &StreamColorspace) -> CodecColorspa
         transfer,
         matrix,
         full_range: sunshine_colorspace.full_range,
+    }
+}
+
+/// swscale coefficient set (`avcodec_colorspace_t::software_format`,
+/// video_colorspace.cpp:119, 127, 136, 145).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftwareFormat {
+    /// `SWS_CS_SMPTE170M` (line 119).
+    Smpte170m,
+    /// `SWS_CS_ITU709` (line 127).
+    Itu709,
+    /// `SWS_CS_BT2020` (lines 136, 145).
+    Bt2020,
+}
+
+/// swscale coefficient set for a colourspace (`software_format`,
+/// video_colorspace.cpp:119, 127, 136, 145).
+pub fn software_format(cs: &StreamColorspace) -> SoftwareFormat {
+    match cs.colorspace {
+        Colorspace::Rec601 => SoftwareFormat::Smpte170m,
+        Colorspace::Rec709 => SoftwareFormat::Itu709,
+        Colorspace::Bt2020Sdr | Colorspace::Bt2020 => SoftwareFormat::Bt2020,
     }
 }
 
@@ -468,6 +490,14 @@ mod tests {
         assert_eq!(c, CodecColorspace { primaries: 9, transfer: 16, matrix: 9, full_range: false });
         let c = codec_colorspace(&sc(Colorspace::Bt2020, true, 10));
         assert_eq!(c, CodecColorspace { primaries: 9, transfer: 16, matrix: 9, full_range: true });
+    }
+
+    #[test]
+    fn software_format_mappings() {
+        assert_eq!(software_format(&sc(Colorspace::Rec601, false, 8)), SoftwareFormat::Smpte170m);
+        assert_eq!(software_format(&sc(Colorspace::Rec709, true, 8)), SoftwareFormat::Itu709);
+        assert_eq!(software_format(&sc(Colorspace::Bt2020Sdr, false, 10)), SoftwareFormat::Bt2020);
+        assert_eq!(software_format(&sc(Colorspace::Bt2020, true, 10)), SoftwareFormat::Bt2020);
     }
 
     // ---- color_vectors -------------------------------------------------------

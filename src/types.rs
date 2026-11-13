@@ -74,7 +74,17 @@ pub struct StreamConfig {
     pub yuv444: bool,
     /// Also record the computer's microphone, mixed into its sound.
     pub microphone: bool,
+    /// Colourspace, range and bit depth to convert to and to signal
+    /// (Sunshine `encode_device->colorspace`, video.cpp:2040).
+    pub colorspace: crate::colorspace::StreamColorspace,
 }
+
+/// `encoderCscMode` used when the client sends none: Rec. 709, limited range
+/// (bits 1.. = 1 → Rec. 709, bit 0 = 0 → limited; video_colorspace.cpp:59-82).
+/// Lunaris choice, not Sunshine's (its RTSP default is 0 = Rec. 601): clients
+/// that send nothing are browsers and Lunaris ≤ 0.3.2, and Rec. 709 limited is
+/// what they assume for an HD stream.
+pub const DEFAULT_ENCODER_CSC_MODE: i32 = 2;
 
 impl Default for StreamConfig {
     fn default() -> Self {
@@ -89,6 +99,7 @@ impl Default for StreamConfig {
             virtual_display: false,
             yuv444: false,
             microphone: false,
+            colorspace: crate::colorspace::from_client_config(DEFAULT_ENCODER_CSC_MODE, 0, false),
         }
     }
 }

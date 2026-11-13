@@ -56,6 +56,9 @@ pub struct EncoderConfig {
     /// Full-resolution chroma (YUV 4:4:4). H.264 only; supported by NVENC
     /// (`high444p`) and libx264 (`yuv444p`). Other backends are skipped.
     pub yuv444: bool,
+    /// Colourspace, range and bit depth to convert to and to signal
+    /// (Sunshine `encode_device->colorspace`, video.cpp:2040).
+    pub colorspace: crate::colorspace::StreamColorspace,
 }
 
 impl Default for EncoderConfig {
@@ -73,6 +76,11 @@ impl Default for EncoderConfig {
             d3d11_device: None,
             d3d11_context: None,
             yuv444: false,
+            colorspace: crate::colorspace::from_client_config(
+                crate::types::DEFAULT_ENCODER_CSC_MODE,
+                0,
+                false,
+            ),
         }
     }
 }
@@ -377,7 +385,7 @@ pub fn describe_d3d11_device(device_ptr: Option<usize>) -> Option<String> {
         let adapter = dxgi_device.GetAdapter().ok()?;
         let desc = adapter.GetDesc().ok()?;
         let name = String::from_utf16_lossy(&desc.Description)
-            .trim_end_matches(' ')
+            .trim_end_matches('\0')
             .trim()
             .to_string();
         if name.is_empty() {
@@ -699,28 +707,48 @@ pub fn list_available_encoders() -> Vec<EncoderInfo> {
 }
 
 /// Makes a D3D11 video processor convert the captured BGRA (full-range RGB)
-/// to BT.709 YCbCr, studio range (16-235) or full. Left alone it uses
-/// BT.601, while the streams are BT.709: untagged ones (the native AMF, NVENC
-/// and QSV encoders: studio range, as decoders assume) or tagged so (FFmpeg:
-/// full range). Colours came out shifted.
+/// to YCbCr in the stream's colourspace: `Rec601` selects the BT.601 matrix,
+/// `Rec709` the BT.709 one; `full_range` selects 0-255, otherwise 16-235.
+/// Left alone the processor uses BT.601, which shifted colours on BT.709
+/// streams.
+///
+/// The `D3D11_VIDEO_PROCESSOR_COLOR_SPACE` bit field cannot express BT.2020:
+/// `Bt2020Sdr` / `Bt2020` log an error and use the BT.709 matrix. They cannot
+/// occur before Phase 5 (they need 10-bit; `from_client_config` falls back
+/// otherwise).
 #[cfg(target_os = "windows")]
-pub(crate) fn set_bt709_conversion(
+pub(crate) fn set_video_processor_colorspace(
     context: &windows::Win32::Graphics::Direct3D11::ID3D11VideoContext,
     processor: &windows::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,
-    full_range: bool,
+    colorspace: &crate::colorspace::StreamColorspace,
 ) {
+    use crate::colorspace::Colorspace;
     use windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE;
     // Bits: Usage(1) RGB_Range(1) YCbCr_Matrix(1) YCbCr_xvYCC(1) Nominal_Range(2).
     const RGB_FULL: u32 = 0; // RGB_Range 0 = 0-255
+    const YCBCR_601: u32 = 0; // YCbCr_Matrix 0 = BT.601
     const YCBCR_709: u32 = 1 << 2; // YCbCr_Matrix 1 = BT.709
     const NOMINAL_16_235: u32 = 1 << 4; // D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235
     const NOMINAL_0_255: u32 = 2 << 4; // D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
+    let matrix = match colorspace.colorspace {
+        Colorspace::Rec601 => YCBCR_601,
+        Colorspace::Rec709 => YCBCR_709,
+        Colorspace::Bt2020Sdr | Colorspace::Bt2020 => {
+            // Phase 5: replaced by Sunshine's conversion shaders (Phase 4).
+            static BT2020_UNSUPPORTED: std::sync::Once = std::sync::Once::new();
+            BT2020_UNSUPPORTED.call_once(|| {
+                log::error!(
+                    "D3D11 video processor cannot convert to BT.2020; using the BT.709 matrix"
+                );
+            });
+            YCBCR_709
+        }
+    };
     let input = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: RGB_FULL };
-    let range = if full_range { NOMINAL_0_255 } else { NOMINAL_16_235 };
-    let output = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: YCBCR_709 | range };
+    let range = if colorspace.full_range { NOMINAL_0_255 } else { NOMINAL_16_235 };
+    let output = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: matrix | range };
     unsafe {
         context.VideoProcessorSetStreamColorSpace(processor, 0, &input);
         context.VideoProcessorSetOutputColorSpace(processor, &output);
     }
 }
-
