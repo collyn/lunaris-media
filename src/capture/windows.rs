@@ -257,7 +257,7 @@ impl DxgiCapture {
             D3D11CreateDevice(
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
-                None,
+                windows::Win32::Foundation::HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&feature_levels),
                 D3D11_SDK_VERSION,
@@ -1140,7 +1140,8 @@ struct GdiMonitorInfo {
 
 fn enumerate_gdi_monitors_with_coords() -> Result<Vec<GdiMonitorInfo>, MediaError> {
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MONITORINFOEXW};
-    use windows::Win32::Foundation::{RECT, LPARAM, BOOL};
+    use windows::Win32::Foundation::{RECT, LPARAM};
+    use windows::core::BOOL;
 
     unsafe extern "system" fn monitor_enum_proc(
         hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
@@ -1215,7 +1216,7 @@ fn capture_gdi(
             return Err(MediaError::CaptureError("GetDC(None) failed".into()));
         }
 
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
         if hdc_mem.is_invalid() {
             let _ = ReleaseDC(None, hdc_screen);
             return Err(MediaError::CaptureError("CreateCompatibleDC failed".into()));
@@ -1228,7 +1229,7 @@ fn capture_gdi(
             return Err(MediaError::CaptureError("CreateCompatibleBitmap failed".into()));
         }
 
-        let h_old = SelectObject(hdc_mem, h_bitmap);
+        let h_old = SelectObject(hdc_mem, h_bitmap.into());
 
         if let Err(e) = BitBlt(
             hdc_mem,
@@ -1236,13 +1237,13 @@ fn capture_gdi(
             0,
             width as i32,
             height as i32,
-            hdc_screen,
+            Some(hdc_screen),
             x,
             y,
             SRCCOPY,
         ) {
             let _ = SelectObject(hdc_mem, h_old);
-            let _ = DeleteObject(h_bitmap);
+            let _ = DeleteObject(h_bitmap.into());
             let _ = DeleteDC(hdc_mem);
             let _ = ReleaseDC(None, hdc_screen);
             return Err(MediaError::CaptureError(format!("BitBlt failed: {e}")));
@@ -1276,7 +1277,7 @@ fn capture_gdi(
 
         // Cleanup
         let _ = SelectObject(hdc_mem, h_old);
-        let _ = DeleteObject(h_bitmap);
+        let _ = DeleteObject(h_bitmap.into());
         let _ = DeleteDC(hdc_mem);
         let _ = ReleaseDC(None, hdc_screen);
 
@@ -1668,7 +1669,7 @@ unsafe fn draw_cursor_onto_buffer(
         if (cursor_info.flags.0 & CURSOR_SHOWING.0) != 0 {
             let h_cursor = cursor_info.hCursor;
             let mut icon_info = ICONINFO::default();
-            if GetIconInfo(h_cursor, &mut icon_info).is_ok() {
+            if GetIconInfo(windows::Win32::UI::WindowsAndMessaging::HICON(h_cursor.0), &mut icon_info).is_ok() {
                 let x_hotspot = icon_info.xHotspot as i32;
                 let y_hotspot = icon_info.yHotspot as i32;
                 let mut has_color = false;
@@ -1835,10 +1836,10 @@ unsafe fn draw_cursor_onto_buffer(
                 }
 
                 if !icon_info.hbmMask.is_invalid() {
-                    let _ = DeleteObject(icon_info.hbmMask);
+                    let _ = DeleteObject(icon_info.hbmMask.into());
                 }
                 if !icon_info.hbmColor.is_invalid() {
-                    let _ = DeleteObject(icon_info.hbmColor);
+                    let _ = DeleteObject(icon_info.hbmColor.into());
                 }
             }
         }

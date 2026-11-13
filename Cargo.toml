@@ -21,16 +21,16 @@ ffmpeg-next = "8"
 pipewire = "0.8"
 ashpd = { version = "0.9", default-features = false, features = ["tokio", "pipewire"] }
 enumflags2 = "0.7"
-nix = { version = "0.29", features = ["mman", "fs"] }
+nix = { version = "0.31", features = ["mman", "fs"] }
 drm-fourcc = "2.2"
 x11 = { version = "2.21", features = ["xlib", "xtest", "xfixes", "dpms"] }
-evdev = "0.11"
-libloading = "0.8"
+evdev = "0.13"
+libloading = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # FFmpeg raw FFI for hardware contexts
 ffmpeg-next = "8"
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D11",
@@ -58,6 +58,6 @@ screencapturekit = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-image = "0.24"
+image = "0.25"
 
 

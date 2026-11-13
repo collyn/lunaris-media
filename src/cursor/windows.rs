@@ -57,7 +57,7 @@ fn bitmap_dimensions(bitmap: HBITMAP) -> Option<(u32, u32)> {
     let object_size = std::mem::size_of::<BITMAP>() as i32;
     let read = unsafe {
         GetObjectW(
-            bitmap,
+            bitmap.into(),
             object_size,
             Some((&mut bitmap_info_raw as *mut BITMAP).cast()),
         )
@@ -81,7 +81,7 @@ fn read_bitmap_bgra(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     let object_size = std::mem::size_of::<BITMAP>() as i32;
     let read = unsafe {
         GetObjectW(
-            bitmap,
+            bitmap.into(),
             object_size,
             Some((&mut bitmap_info_raw as *mut BITMAP).cast()),
         )
@@ -207,14 +207,14 @@ fn draw_icon_to_bgra(icon: HICON, width: u32, height: u32, background: [u8; 3]) 
             return None;
         }
 
-        let memory_dc = CreateCompatibleDC(screen_dc);
+        let memory_dc = CreateCompatibleDC(Some(screen_dc));
         if memory_dc.is_invalid() {
             let _ = ReleaseDC(None, screen_dc);
             return None;
         }
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dib = match CreateDIBSection(screen_dc, &mut info, DIB_RGB_COLORS, &mut bits, None, 0) {
+        let dib = match CreateDIBSection(Some(screen_dc), &mut info, DIB_RGB_COLORS, &mut bits, None, 0) {
             Ok(bitmap) => bitmap,
             Err(_) => {
                 let _ = DeleteDC(memory_dc);
@@ -225,12 +225,12 @@ fn draw_icon_to_bgra(icon: HICON, width: u32, height: u32, background: [u8; 3]) 
         let _ = ReleaseDC(None, screen_dc);
 
         if bits.is_null() {
-            let _ = DeleteObject(dib);
+            let _ = DeleteObject(dib.into());
             let _ = DeleteDC(memory_dc);
             return None;
         }
 
-        let old_object = SelectObject(memory_dc, dib);
+        let old_object = SelectObject(memory_dc, dib.into());
         let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), len);
         for px in pixels.chunks_exact_mut(4) {
             px[0] = background[2];
@@ -260,7 +260,7 @@ fn draw_icon_to_bgra(icon: HICON, width: u32, height: u32, background: [u8; 3]) 
         if !old_object.is_invalid() {
             let _ = SelectObject(memory_dc, old_object);
         }
-        let _ = DeleteObject(dib);
+        let _ = DeleteObject(dib.into());
         let _ = DeleteDC(memory_dc);
         output
     }
@@ -389,10 +389,10 @@ fn cursor_image_from_handle(handle: HCURSOR) -> Option<CursorImage> {
 
     unsafe {
         if !icon_info.hbmColor.is_invalid() {
-            let _ = DeleteObject(icon_info.hbmColor);
+            let _ = DeleteObject(icon_info.hbmColor.into());
         }
         if !icon_info.hbmMask.is_invalid() {
-            let _ = DeleteObject(icon_info.hbmMask);
+            let _ = DeleteObject(icon_info.hbmMask.into());
         }
     }
 

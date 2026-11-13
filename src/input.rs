@@ -7,9 +7,9 @@ use x11::xlib;
 use x11::xtest;
 
 #[cfg(target_os = "linux")]
-use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
+use evdev::uinput::VirtualDevice;
 #[cfg(target_os = "linux")]
-use evdev::{AttributeSet, InputEvent, Key, RelativeAxisType, AbsoluteAxisType, UinputAbsSetup, AbsInfo};
+use evdev::{AttributeSet, InputEvent, KeyCode, RelativeAxisCode, AbsoluteAxisCode, UinputAbsSetup, AbsInfo};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -44,15 +44,15 @@ const ABS_RESOLUTION: i32 = 28;
 
 /// Mouse buttons exposed by both virtual mice.
 #[cfg(target_os = "linux")]
-const MOUSE_BUTTONS: [Key; 8] = [
-    Key::BTN_LEFT,
-    Key::BTN_RIGHT,
-    Key::BTN_MIDDLE,
-    Key::BTN_SIDE,
-    Key::BTN_EXTRA,
-    Key::BTN_FORWARD,
-    Key::BTN_BACK,
-    Key::BTN_TASK,
+const MOUSE_BUTTONS: [KeyCode; 8] = [
+    KeyCode::BTN_LEFT,
+    KeyCode::BTN_RIGHT,
+    KeyCode::BTN_MIDDLE,
+    KeyCode::BTN_SIDE,
+    KeyCode::BTN_EXTRA,
+    KeyCode::BTN_FORWARD,
+    KeyCode::BTN_BACK,
+    KeyCode::BTN_TASK,
 ];
 
 /// Virtual input devices created through `/dev/uinput`, modelled on
@@ -81,9 +81,9 @@ impl UinputInjector {
         // 1. Keyboard device
         let mut kbd_keys = AttributeSet::new();
         for code in 1..=255 {
-            kbd_keys.insert(Key::new(code));
+            kbd_keys.insert(KeyCode::new(code));
         }
-        let keyboard = VirtualDeviceBuilder::new()
+        let keyboard = VirtualDevice::builder()
             .map_err(|e| log_err("open", e))
             .ok()?
             .name("Lunaris Keyboard passthrough")
@@ -100,13 +100,13 @@ impl UinputInjector {
 
         // 2. Relative mouse with high-resolution wheels
         let mut rel_axes = AttributeSet::new();
-        rel_axes.insert(RelativeAxisType::REL_X);
-        rel_axes.insert(RelativeAxisType::REL_Y);
-        rel_axes.insert(RelativeAxisType::REL_WHEEL);
-        rel_axes.insert(RelativeAxisType::REL_HWHEEL);
-        rel_axes.insert(RelativeAxisType::REL_WHEEL_HI_RES);
-        rel_axes.insert(RelativeAxisType::REL_HWHEEL_HI_RES);
-        let mouse_rel = VirtualDeviceBuilder::new()
+        rel_axes.insert(RelativeAxisCode::REL_X);
+        rel_axes.insert(RelativeAxisCode::REL_Y);
+        rel_axes.insert(RelativeAxisCode::REL_WHEEL);
+        rel_axes.insert(RelativeAxisCode::REL_HWHEEL);
+        rel_axes.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+        rel_axes.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
+        let mouse_rel = VirtualDevice::builder()
             .ok()?
             .name("Lunaris Mouse passthrough")
             .with_keys(&buttons)
@@ -121,14 +121,14 @@ impl UinputInjector {
         //    No BTN_TOOL_PEN/BTN_TOUCH, otherwise libinput treats it as a
         //    tablet (and rejects it without proper tablet capabilities).
         let abs_x = UinputAbsSetup::new(
-            AbsoluteAxisType::ABS_X,
+            AbsoluteAxisCode::ABS_X,
             AbsInfo::new(0, 0, ABS_MAX_WIDTH, 1, 0, ABS_RESOLUTION),
         );
         let abs_y = UinputAbsSetup::new(
-            AbsoluteAxisType::ABS_Y,
+            AbsoluteAxisCode::ABS_Y,
             AbsInfo::new(0, 0, ABS_MAX_HEIGHT, 1, 0, ABS_RESOLUTION),
         );
-        let mouse_abs = VirtualDeviceBuilder::new()
+        let mouse_abs = VirtualDevice::builder()
             .ok()?
             .name("Lunaris Mouse passthrough (absolute)")
             .with_keys(&buttons)
@@ -173,9 +173,9 @@ impl UinputInjector {
         Self::emit(
             &self.mouse_abs,
             &[
-                InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, abs_x),
-                InputEvent::new(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, abs_y),
-                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+                InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, abs_x),
+                InputEvent::new(evdev::EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, abs_y),
+                InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
             ],
         );
     }
@@ -184,16 +184,16 @@ impl UinputInjector {
     /// high-resolution (120 per detent) and legacy wheel events.
     fn scroll(&self, horizontal: bool, notches: i32) {
         let (lo, hi) = if horizontal {
-            (RelativeAxisType::REL_HWHEEL, RelativeAxisType::REL_HWHEEL_HI_RES)
+            (RelativeAxisCode::REL_HWHEEL, RelativeAxisCode::REL_HWHEEL_HI_RES)
         } else {
-            (RelativeAxisType::REL_WHEEL, RelativeAxisType::REL_WHEEL_HI_RES)
+            (RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_WHEEL_HI_RES)
         };
         Self::emit(
             &self.mouse_rel,
             &[
-                InputEvent::new(evdev::EventType::RELATIVE, hi.0, notches * 120),
-                InputEvent::new(evdev::EventType::RELATIVE, lo.0, notches),
-                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+                InputEvent::new(evdev::EventType::RELATIVE.0, hi.0, notches * 120),
+                InputEvent::new(evdev::EventType::RELATIVE.0, lo.0, notches),
+                InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
             ],
         );
     }
@@ -652,9 +652,9 @@ impl InputInjector {
             Backend::Uinput(u) => {
                 u.last_absolute.store(false, std::sync::atomic::Ordering::Relaxed);
                 let events = [
-                    InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_X.0, dx),
-                    InputEvent::new(evdev::EventType::RELATIVE, RelativeAxisType::REL_Y.0, dy),
-                    InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+                    InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, dx),
+                    InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, dy),
+                    InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
                 ];
                 if let Ok(mut dev) = u.mouse_rel.lock() {
                     let _ = dev.emit(&events);
@@ -796,11 +796,11 @@ impl InputInjector {
                         if let Some(linux_btn) = mouse_button_to_linux_keycode(button) {
                             let events = [
                                 InputEvent::new(
-                                    evdev::EventType::KEY,
+                                    evdev::EventType::KEY.0,
                                     linux_btn.0,
                                     if is_press { 1 } else { 0 }
                                 ),
-                                InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+                                InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
                             ];
                             UinputInjector::emit(u.pointer_device(), &events);
                         }
@@ -853,11 +853,11 @@ impl InputInjector {
                 if let Some(linux_key) = vk_to_linux_keycode(vk_code) {
                     let events = [
                         InputEvent::new(
-                            evdev::EventType::KEY,
+                            evdev::EventType::KEY.0,
                             linux_key.0,
                             if is_press { 1 } else { 0 }
                         ),
-                        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+                        InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
                     ];
                     if let Ok(mut dev) = u.keyboard.lock() {
                         let _ = dev.emit(&events);
@@ -994,13 +994,13 @@ impl Drop for InputInjector {
 }
 
 #[cfg(target_os = "linux")]
-fn mouse_button_to_linux_keycode(button: u32) -> Option<Key> {
+fn mouse_button_to_linux_keycode(button: u32) -> Option<KeyCode> {
     let code = match button {
-        1 => Key::BTN_LEFT,
-        2 => Key::BTN_MIDDLE,
-        3 => Key::BTN_RIGHT,
-        8 => Key::BTN_SIDE,
-        9 => Key::BTN_EXTRA,
+        1 => KeyCode::BTN_LEFT,
+        2 => KeyCode::BTN_MIDDLE,
+        3 => KeyCode::BTN_RIGHT,
+        8 => KeyCode::BTN_SIDE,
+        9 => KeyCode::BTN_EXTRA,
         _ => return None,
     };
     Some(code)
@@ -1098,56 +1098,56 @@ unsafe fn x11_spare_keycodes(d: *mut xlib::Display) -> Vec<u8> {
 
 /// A printable ASCII character on a US keyboard: (key, with Shift).
 #[cfg(target_os = "linux")]
-fn ascii_us_key(ch: char) -> Option<(Key, bool)> {
-    const LETTERS: [Key; 26] = [
-        Key::KEY_A, Key::KEY_B, Key::KEY_C, Key::KEY_D, Key::KEY_E, Key::KEY_F, Key::KEY_G,
-        Key::KEY_H, Key::KEY_I, Key::KEY_J, Key::KEY_K, Key::KEY_L, Key::KEY_M, Key::KEY_N,
-        Key::KEY_O, Key::KEY_P, Key::KEY_Q, Key::KEY_R, Key::KEY_S, Key::KEY_T, Key::KEY_U,
-        Key::KEY_V, Key::KEY_W, Key::KEY_X, Key::KEY_Y, Key::KEY_Z,
+fn ascii_us_key(ch: char) -> Option<(KeyCode, bool)> {
+    const LETTERS: [KeyCode; 26] = [
+        KeyCode::KEY_A, KeyCode::KEY_B, KeyCode::KEY_C, KeyCode::KEY_D, KeyCode::KEY_E, KeyCode::KEY_F, KeyCode::KEY_G,
+        KeyCode::KEY_H, KeyCode::KEY_I, KeyCode::KEY_J, KeyCode::KEY_K, KeyCode::KEY_L, KeyCode::KEY_M, KeyCode::KEY_N,
+        KeyCode::KEY_O, KeyCode::KEY_P, KeyCode::KEY_Q, KeyCode::KEY_R, KeyCode::KEY_S, KeyCode::KEY_T, KeyCode::KEY_U,
+        KeyCode::KEY_V, KeyCode::KEY_W, KeyCode::KEY_X, KeyCode::KEY_Y, KeyCode::KEY_Z,
     ];
-    const DIGITS: [Key; 10] = [
-        Key::KEY_0, Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4,
-        Key::KEY_5, Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9,
+    const DIGITS: [KeyCode; 10] = [
+        KeyCode::KEY_0, KeyCode::KEY_1, KeyCode::KEY_2, KeyCode::KEY_3, KeyCode::KEY_4,
+        KeyCode::KEY_5, KeyCode::KEY_6, KeyCode::KEY_7, KeyCode::KEY_8, KeyCode::KEY_9,
     ];
     Some(match ch {
         'a'..='z' => (LETTERS[ch as usize - 'a' as usize], false),
         'A'..='Z' => (LETTERS[ch as usize - 'A' as usize], true),
         '0'..='9' => (DIGITS[ch as usize - '0' as usize], false),
-        ' ' => (Key::KEY_SPACE, false),
-        '\n' | '\r' => (Key::KEY_ENTER, false),
-        '\t' => (Key::KEY_TAB, false),
-        '-' => (Key::KEY_MINUS, false), '_' => (Key::KEY_MINUS, true),
-        '=' => (Key::KEY_EQUAL, false), '+' => (Key::KEY_EQUAL, true),
-        '[' => (Key::KEY_LEFTBRACE, false), '{' => (Key::KEY_LEFTBRACE, true),
-        ']' => (Key::KEY_RIGHTBRACE, false), '}' => (Key::KEY_RIGHTBRACE, true),
-        '\\' => (Key::KEY_BACKSLASH, false), '|' => (Key::KEY_BACKSLASH, true),
-        ';' => (Key::KEY_SEMICOLON, false), ':' => (Key::KEY_SEMICOLON, true),
-        '\'' => (Key::KEY_APOSTROPHE, false), '"' => (Key::KEY_APOSTROPHE, true),
-        '`' => (Key::KEY_GRAVE, false), '~' => (Key::KEY_GRAVE, true),
-        ',' => (Key::KEY_COMMA, false), '<' => (Key::KEY_COMMA, true),
-        '.' => (Key::KEY_DOT, false), '>' => (Key::KEY_DOT, true),
-        '/' => (Key::KEY_SLASH, false), '?' => (Key::KEY_SLASH, true),
-        '!' => (Key::KEY_1, true), '@' => (Key::KEY_2, true), '#' => (Key::KEY_3, true),
-        '$' => (Key::KEY_4, true), '%' => (Key::KEY_5, true), '^' => (Key::KEY_6, true),
-        '&' => (Key::KEY_7, true), '*' => (Key::KEY_8, true), '(' => (Key::KEY_9, true),
-        ')' => (Key::KEY_0, true),
+        ' ' => (KeyCode::KEY_SPACE, false),
+        '\n' | '\r' => (KeyCode::KEY_ENTER, false),
+        '\t' => (KeyCode::KEY_TAB, false),
+        '-' => (KeyCode::KEY_MINUS, false), '_' => (KeyCode::KEY_MINUS, true),
+        '=' => (KeyCode::KEY_EQUAL, false), '+' => (KeyCode::KEY_EQUAL, true),
+        '[' => (KeyCode::KEY_LEFTBRACE, false), '{' => (KeyCode::KEY_LEFTBRACE, true),
+        ']' => (KeyCode::KEY_RIGHTBRACE, false), '}' => (KeyCode::KEY_RIGHTBRACE, true),
+        '\\' => (KeyCode::KEY_BACKSLASH, false), '|' => (KeyCode::KEY_BACKSLASH, true),
+        ';' => (KeyCode::KEY_SEMICOLON, false), ':' => (KeyCode::KEY_SEMICOLON, true),
+        '\'' => (KeyCode::KEY_APOSTROPHE, false), '"' => (KeyCode::KEY_APOSTROPHE, true),
+        '`' => (KeyCode::KEY_GRAVE, false), '~' => (KeyCode::KEY_GRAVE, true),
+        ',' => (KeyCode::KEY_COMMA, false), '<' => (KeyCode::KEY_COMMA, true),
+        '.' => (KeyCode::KEY_DOT, false), '>' => (KeyCode::KEY_DOT, true),
+        '/' => (KeyCode::KEY_SLASH, false), '?' => (KeyCode::KEY_SLASH, true),
+        '!' => (KeyCode::KEY_1, true), '@' => (KeyCode::KEY_2, true), '#' => (KeyCode::KEY_3, true),
+        '$' => (KeyCode::KEY_4, true), '%' => (KeyCode::KEY_5, true), '^' => (KeyCode::KEY_6, true),
+        '&' => (KeyCode::KEY_7, true), '*' => (KeyCode::KEY_8, true), '(' => (KeyCode::KEY_9, true),
+        ')' => (KeyCode::KEY_0, true),
         _ => return None,
     })
 }
 
 #[cfg(target_os = "linux")]
-fn uinput_tap(u: &UinputInjector, key: Key, shift: bool) {
+fn uinput_tap(u: &UinputInjector, key: KeyCode, shift: bool) {
     let mut events = Vec::new();
     if shift {
-        events.push(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 1));
+        events.push(InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1));
     }
-    events.push(InputEvent::new(evdev::EventType::KEY, key.0, 1));
-    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0));
-    events.push(InputEvent::new(evdev::EventType::KEY, key.0, 0));
+    events.push(InputEvent::new(evdev::EventType::KEY.0, key.0, 1));
+    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0));
+    events.push(InputEvent::new(evdev::EventType::KEY.0, key.0, 0));
     if shift {
-        events.push(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 0));
+        events.push(InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0));
     }
-    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0));
+    events.push(InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0));
     if let Ok(mut dev) = u.keyboard.lock() {
         let _ = dev.emit(&events);
     }
@@ -1162,14 +1162,14 @@ fn uinput_type_char(u: &UinputInjector, ch: char) {
         return;
     }
     let mut events = vec![
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.0, 1),
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 1),
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_U.0, 1),
-        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_U.0, 0),
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.0, 0),
-        InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.0, 0),
-        InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTCTRL.0, 1),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_U.0, 1),
+        InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_U.0, 0),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
+        InputEvent::new(evdev::EventType::KEY.0, KeyCode::KEY_LEFTCTRL.0, 0),
+        InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
     ];
     if let Ok(mut dev) = u.keyboard.lock() {
         let _ = dev.emit(&events);
@@ -1180,7 +1180,7 @@ fn uinput_type_char(u: &UinputInjector, ch: char) {
             uinput_tap(u, key, shift);
         }
     }
-    uinput_tap(u, Key::KEY_SPACE, false);
+    uinput_tap(u, KeyCode::KEY_SPACE, false);
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1197,123 +1197,123 @@ mod type_text_tests {
 
     #[test]
     fn ascii_on_a_us_keyboard() {
-        assert_eq!(ascii_us_key('a'), Some((Key::KEY_A, false)));
-        assert_eq!(ascii_us_key('Z'), Some((Key::KEY_Z, true)));
-        assert_eq!(ascii_us_key('?'), Some((Key::KEY_SLASH, true)));
-        assert_eq!(ascii_us_key('@'), Some((Key::KEY_2, true)));
+        assert_eq!(ascii_us_key('a'), Some((KeyCode::KEY_A, false)));
+        assert_eq!(ascii_us_key('Z'), Some((KeyCode::KEY_Z, true)));
+        assert_eq!(ascii_us_key('?'), Some((KeyCode::KEY_SLASH, true)));
+        assert_eq!(ascii_us_key('@'), Some((KeyCode::KEY_2, true)));
         assert_eq!(ascii_us_key('ệ'), None);
     }
 }
 
 #[cfg(target_os = "linux")]
-fn vk_to_linux_keycode(vk: u16) -> Option<Key> {
+fn vk_to_linux_keycode(vk: u16) -> Option<KeyCode> {
     let code = match vk {
-        0x08 => Key::KEY_BACKSPACE,
-        0x09 => Key::KEY_TAB,
-        0x0D => Key::KEY_ENTER,
-        0x1B => Key::KEY_ESC,
-        0x20 => Key::KEY_SPACE,
-        0x21 => Key::KEY_PAGEUP,
-        0x22 => Key::KEY_PAGEDOWN,
-        0x23 => Key::KEY_END,
-        0x24 => Key::KEY_HOME,
-        0x25 => Key::KEY_LEFT,
-        0x26 => Key::KEY_UP,
-        0x27 => Key::KEY_RIGHT,
-        0x28 => Key::KEY_DOWN,
-        0x2D => Key::KEY_INSERT,
-        0x2E => Key::KEY_DELETE,
+        0x08 => KeyCode::KEY_BACKSPACE,
+        0x09 => KeyCode::KEY_TAB,
+        0x0D => KeyCode::KEY_ENTER,
+        0x1B => KeyCode::KEY_ESC,
+        0x20 => KeyCode::KEY_SPACE,
+        0x21 => KeyCode::KEY_PAGEUP,
+        0x22 => KeyCode::KEY_PAGEDOWN,
+        0x23 => KeyCode::KEY_END,
+        0x24 => KeyCode::KEY_HOME,
+        0x25 => KeyCode::KEY_LEFT,
+        0x26 => KeyCode::KEY_UP,
+        0x27 => KeyCode::KEY_RIGHT,
+        0x28 => KeyCode::KEY_DOWN,
+        0x2D => KeyCode::KEY_INSERT,
+        0x2E => KeyCode::KEY_DELETE,
         // Numbers 0-9
-        0x30 => Key::KEY_0,
-        0x31 => Key::KEY_1,
-        0x32 => Key::KEY_2,
-        0x33 => Key::KEY_3,
-        0x34 => Key::KEY_4,
-        0x35 => Key::KEY_5,
-        0x36 => Key::KEY_6,
-        0x37 => Key::KEY_7,
-        0x38 => Key::KEY_8,
-        0x39 => Key::KEY_9,
+        0x30 => KeyCode::KEY_0,
+        0x31 => KeyCode::KEY_1,
+        0x32 => KeyCode::KEY_2,
+        0x33 => KeyCode::KEY_3,
+        0x34 => KeyCode::KEY_4,
+        0x35 => KeyCode::KEY_5,
+        0x36 => KeyCode::KEY_6,
+        0x37 => KeyCode::KEY_7,
+        0x38 => KeyCode::KEY_8,
+        0x39 => KeyCode::KEY_9,
         // Letters A-Z
-        0x41 => Key::KEY_A,
-        0x42 => Key::KEY_B,
-        0x43 => Key::KEY_C,
-        0x44 => Key::KEY_D,
-        0x45 => Key::KEY_E,
-        0x46 => Key::KEY_F,
-        0x47 => Key::KEY_G,
-        0x48 => Key::KEY_H,
-        0x49 => Key::KEY_I,
-        0x4A => Key::KEY_J,
-        0x4B => Key::KEY_K,
-        0x4C => Key::KEY_L,
-        0x4D => Key::KEY_M,
-        0x4E => Key::KEY_N,
-        0x4F => Key::KEY_O,
-        0x50 => Key::KEY_P,
-        0x51 => Key::KEY_Q,
-        0x52 => Key::KEY_R,
-        0x53 => Key::KEY_S,
-        0x54 => Key::KEY_T,
-        0x55 => Key::KEY_U,
-        0x56 => Key::KEY_V,
-        0x57 => Key::KEY_W,
-        0x58 => Key::KEY_X,
-        0x59 => Key::KEY_Y,
-        0x5A => Key::KEY_Z,
+        0x41 => KeyCode::KEY_A,
+        0x42 => KeyCode::KEY_B,
+        0x43 => KeyCode::KEY_C,
+        0x44 => KeyCode::KEY_D,
+        0x45 => KeyCode::KEY_E,
+        0x46 => KeyCode::KEY_F,
+        0x47 => KeyCode::KEY_G,
+        0x48 => KeyCode::KEY_H,
+        0x49 => KeyCode::KEY_I,
+        0x4A => KeyCode::KEY_J,
+        0x4B => KeyCode::KEY_K,
+        0x4C => KeyCode::KEY_L,
+        0x4D => KeyCode::KEY_M,
+        0x4E => KeyCode::KEY_N,
+        0x4F => KeyCode::KEY_O,
+        0x50 => KeyCode::KEY_P,
+        0x51 => KeyCode::KEY_Q,
+        0x52 => KeyCode::KEY_R,
+        0x53 => KeyCode::KEY_S,
+        0x54 => KeyCode::KEY_T,
+        0x55 => KeyCode::KEY_U,
+        0x56 => KeyCode::KEY_V,
+        0x57 => KeyCode::KEY_W,
+        0x58 => KeyCode::KEY_X,
+        0x59 => KeyCode::KEY_Y,
+        0x5A => KeyCode::KEY_Z,
         // Win/Super
-        0x5B => Key::KEY_LEFTMETA,
-        0x5C => Key::KEY_RIGHTMETA,
+        0x5B => KeyCode::KEY_LEFTMETA,
+        0x5C => KeyCode::KEY_RIGHTMETA,
         // Numpad
-        0x60 => Key::KEY_KP0,
-        0x61 => Key::KEY_KP1,
-        0x62 => Key::KEY_KP2,
-        0x63 => Key::KEY_KP3,
-        0x64 => Key::KEY_KP4,
-        0x65 => Key::KEY_KP5,
-        0x66 => Key::KEY_KP6,
-        0x67 => Key::KEY_KP7,
-        0x68 => Key::KEY_KP8,
-        0x69 => Key::KEY_KP9,
-        0x6A => Key::KEY_KPASTERISK,
-        0x6B => Key::KEY_KPPLUS,
-        0x6D => Key::KEY_KPMINUS,
-        0x6E => Key::KEY_KPDOT,
-        0x6F => Key::KEY_KPSLASH,
+        0x60 => KeyCode::KEY_KP0,
+        0x61 => KeyCode::KEY_KP1,
+        0x62 => KeyCode::KEY_KP2,
+        0x63 => KeyCode::KEY_KP3,
+        0x64 => KeyCode::KEY_KP4,
+        0x65 => KeyCode::KEY_KP5,
+        0x66 => KeyCode::KEY_KP6,
+        0x67 => KeyCode::KEY_KP7,
+        0x68 => KeyCode::KEY_KP8,
+        0x69 => KeyCode::KEY_KP9,
+        0x6A => KeyCode::KEY_KPASTERISK,
+        0x6B => KeyCode::KEY_KPPLUS,
+        0x6D => KeyCode::KEY_KPMINUS,
+        0x6E => KeyCode::KEY_KPDOT,
+        0x6F => KeyCode::KEY_KPSLASH,
         // F1-F12
-        0x70 => Key::KEY_F1,
-        0x71 => Key::KEY_F2,
-        0x72 => Key::KEY_F3,
-        0x73 => Key::KEY_F4,
-        0x74 => Key::KEY_F5,
-        0x75 => Key::KEY_F6,
-        0x76 => Key::KEY_F7,
-        0x77 => Key::KEY_F8,
-        0x78 => Key::KEY_F9,
-        0x79 => Key::KEY_F10,
-        0x7A => Key::KEY_F11,
-        0x7B => Key::KEY_F12,
-        0x90 => Key::KEY_NUMLOCK,
-        0x91 => Key::KEY_SCROLLLOCK,
+        0x70 => KeyCode::KEY_F1,
+        0x71 => KeyCode::KEY_F2,
+        0x72 => KeyCode::KEY_F3,
+        0x73 => KeyCode::KEY_F4,
+        0x74 => KeyCode::KEY_F5,
+        0x75 => KeyCode::KEY_F6,
+        0x76 => KeyCode::KEY_F7,
+        0x77 => KeyCode::KEY_F8,
+        0x78 => KeyCode::KEY_F9,
+        0x79 => KeyCode::KEY_F10,
+        0x7A => KeyCode::KEY_F11,
+        0x7B => KeyCode::KEY_F12,
+        0x90 => KeyCode::KEY_NUMLOCK,
+        0x91 => KeyCode::KEY_SCROLLLOCK,
         // Modifiers
-        0x10 | 0xA0 => Key::KEY_LEFTSHIFT,
-        0xA1 => Key::KEY_RIGHTSHIFT,
-        0x11 | 0xA2 => Key::KEY_LEFTCTRL,
-        0xA3 => Key::KEY_RIGHTCTRL,
-        0x12 | 0xA4 => Key::KEY_LEFTALT,
-        0xA5 => Key::KEY_RIGHTALT,
+        0x10 | 0xA0 => KeyCode::KEY_LEFTSHIFT,
+        0xA1 => KeyCode::KEY_RIGHTSHIFT,
+        0x11 | 0xA2 => KeyCode::KEY_LEFTCTRL,
+        0xA3 => KeyCode::KEY_RIGHTCTRL,
+        0x12 | 0xA4 => KeyCode::KEY_LEFTALT,
+        0xA5 => KeyCode::KEY_RIGHTALT,
         // Punctuation keys
-        0xBA => Key::KEY_SEMICOLON,
-        0xBB => Key::KEY_EQUAL,
-        0xBC => Key::KEY_COMMA,
-        0xBD => Key::KEY_MINUS,
-        0xBE => Key::KEY_DOT,
-        0xBF => Key::KEY_SLASH,
-        0xC0 => Key::KEY_GRAVE,
-        0xDB => Key::KEY_LEFTBRACE,
-        0xDC => Key::KEY_BACKSLASH,
-        0xDD => Key::KEY_RIGHTBRACE,
-        0xDE => Key::KEY_APOSTROPHE,
+        0xBA => KeyCode::KEY_SEMICOLON,
+        0xBB => KeyCode::KEY_EQUAL,
+        0xBC => KeyCode::KEY_COMMA,
+        0xBD => KeyCode::KEY_MINUS,
+        0xBE => KeyCode::KEY_DOT,
+        0xBF => KeyCode::KEY_SLASH,
+        0xC0 => KeyCode::KEY_GRAVE,
+        0xDB => KeyCode::KEY_LEFTBRACE,
+        0xDC => KeyCode::KEY_BACKSLASH,
+        0xDD => KeyCode::KEY_RIGHTBRACE,
+        0xDE => KeyCode::KEY_APOSTROPHE,
         _ => return None,
     };
     Some(code)
