@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::WAIT_ABANDONED;
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 use crate::win_desktop::sync_thread_desktop;
+use crate::win_timer::{
+    qpc_to_instant, HighPrecisionTimer, SleepOvershootLogger, TimerResolution,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -128,9 +131,68 @@ struct Duplicated {
     /// `AcquireNextFrame` delivers.
     tex_width: u32,
     tex_height: u32,
+    /// `IDXGIOutputDuplication::GetDesc().ModeDesc.RefreshRate`
+    /// (display_base.cpp:136, `display_refresh_rate`) as numerator/denominator.
+    refresh_rate: (u32, u32),
+}
+
+/// Result of one `snapshot` (display_vram.cpp:1366): the `capture_e` values
+/// that do not end the capture loop. `reinit` / `capture_error` travel as
+/// `Err(MediaError)`.
+enum Snapshot {
+    /// `capture_e::ok` with an image, and the time the image was displayed
+    /// (`img_out->frame_timestamp`, display_vram.cpp:1768).
+    Frame(CapturedFrame, Option<Instant>),
+    /// `capture_e::timeout`.
+    Timeout,
+}
+
+/// Port of the `adjust_client_frame_rate` lambda (display_base.cpp:226-248).
+///
+/// Adaptation: Lunaris has no `client_frame_rate_strict` (framerateX100,
+/// display_base.cpp:228-230, 739-744), so that branch is absent. `lround` of
+/// the refresh rate and the modulo operands are guarded against 0, which
+/// would be undefined behaviour / a panic here.
+fn adjust_client_frame_rate(client_frame_rate: u32, refresh: (u32, u32)) -> (u64, u64) {
+    let client = client_frame_rate.max(1) as u64;
+    let (num, den) = (refresh.0 as u64, refresh.1 as u64);
+    // Adjust capture frame interval when display refresh rate is not integral
+    // but very close to requested fps.
+    if den > 1 {
+        let rounded = (num as f64 / den as f64).round() as u64; // display_refresh_rate_rounded
+        let (mut cand_num, mut cand_den) = (num, den);
+        if rounded > 0 && client % rounded == 0 {
+            cand_num *= client / rounded;
+        } else if rounded > 0 && rounded % client == 0 {
+            cand_den *= rounded / client;
+        }
+        let candidate_rate = cand_num as f64 / cand_den as f64;
+        // Can only decrease requested fps, otherwise client may start
+        // accumulating frames and suffer increased latency.
+        if client as f64 > candidate_rate && candidate_rate / client as f64 > 0.99 {
+            log::info!("Adjusted capture rate to {candidate_rate}fps to better match display");
+            return (cand_num, cand_den);
+        }
+    }
+    (client, 1)
 }
 
 pub struct DxgiCapture {
+    /// Sunshine `display_base_t::timer` (high_precision_timer), used for the
+    /// frame pacing group sleep.
+    timer: Option<HighPrecisionTimer>,
+    /// System timer resolution raised while capturing (`streaming_will_start`).
+    timer_resolution: Option<TimerResolution>,
+    /// `client_frame_rate` (display_base.cpp:739).
+    client_frame_rate: u32,
+    display_refresh_rate: (u32, u32),
+    /// `client_frame_rate_adjusted` (display_base.cpp:250), numerator/denominator.
+    client_frame_rate_adjusted: (u64, u64),
+    /// `frame_pacing_group_start` / `frame_pacing_group_frames`
+    /// (display_base.cpp:251-252), kept across `next_frame` calls.
+    frame_pacing_group_start: Option<Instant>,
+    frame_pacing_group_frames: u32,
+    sleep_overshoot_logger: SleepOvershootLogger,
     keep_awake: Option<KeepAwake>,
     factory: Option<IDXGIFactory1>,
     tex_width: u32,
@@ -155,6 +217,14 @@ pub struct DxgiCapture {
 impl DxgiCapture {
     pub fn new() -> Result<Self, MediaError> {
         Ok(Self {
+            timer: None,
+            timer_resolution: None,
+            client_frame_rate: 60,
+            display_refresh_rate: (0, 0),
+            client_frame_rate_adjusted: (60, 1),
+            frame_pacing_group_start: None,
+            frame_pacing_group_frames: 0,
+            sleep_overshoot_logger: SleepOvershootLogger::new(),
             keep_awake: None,
             factory: None,
             tex_width: 0,
@@ -344,6 +414,10 @@ impl DxgiCapture {
                         index,
                         tex_width: dup_desc.ModeDesc.Width,
                         tex_height: dup_desc.ModeDesc.Height,
+                        refresh_rate: (
+                            dup_desc.ModeDesc.RefreshRate.Numerator,
+                            dup_desc.ModeDesc.RefreshRate.Denominator,
+                        ),
                     });
                 }
                 Err(e) => {
@@ -508,116 +582,16 @@ impl DxgiCapture {
             cursor: None,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl ScreenCapture for DxgiCapture {
-    async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError> {
-        let (device, _context) = Self::create_d3d11_device()?;
-        let outputs = Self::enumerate_outputs(&device)?;
-
-        let mut displays = Vec::new();
-        for (i, (_output, desc)) in outputs.iter().enumerate() {
-            let rect = desc.DesktopCoordinates;
-            let width = (rect.right - rect.left) as u32;
-            let height = (rect.bottom - rect.top) as u32;
-
-            let name_chars: Vec<u16> = desc.DeviceName.iter().take_while(|&&c| c != 0).copied().collect();
-            let name = String::from_utf16_lossy(&name_chars);
-
-            displays.push(DisplayInfo {
-                id: format!("{}", i),
-                name,
-                width,
-                height,
-                refresh_rate: 60.0,
-                is_primary: rect.left == 0 && rect.top == 0,
-            });
-        }
-
-        Ok(displays)
-    }
-
-    async fn start(&mut self, display_id: &str, _config: &StreamConfig) -> Result<(), MediaError> {
-        if self.capturing {
-            return Err(MediaError::CaptureAlreadyStarted);
-        }
-
-        // Started BEFORE the duplication attempts so that a sleeping monitor is
-        // being woken while they run. Dropped (execution state released) if
-        // start fails. See `KeepAwake` (display_base.cpp:254-261).
-        let keep_awake = KeepAwake::start();
-
-        let (device, context) = Self::create_d3d11_device()?;
-
-        // Output search, `DuplicateOutput` x2 with `syncThreadDesktop()`, and the
-        // wake-and-retry pass: see `find_and_duplicate`.
-        let found = Self::find_and_duplicate(&device, display_id).await?;
-
-        let output_index = found.index;
-        let rect = found.rect;
-        self.width = (rect.right - rect.left) as u32;
-        self.height = (rect.bottom - rect.top) as u32;
-
-        log::info!(
-            "DXGI: Starting capture on output {} ({}x{})",
-            output_index,
-            self.width,
-            self.height
-        );
-
-        let duplication = found.duplication;
-
-        let staging = Self::create_staging_texture(&device, self.width, self.height)?;
-
-        let use_zero_copy = std::env::var("LUNARIS_ZERO_COPY")
-            .map(|val| val == "1" || val.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        let gpu_texture = if use_zero_copy {
-            log::info!("DXGI: Creating GPU-only texture for Zero-Copy mode");
-            Some(Self::create_gpu_texture(&device, self.width, self.height)?)
-        } else {
-            None
-        };
-
-        self.keep_awake = Some(keep_awake);
-        self.factory = Some(found.factory);
-        self.tex_width = found.tex_width;
-        self.tex_height = found.tex_height;
-        self.device = Some(device);
-        self.context = Some(context);
-        self.duplication = Some(duplication);
-        self.staging_texture = Some(staging);
-        self.gpu_texture = gpu_texture;
-        self.use_zero_copy = use_zero_copy;
-        self.x_offset = rect.left;
-        self.y_offset = rect.top;
-        self.capturing = true;
-        self.start_time = Some(Instant::now());
-        self.frame_count = 0;
-        self.last_returned_time = None;
-
-        log::info!("DXGI Desktop Duplication capture started");
-        Ok(())
-    }
-
-    async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
-        if !self.capturing {
-            return Err(MediaError::CaptureError("Not capturing".into()));
-        }
-
-        // display_base.cpp:264-271: "This will return false if the HDR state
-        // changes or for any number of other display or GPU changes. We should
-        // reinit to examine the updated state of the display subsystem."
-        if let Some(factory) = &self.factory {
-            if !unsafe { factory.IsCurrent() }.as_bool() {
-                log::info!("DXGI factory is no longer current: capture has to be re-initialised");
-                return Err(MediaError::CaptureReinit);
-            }
-        }
-
-        // Cloned (cheap COM AddRef) so that `self` stays free for `timeout_frame()`
+    /// `display_ddup_vram_t::snapshot` (display_vram.cpp:1366-1415 and the
+    /// copy/convert part that follows): wait up to `timeout` for the next
+    /// duplication frame and turn it into a [`CapturedFrame`].
+    ///
+    /// `timeout` goes to `AcquireNextFrame` exactly as in
+    /// `duplication_t::next_frame` (display_base.cpp:152-157,
+    /// `dup->AcquireNextFrame(timeout.count(), ...)`).
+    fn snapshot(&mut self, timeout: Duration) -> Result<Snapshot, MediaError> {
+        // Cloned (cheap COM AddRef) so that `self` stays free for the helpers
         // below.
         let duplication = self
             .duplication
@@ -630,7 +604,7 @@ impl ScreenCapture for DxgiCapture {
         let mut desktop_resource = None;
 
         let result = unsafe {
-            duplication.AcquireNextFrame(5, &mut frame_info, &mut desktop_resource)
+            duplication.AcquireNextFrame(timeout.as_millis() as u32, &mut frame_info, &mut desktop_resource)
         };
 
         // Mapping of duplication_t::next_frame (display_base.cpp:158-182):
@@ -644,7 +618,7 @@ impl ScreenCapture for DxgiCapture {
         };
         match classify_acquire(code) {
             AcquireStatus::Ok => {}
-            AcquireStatus::Timeout => return Ok(self.timeout_frame()),
+            AcquireStatus::Timeout => return Ok(Snapshot::Timeout),
             AcquireStatus::Reinit => {
                 log::warn!(
                     "AcquireNextFrame returned {code:?}: capture has to be re-initialised (display_base.cpp:175)"
@@ -659,6 +633,52 @@ impl ScreenCapture for DxgiCapture {
             }
         }
 
+        // display_vram.cpp:1374-1380: a frame with neither a present nor a
+        // mouse update does not count as a frame ("timeout").
+        // Adaptation: Sunshine leaves the acquired frame to be released by the
+        // next `duplication_t::next_frame` (display_base.cpp:150); Lunaris
+        // releases frames where it copies them, so it is released here, with
+        // the `release_frame` result classified as in the normal path.
+        let mouse_update_flag =
+            frame_info.LastMouseUpdateTime != 0 || frame_info.PointerShapeBufferSize > 0;
+        let frame_update_flag = frame_info.LastPresentTime != 0;
+        if !(mouse_update_flag || frame_update_flag) {
+            drop(desktop_resource);
+            return match release_frame(&duplication) {
+                AcquireStatus::Reinit => Err(MediaError::CaptureReinit),
+                AcquireStatus::Error => Err(MediaError::CaptureError("ReleaseFrame failed".into())),
+                _ => Ok(Snapshot::Timeout),
+            };
+        }
+
+        // display_vram.cpp:1383-1390: the time the frame was displayed,
+        // `max(LastPresentTime, LastMouseUpdateTime)` (QPC) translated to the
+        // monotonic clock.
+        let qpc_displayed = frame_info.LastPresentTime.max(frame_info.LastMouseUpdateTime);
+        let frame_timestamp = if qpc_displayed != 0 { qpc_to_instant(qpc_displayed) } else { None };
+
+        // Adaptation: Sunshine fetches the texture only when `frame_update_flag`
+        // and otherwise forwards its saved last image with the cursor blended
+        // in. Lunaris draws the cursor into every copied frame (CPU path), so a
+        // mouse-only update is copied like a frame update (the duplication
+        // resource still holds the desktop image); cursor compositing itself
+        // is out of scope of this change.
+        let frame = self.copy_acquired(desktop_resource, &duplication, &context, &staging)?;
+        Ok(Snapshot::Frame(frame, frame_timestamp))
+    }
+
+    /// Copy the acquired duplication frame out (rest of the former
+    /// `next_frame`, unchanged apart from taking its inputs as arguments).
+    fn copy_acquired(
+        &mut self,
+        desktop_resource: Option<IDXGIResource>,
+        duplication: &IDXGIOutputDuplication,
+        context: &ID3D11DeviceContext,
+        staging: &ID3D11Texture2D,
+    ) -> Result<CapturedFrame, MediaError> {
+        let duplication = duplication.clone();
+        let context = context.clone();
+        let staging = staging.clone();
         let resource = desktop_resource
             .ok_or_else(|| MediaError::CaptureError("Desktop resource is None".into()))?;
 
@@ -839,9 +859,229 @@ impl ScreenCapture for DxgiCapture {
             cursor: None,
         })
     }
+}
+
+#[async_trait::async_trait]
+impl ScreenCapture for DxgiCapture {
+    async fn list_displays(&self) -> Result<Vec<DisplayInfo>, MediaError> {
+        let (device, _context) = Self::create_d3d11_device()?;
+        let outputs = Self::enumerate_outputs(&device)?;
+
+        let mut displays = Vec::new();
+        for (i, (_output, desc)) in outputs.iter().enumerate() {
+            let rect = desc.DesktopCoordinates;
+            let width = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+
+            let name_chars: Vec<u16> = desc.DeviceName.iter().take_while(|&&c| c != 0).copied().collect();
+            let name = String::from_utf16_lossy(&name_chars);
+
+            displays.push(DisplayInfo {
+                id: format!("{}", i),
+                name,
+                width,
+                height,
+                refresh_rate: 60.0,
+                is_primary: rect.left == 0 && rect.top == 0,
+            });
+        }
+
+        Ok(displays)
+    }
+
+    async fn start(&mut self, display_id: &str, config: &StreamConfig) -> Result<(), MediaError> {
+        if self.capturing {
+            return Err(MediaError::CaptureAlreadyStarted);
+        }
+
+        // Started BEFORE the duplication attempts so that a sleeping monitor is
+        // being woken while they run. Dropped (execution state released) if
+        // start fails. See `KeepAwake` (display_base.cpp:254-261).
+        let keep_awake = KeepAwake::start();
+
+        let (device, context) = Self::create_d3d11_device()?;
+
+        // Output search, `DuplicateOutput` x2 with `syncThreadDesktop()`, and the
+        // wake-and-retry pass: see `find_and_duplicate`.
+        let found = Self::find_and_duplicate(&device, display_id).await?;
+
+        let output_index = found.index;
+        let rect = found.rect;
+        self.width = (rect.right - rect.left) as u32;
+        self.height = (rect.bottom - rect.top) as u32;
+
+        log::info!(
+            "DXGI: Starting capture on output {} ({}x{})",
+            output_index,
+            self.width,
+            self.height
+        );
+
+        let duplication = found.duplication;
+
+        let staging = Self::create_staging_texture(&device, self.width, self.height)?;
+
+        let use_zero_copy = std::env::var("LUNARIS_ZERO_COPY")
+            .map(|val| val == "1" || val.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let gpu_texture = if use_zero_copy {
+            log::info!("DXGI: Creating GPU-only texture for Zero-Copy mode");
+            Some(Self::create_gpu_texture(&device, self.width, self.height)?)
+        } else {
+            None
+        };
+
+        // display_base.cpp:739 `client_frame_rate = config.framerate`, and
+        // display_base.cpp:136-146 `display_refresh_rate`; the pacing group
+        // starts empty (display_base.cpp:250-252).
+        self.client_frame_rate = config.fps.max(1);
+        self.display_refresh_rate = found.refresh_rate;
+        self.client_frame_rate_adjusted =
+            adjust_client_frame_rate(self.client_frame_rate, self.display_refresh_rate);
+        self.frame_pacing_group_start = None;
+        self.frame_pacing_group_frames = 0;
+        self.sleep_overshoot_logger.reset(); // display_base.cpp:263
+        // `timer = create_high_precision_timer()` and the timer resolution
+        // request of `streaming_will_start()` (misc.cpp:1218-1225). Restored in
+        // `stop()` (`streaming_will_stop()`, misc.cpp:1306-1314).
+        self.timer = Some(HighPrecisionTimer::new());
+        self.timer_resolution = Some(TimerResolution::raise());
+
+        self.keep_awake = Some(keep_awake);
+        self.factory = Some(found.factory);
+        self.tex_width = found.tex_width;
+        self.tex_height = found.tex_height;
+        self.device = Some(device);
+        self.context = Some(context);
+        self.duplication = Some(duplication);
+        self.staging_texture = Some(staging);
+        self.gpu_texture = gpu_texture;
+        self.use_zero_copy = use_zero_copy;
+        self.x_offset = rect.left;
+        self.y_offset = rect.top;
+        self.capturing = true;
+        self.start_time = Some(Instant::now());
+        self.frame_count = 0;
+        self.last_returned_time = None;
+
+        log::info!("DXGI Desktop Duplication capture started");
+        Ok(())
+    }
+
+    async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
+        if !self.capturing {
+            return Err(MediaError::CaptureError("Not capturing".into()));
+        }
+
+        // One call = one iteration of the `while (true)` loop of
+        // `display_base_t::capture` (display_base.cpp:265-361).
+        //
+        // Sunshine runs that loop on a dedicated capture thread that pushes
+        // images to the encoder thread through a callback. Lunaris does not
+        // yet: capture and encoder share ONE D3D11 immediate context, which is
+        // not thread-safe (Sunshine gives the capture and the encoder their
+        // own ID3D11Device). So the loop body runs on the caller's thread and
+        // blocks it for at most about one frame interval (the pacing sleep
+        // plus the `AcquireNextFrame` timeout, both capped below).
+
+        // display_base.cpp:264-271: "This will return false if the HDR state
+        // changes or for any number of other display or GPU changes. We should
+        // reinit to examine the updated state of the display subsystem."
+        if let Some(factory) = &self.factory {
+            if !unsafe { factory.IsCurrent() }.as_bool() {
+                log::info!("DXGI factory is no longer current: capture has to be re-initialised");
+                return Err(MediaError::CaptureReinit);
+            }
+        }
+
+        // `status == ok` with `img_out` null at the top of the iteration
+        // (display_base.cpp:273-274) is `None`.
+        let mut status: Option<Snapshot> = None;
+
+        // Try to continue frame pacing group, snapshot() is called with zero
+        // timeout after waiting for client frame interval (display_base.cpp:277-308).
+        if let Some(group_start) = self.frame_pacing_group_start {
+            let (num, den) = self.client_frame_rate_adjusted;
+            let frames = self.frame_pacing_group_frames as u64;
+            let seconds = frames * den / num;
+            let remainder = frames * den % num;
+            let sleep_target = group_start
+                + Duration::from_secs(seconds)
+                + Duration::from_nanos((1_000_000_000u64 as u128 * remainder as u128 / num as u128) as u64);
+            let now = Instant::now();
+
+            if sleep_target <= now {
+                // We missed next frame time, invalidating current frame pacing group
+                self.frame_pacing_group_start = None;
+                self.frame_pacing_group_frames = 0;
+                status = Some(Snapshot::Timeout);
+            } else {
+                // Safety cap (not in Sunshine): never sleep longer than the
+                // target allows; a group start in the future (clock
+                // translation) must not block the pipeline for long.
+                let sleep_period = (sleep_target - now).min(Duration::from_millis(200));
+                if let Some(timer) = &self.timer {
+                    timer.sleep_for(sleep_period);
+                } else {
+                    // Sunshine's sleep_for logs and returns on an uninitialised timer.
+                    log::error!("Attempting high_precision_timer::sleep_for() with uninitialized timer");
+                }
+                self.sleep_overshoot_logger.first_point(sleep_target);
+                self.sleep_overshoot_logger.second_point_now_and_log();
+
+                let snap = self.snapshot(Duration::ZERO)?;
+                if matches!(snap, Snapshot::Frame(..)) {
+                    self.frame_pacing_group_frames += 1;
+                } else {
+                    self.frame_pacing_group_start = None;
+                    self.frame_pacing_group_frames = 0;
+                }
+                status = Some(snap);
+            }
+        }
+
+        // Start new frame pacing group if necessary, snapshot() is called with
+        // non-zero timeout (display_base.cpp:310-343).
+        // Sunshine uses 200 ms here. Lunaris waits at most one stream frame
+        // interval (never more than 200 ms): the pipeline pads a static screen
+        // with the "no new frame" result at the stream rate, as the PipeWire
+        // backend does (`ScreenCapture::paces_frames`). Sunshine's
+        // encoder-side repeat logic does not exist here.
+        if matches!(status, Some(Snapshot::Timeout)) || self.frame_pacing_group_start.is_none() {
+            let interval = Duration::from_nanos(1_000_000_000 / self.client_frame_rate.max(1) as u64);
+            status = Some(self.snapshot(interval.min(Duration::from_millis(200)))?);
+            if let Some(Snapshot::Frame(_, timestamp)) = &status {
+                self.frame_pacing_group_start = Some(match timestamp {
+                    Some(t) => *t,
+                    None => {
+                        log::warn!("snapshot() provided image without timestamp");
+                        Instant::now()
+                    }
+                });
+                self.frame_pacing_group_frames = 1;
+            }
+            // `else if (status == timeout)`: Sunshine sleeps 10 ms here so the
+            // encoder thread is not starved of the D3D11 device lock held by
+            // AcquireNextFrame (display_base.cpp:316-336). Not ported: capture
+            // and encode run on the same thread here, so there is no thread to
+            // starve, and the sleep would delay the padding frame.
+        }
+
+        // display_base.cpp:345-357: timeout -> push_captured_image_cb(nullptr,
+        // false) (the existing "no new frame" frame); ok -> push the image.
+        match status {
+            Some(Snapshot::Frame(frame, _)) => Ok(frame),
+            _ => Ok(self.timeout_frame()),
+        }
+    }
 
     async fn stop(&mut self) -> Result<(), MediaError> {
         self.keep_awake = None; // SetThreadExecutionState(ES_CONTINUOUS), display_base.cpp:259
+        self.timer = None;
+        self.timer_resolution = None; // streaming_will_stop(), misc.cpp:1306-1314
+        self.frame_pacing_group_start = None;
+        self.frame_pacing_group_frames = 0;
         self.factory = None;
         self.duplication = None;
         self.staging_texture = None;
@@ -859,6 +1099,26 @@ impl ScreenCapture for DxgiCapture {
 
     fn is_capturing(&self) -> bool {
         self.capturing
+    }
+
+    /// `next_frame` waits for the next duplication frame itself
+    /// (display_base.cpp:226-361 frame pacing), the pipeline must not add a
+    /// second ticker.
+    fn paces_frames(&self) -> bool {
+        true
+    }
+
+    /// Sunshine has no runtime frame rate change (a new rate restarts the
+    /// session, display_base.cpp:739). Equivalent here: update
+    /// `client_frame_rate`, recompute `client_frame_rate_adjusted` and start a
+    /// new pacing group.
+    async fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        self.client_frame_rate = fps.max(1);
+        self.client_frame_rate_adjusted =
+            adjust_client_frame_rate(self.client_frame_rate, self.display_refresh_rate);
+        self.frame_pacing_group_start = None;
+        self.frame_pacing_group_frames = 0;
+        Ok(())
     }
 
     fn get_d3d11_device(&self) -> Option<(usize, usize)> {
@@ -1195,6 +1455,11 @@ pub struct WindowsScreenCapture {
     display_id: String,
     config: Option<StreamConfig>,
     black_frame_count: u32,
+    /// `paces_frames()` has returned `true` to the pipeline, which then runs
+    /// without its own ticker. If capture falls back to GDI mid-stream (which
+    /// does not pace), the wrapper has to keep that promise.
+    promised_pacing: std::sync::atomic::AtomicBool,
+    gdi_next_due: Option<tokio::time::Instant>,
 }
 
 impl WindowsScreenCapture {
@@ -1211,6 +1476,8 @@ impl WindowsScreenCapture {
             display_id: String::new(),
             config: None,
             black_frame_count: 0,
+            promised_pacing: std::sync::atomic::AtomicBool::new(false),
+            gdi_next_due: None,
         })
     }
 }
@@ -1266,6 +1533,16 @@ impl ScreenCapture for WindowsScreenCapture {
 
     async fn next_frame(&mut self) -> Result<CapturedFrame, MediaError> {
         if self.active_is_gdi {
+            if self.promised_pacing.load(std::sync::atomic::Ordering::Relaxed) {
+                // Not Sunshine logic: fixed-rate pacing of the GDI fallback
+                // when the pipeline's own ticker has been switched off.
+                let fps = self.config.as_ref().map_or(60, |c| c.fps.max(1));
+                let interval = Duration::from_nanos(1_000_000_000 / fps as u64);
+                let due = self.gdi_next_due.unwrap_or_else(tokio::time::Instant::now);
+                tokio::time::sleep_until(due).await;
+                let now = tokio::time::Instant::now();
+                self.gdi_next_due = Some((due + interval).max(now));
+            }
             if let Some(gdi) = &mut self.gdi {
                 return gdi.next_frame().await;
             }
@@ -1322,6 +1599,28 @@ impl ScreenCapture for WindowsScreenCapture {
         } else {
             if let Some(dxgi) = &mut self.dxgi {
                 dxgi.stop().await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn paces_frames(&self) -> bool {
+        // GDI does not pace; DXGI does.
+        let paces = !self.active_is_gdi
+            && self.dxgi.as_ref().map_or(false, |dxgi| dxgi.paces_frames());
+        if paces {
+            self.promised_pacing.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        paces
+    }
+
+    async fn set_fps(&mut self, fps: u32) -> Result<(), MediaError> {
+        if let Some(config) = &mut self.config {
+            config.fps = fps;
+        }
+        if !self.active_is_gdi {
+            if let Some(dxgi) = &mut self.dxgi {
+                return dxgi.set_fps(fps).await;
             }
         }
         Ok(())

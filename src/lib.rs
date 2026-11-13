@@ -72,6 +72,8 @@ pub mod input;
 pub mod colorspace;
 #[cfg(target_os = "windows")]
 pub(crate) mod win_desktop;
+#[cfg(target_os = "windows")]
+pub(crate) mod win_timer;
 
 // Re-export primary public API for convenience.
 pub use error::MediaError;

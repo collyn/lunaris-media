@@ -385,6 +385,12 @@ impl MediaPipeline {
         let mut log_size_after_reinit = false;
         let mut metrics_started = Instant::now();
         let mut metrics_ticks: u64 = 0;
+        // Tick-to-tick interval of the video loop within one metrics period
+        // (frame pacing quality: all three should be close to 1000/fps).
+        let mut metrics_last_tick: Option<Instant> = None;
+        let mut metrics_tick_min = Duration::MAX;
+        let mut metrics_tick_max = Duration::ZERO;
+        let mut metrics_tick_late: u64 = 0;
         let mut metrics_new_captures: u64 = 0;
         let mut metrics_encode_attempts: u64 = 0;
         let mut metrics_encoded_frames: u64 = 0;
@@ -398,6 +404,18 @@ impl MediaPipeline {
                 // Video: capture → encode → send
                 _ = frame_ticker.tick() => {
                     metrics_ticks += 1;
+                    {
+                        let now = Instant::now();
+                        if let Some(prev) = metrics_last_tick {
+                            let dt = now - prev;
+                            metrics_tick_min = metrics_tick_min.min(dt);
+                            metrics_tick_max = metrics_tick_max.max(dt);
+                            if dt > target_interval + target_interval / 4 {
+                                metrics_tick_late += 1;
+                            }
+                        }
+                        metrics_last_tick = Some(now);
+                    }
                     let frame_result = capture.next_frame().await;
                     if matches!(frame_result, Err(MediaError::CaptureReinit)) {
                         // Port of Sunshine's handling of `capture_e::reinit`
@@ -606,7 +624,7 @@ impl MediaPipeline {
                         };
                         let queue_len = event_capacity - self.event_tx.capacity();
                         log::debug!(
-                            "Pipeline metrics: ticks={:.1}/s capture_new={:.1}/s encode_attempts={:.1}/s encoded={:.1}/s sent={:.1}/s dropped={} bitrate={:.2}Mbps queue={} avg_encode={:.2}ms constant_fps={}",
+                            "Pipeline metrics: ticks={:.1}/s capture_new={:.1}/s encode_attempts={:.1}/s encoded={:.1}/s sent={:.1}/s dropped={} bitrate={:.2}Mbps queue={} avg_encode={:.2}ms constant_fps={} tick_ms(min/max)={:.1}/{:.1} late_ticks={}",
                             metrics_ticks as f64 / secs,
                             metrics_new_captures as f64 / secs,
                             metrics_encode_attempts as f64 / secs,
@@ -616,8 +634,14 @@ impl MediaPipeline {
                             (metrics_bytes as f64 * 8.0 / secs) / 1_000_000.0,
                             queue_len,
                             avg_encode_ms,
-                            constant_fps
+                            constant_fps,
+                            if metrics_tick_min == Duration::MAX { 0.0 } else { metrics_tick_min.as_secs_f64() * 1000.0 },
+                            metrics_tick_max.as_secs_f64() * 1000.0,
+                            metrics_tick_late
                         );
+                        metrics_tick_min = Duration::MAX;
+                        metrics_tick_max = Duration::ZERO;
+                        metrics_tick_late = 0;
                         metrics_started = Instant::now();
                         metrics_ticks = 0;
                         metrics_new_captures = 0;
