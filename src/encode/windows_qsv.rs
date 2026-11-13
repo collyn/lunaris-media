@@ -739,8 +739,16 @@ impl WindowsQsvEncoder {
             })?;
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .map_err(|e| MediaError::EncodeError(format!("CreateVideoProcessor failed: {e}")))?;
-        // The bitstream carries no colour description yet (Phase 3).
-        super::set_video_processor_colorspace(&video_context, &processor, &config.colorspace);
+        // Always Rec. 709 limited, whatever was requested: this encoder does
+        // not write the requested colour description yet (Phase 3). Measured
+        // on AMF (RX 6600 XT): its H.264 stream decodes as BT.709 limited, so
+        // converting to anything else shows wrong colours.
+        let colorspace = crate::colorspace::from_client_config(
+            crate::types::DEFAULT_ENCODER_CSC_MODE,
+            0,
+            false,
+        );
+        super::set_video_processor_colorspace(&video_context, &processor, &colorspace);
         self.video_device = Some(video_device);
         self.video_context = Some(video_context);
         self.video_enumerator = Some(enumerator);
