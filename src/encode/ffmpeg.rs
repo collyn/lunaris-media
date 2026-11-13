@@ -3273,6 +3273,16 @@ impl VideoEncoder for FfmpegEncoder {
 
         log::debug!("Setting bitrate to {} kbps", bitrate_kbps);
 
+        // FFmpeg's AMF encoders read the bitrate only when they are opened
+        // (libavcodec/amfenc_h264.c:378-389, amfenc_hevc.c:388-399, FFmpeg
+        // 8.1), so a change here would do nothing except force the key frame
+        // below. Measured with Chrome's bitrate estimate driving this: ten
+        // key frames in two minutes, each a burst that cost packets and a
+        // visible hitch, at an unchanged output bitrate.
+        if self.info.as_ref().map(|i| i.hw_type) == Some(HwAccelType::Amf) {
+            return Ok(());
+        }
+
         unsafe {
             let bitrate = (bitrate_kbps as i64) * 1000;
             (*self.codec_ctx).bit_rate = bitrate;
