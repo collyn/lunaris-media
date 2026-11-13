@@ -63,7 +63,7 @@ impl DxgiCapture {
         })
     }
 
-    fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), MediaError> {
+    pub(crate) fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), MediaError> {
         let mut device = None;
         let mut context = None;
 

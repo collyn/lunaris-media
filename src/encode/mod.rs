@@ -475,6 +475,57 @@ pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Op
     }
 }
 
+/// Windows counterpart of the probe above: opens the encoder a session would
+/// use for `codec` (through [`create_encoder`], so FFmpeg AMF on AMD and the
+/// native NVENC / QSV encoders elsewhere) at the given size, then shuts it
+/// down. Those encoders need a D3D11 device, so one is created with the
+/// capture backend's own routine; Sunshine's `probe_encoders` likewise probes
+/// against its real display device (`reset_display`, video.cpp).
+#[cfg(target_os = "windows")]
+pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Option<EncoderInfo> {
+    use windows::core::Interface;
+
+    let (device, context) = match crate::capture::windows::DxgiCapture::create_d3d11_device() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::info!("Encoder probe for {:?} {}x{}: no D3D11 device ({})", codec, width, height, e);
+            return None;
+        }
+    };
+    let config = EncoderConfig {
+        codec,
+        width,
+        height,
+        fps,
+        bitrate_kbps: 8_000,
+        keyframe_interval: KEYFRAME_INTERVAL_ON_DEMAND,
+        d3d11_device: Some(device.as_raw() as usize),
+        d3d11_context: Some(context.as_raw() as usize),
+        ..EncoderConfig::default()
+    };
+    let result = create_encoder().and_then(|mut encoder| match encoder.initialize(&config) {
+        Ok(()) => {
+            let info = encoder.encoder_info();
+            // Encoder first, device afterwards, as the pipeline does on shutdown.
+            encoder.shutdown();
+            Ok(info)
+        }
+        Err(e) => {
+            encoder.shutdown();
+            Err(e)
+        }
+    });
+    drop(context);
+    drop(device);
+    match result {
+        Ok(info) => Some(info),
+        Err(e) => {
+            log::info!("Encoder probe for {:?} {}x{}: no usable encoder ({})", codec, width, height, e);
+            None
+        }
+    }
+}
+
 pub fn describe_host_gpu(d3d11_device: Option<usize>) -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     let _ = d3d11_device;
