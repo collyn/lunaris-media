@@ -7,13 +7,14 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run --release --example color_roundtrip -- <csc 0..=3> [encoder] <out.h264>
+//! cargo run --release --example color_roundtrip -- <csc 0..=3> [encoder] <out> [codec]
 //! # e.g. csc 2 = Rec. 709 limited, 3 = Rec. 709 full, 0 = Rec. 601 limited
 //! cargo run --release --example color_roundtrip -- 2 software /tmp/bars.h264
 //! ```
 //!
 //! With two arguments only, the second one is the output path and the
-//! encoder defaults to "software".
+//! encoder defaults to "software". The optional fourth argument is the codec,
+//! `h264` (default) or `h265`.
 
 use std::io::Write;
 
@@ -42,7 +43,7 @@ const BARS: [[u8; 4]; 8] = [
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: color_roundtrip <csc 0..=3> [encoder] <output.h264>");
+        eprintln!("usage: color_roundtrip <csc 0..=3> [encoder] <output> [codec: h264|h265]");
         std::process::exit(2);
     }
     let csc: i32 = args[1].parse()?;
@@ -55,11 +56,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("software".to_string(), args[2].clone())
     };
 
+    let codec = match args.get(4).map(String::as_str) {
+        None | Some("h264") => VideoCodec::H264,
+        Some("h265") => VideoCodec::H265,
+        Some(other) => return Err(format!("unknown codec '{other}' (h264 or h265)").into()),
+    };
+
     let config = StreamConfig {
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,
-        codec: VideoCodec::H264,
+        codec,
         pixel_format: PixelFormat::BGRA,
         preferred_encoder: Some(encoder_pref.clone()),
         colorspace: from_client_config(csc, 0, false),
@@ -77,6 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         preferred_hw: StreamConfig::parse_encoder_preference(&encoder_pref),
         force_ffmpeg: StreamConfig::encoder_prefers_ffmpeg(&encoder_pref),
         colorspace: config.colorspace,
+        // RT_YUV444=1: encode 4:4:4 (H.264 only).
+        yuv444: std::env::var("RT_YUV444").is_ok(),
         ..EncoderConfig::default()
     })?;
     println!("encoder: {:?}", encoder.encoder_info());
