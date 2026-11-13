@@ -69,6 +69,7 @@ pub mod error;
 pub mod pipeline;
 pub mod types;
 pub mod input;
+pub mod colorspace;
 
 // Re-export primary public API for convenience.
 pub use error::MediaError;
