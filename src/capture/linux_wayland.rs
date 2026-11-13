@@ -358,7 +358,7 @@ fn portal_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-type ScreencastSession = ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>;
+type ScreencastSession = ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>;
 
 struct PortalSession {
     session: ScreencastSession,
@@ -386,14 +386,14 @@ async fn portal_step<T, E: std::fmt::Display>(
 /// Open a ScreenCast portal session for one monitor, reusing the saved
 /// restore token so reconnects do not prompt the user.
 async fn open_portal_session() -> Result<PortalSession, MediaError> {
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+    use ashpd::desktop::screencast::{
+        CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions,
+    };
     use ashpd::desktop::PersistMode;
-    use ashpd::WindowIdentifier;
-    use enumflags2::BitFlags;
 
     log::info!("Connecting to Screencast portal...");
     let screencast = portal_step("Failed to create Screencast portal", PORTAL_CALL_TIMEOUT, Screencast::new()).await?;
-    let session = portal_step("Failed to create portal session", PORTAL_CALL_TIMEOUT, screencast.create_session()).await?;
+    let session = portal_step("Failed to create portal session", PORTAL_CALL_TIMEOUT, screencast.create_session(Default::default())).await?;
 
     let config_dir = std::env::var("XDG_CONFIG_HOME")
         .unwrap_or_else(|_| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
@@ -406,7 +406,7 @@ async fn open_portal_session() -> Result<PortalSession, MediaError> {
     log::info!("Requesting source selection...");
     let cursor_mode = if crate::capture::should_embed_host_cursor() {
         log::info!("PipeWireCapture: embedding host cursor in video stream");
-        CursorMode::Embedded
+        CursorMode::EMBEDDED
     } else {
         // Cursor as metadata (SPA_META_Cursor): not drawn into the video,
         // forwarded to the client overlay instead. Fall back to embedding
@@ -416,12 +416,12 @@ async fn open_portal_session() -> Result<PortalSession, MediaError> {
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or_default();
-        if available.contains(CursorMode::Metadata) {
+        if available.contains(CursorMode::METADATA) {
             log::info!("PipeWireCapture: cursor as metadata; browser overlay will render it");
-            CursorMode::Metadata
+            CursorMode::METADATA
         } else {
             log::info!("PipeWireCapture: portal lacks cursor metadata; embedding cursor in video");
-            CursorMode::Embedded
+            CursorMode::EMBEDDED
         }
     };
     portal_step(
@@ -429,11 +429,12 @@ async fn open_portal_session() -> Result<PortalSession, MediaError> {
         PORTAL_CALL_TIMEOUT,
         screencast.select_sources(
             &session,
-            cursor_mode,
-            BitFlags::from(SourceType::Monitor),
-            false,
-            saved_token.as_deref(),
-            PersistMode::ExplicitlyRevoked,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(cursor_mode)
+                .set_sources(SourceType::MONITOR)
+                .set_multiple(false)
+                .set_restore_token(saved_token.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
         ),
     )
     .await?;
@@ -442,7 +443,7 @@ async fn open_portal_session() -> Result<PortalSession, MediaError> {
     let request = portal_step(
         "Failed to start portal",
         PORTAL_START_TIMEOUT,
-        screencast.start(&session, &WindowIdentifier::default()),
+        screencast.start(&session, None, StartCastOptions::default()),
     )
     .await?;
     let start_response = request
@@ -642,17 +643,15 @@ fn run_pipewire_loop(
     config: StreamConfig,
     passthrough: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), MediaError> {
-    use pipewire::main_loop::MainLoop;
+    use pipewire::main_loop::MainLoopRc;
     use pipewire::spa::sys as spa;
 
-    let mainloop = Rc::new(
-        MainLoop::new(None)
-            .map_err(|e| MediaError::CaptureError(format!("Failed to create MainLoop: {}", e)))?,
-    );
-    let context = pipewire::context::Context::new(mainloop.as_ref())
+    let mainloop = MainLoopRc::new(None)
+        .map_err(|e| MediaError::CaptureError(format!("Failed to create MainLoop: {}", e)))?;
+    let context = pipewire::context::ContextRc::new(&mainloop, None)
         .map_err(|e| MediaError::CaptureError(format!("Failed to create Context: {}", e)))?;
     let core = context
-        .connect(None)
+        .connect_rc(None)
         .map_err(|e| MediaError::CaptureError(format!("Failed to connect Context: {}", e)))?;
 
     let props = pipewire::properties::properties! {
@@ -661,7 +660,7 @@ fn run_pipewire_loop(
         *pipewire::keys::MEDIA_ROLE => "Screen",
     };
 
-    let stream = pipewire::stream::Stream::new(&core, "lunaris-capture", props)
+    let stream = pipewire::stream::StreamRc::new(core.clone(), "lunaris-capture", props)
         .map_err(|e| MediaError::CaptureError(format!("Failed to create Stream: {}", e)))?;
 
     let mainloop_clone = mainloop.clone();
