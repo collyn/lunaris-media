@@ -13,12 +13,9 @@
 
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{GENERIC_ALL, WAIT_ABANDONED};
+use windows::Win32::Foundation::WAIT_ABANDONED;
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
-use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
-    DF_ALLOWOTHERACCOUNTHOOK,
-};
+use crate::win_desktop::sync_thread_desktop;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -29,35 +26,6 @@ use crate::capture::{CapturedFrame, ScreenCapture};
 use crate::capture::gpu_buffer::GpuBuffer;
 use crate::error::MediaError;
 use crate::types::*;
-
-/// Port of Sunshine `syncThreadDesktop()` (src/platform/windows/misc.cpp:247-264):
-/// attach the CALLING thread to the desktop that currently receives input, so
-/// that `DuplicateOutput` is not refused (E_ACCESSDENIED) after a desktop
-/// switch (lock screen, UAC prompt, sleeping monitor).
-///
-/// Adaptation: it acts on the calling thread only. Lunaris runs on tokio worker
-/// threads and a task may move to another thread at any `.await`, so every
-/// caller must invoke this in the same synchronous stretch of code as the
-/// `DuplicateOutput` it protects, with no `.await` in between.
-fn sync_thread_desktop() {
-    unsafe {
-        let desk = match OpenInputDesktop(
-            DF_ALLOWOTHERACCOUNTHOOK,
-            false,
-            DESKTOP_ACCESS_FLAGS(GENERIC_ALL.0),
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("Failed to Open Input Desktop [{e}]");
-                return;
-            }
-        };
-        if let Err(e) = SetThreadDesktop(desk) {
-            log::error!("Failed to sync desktop to thread [{e}]");
-        }
-        let _ = CloseDesktop(desk);
-    }
-}
 
 /// Keeps the display awake while capturing.
 ///

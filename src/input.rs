@@ -479,15 +479,45 @@ pub struct InputInjector {
 static LAST_UIPI_WARN_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
-/// Wrap `SendInput` with error checking. Returns the same value as `SendInput`
-/// (count of successfully inserted events). Logs a rate-limited diagnostic when
-/// the call fails due to UIPI (e.g. an elevated window like Task Manager has
-/// focus and blocks input from a non-admin process).
+// Desktop handle value that the last `sync_thread_desktop()` of this thread
+// returned. Port of `thread_local HDESK _lastKnownInputDesktop`
+// (Sunshine-v0.23.1/input.cpp:33). Each of the input threads has its own, as
+// the desktop is attached per thread.
+thread_local! {
+    static LAST_KNOWN_INPUT_DESKTOP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_os = "windows")]
+/// Wrap `SendInput` with error checking and input desktop switching. Returns
+/// the same value as `SendInput` (count of successfully inserted events).
+///
+/// Port of `send_input` (Sunshine-v0.23.1/input.cpp:468-483): when `SendInput`
+/// inserts fewer events than given (it does so when the desktop that receives
+/// input is not the one of the calling thread: UAC prompt, lock screen), the
+/// thread is attached to the input desktop (`sync_thread_desktop`, :476) and,
+/// when that desktop is not the one of the last attempt (:477-478), the call is
+/// repeated (`goto retry`, :473 and :479). Adaptation: Sunshine sends one `INPUT` per
+/// call, here a slice is sent and "failed" means fewer events than given.
+///
+/// When it still fails, logs a rate-limited diagnostic (Sunshine: "Couldn't
+/// send input", :481): with no desktop change to blame it is nearly always UIPI,
+/// when a privileged window (Task Manager) has focus and blocks input from a
+/// non-admin process.
 unsafe fn send_input_checked(inputs: &[INPUT], cb_size: i32) -> u32 {
-    let ret = SendInput(inputs, cb_size);
+    let mut ret;
+    loop {
+        ret = SendInput(inputs, cb_size);
+        if ret as usize == inputs.len() {
+            break;
+        }
+        let desk = crate::win_desktop::sync_thread_desktop();
+        if LAST_KNOWN_INPUT_DESKTOP.with(|d| d.get()) != desk {
+            LAST_KNOWN_INPUT_DESKTOP.with(|d| d.set(desk));
+            continue;
+        }
+        break;
+    }
     if ret == 0 {
-        // Input was blocked — nearly always UIPI when a privileged window
-        // (Task Manager, UAC prompt, etc.) has focus.
         let err = GetLastError();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
