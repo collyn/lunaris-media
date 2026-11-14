@@ -21,7 +21,6 @@ Updated: 2026-06-12
 | Audio capture | Implemented | cpal + Opus (PulseAudio/PipeWire monitor capture). |
 | Cursor tracking | Implemented | X11/XFixes cursor position + shape. PipeWire `SPA_META_Cursor` metadata per-frame. |
 | Input injection | Implemented | XTest when `DISPLAY` is available, `/dev/uinput` otherwise. |
-| Virtual display | Implemented | XRandR VIRTUAL output management. |
 
 ### Windows
 
@@ -34,7 +33,6 @@ Updated: 2026-06-12
 | Audio capture | Implemented | WASAPI loopback capture. |
 | Cursor tracking | Implemented | Native Windows cursor position + shape. |
 | Input injection | Implemented | `SendInput` for mouse/keyboard. |
-| Virtual display | Implemented | IddCx driver communication (requires `usbmmidd` or compatible driver installed). |
 
 ### macOS
 
@@ -71,10 +69,6 @@ MediaPipeline
   |-- Input injection
   |     Linux:   XTest + uinput
   |     Windows: SendInput
-  |
-  |-- Virtual display
-  |     Linux:   XRandR VIRTUAL output
-  |     Windows: IddCx driver (usbmmidd)
   |
   |-- Commands
         RequestKeyframe, SetBitrate, SetFps, Stop
@@ -179,7 +173,6 @@ NVIDIA NvFBC/NVENC paths also require a compatible NVIDIA driver and CUDA/NvFBC 
   - **NVENC**: `nvEncodeAPI64.dll` (NVIDIA driver)
   - **AMF**: `amfrt64.dll` (AMD driver)
   - **QSV**: `libvpl.dll` (Intel oneVPL runtime)
-- Virtual display requires an IddCx driver installed (e.g. [usbmmidd](https://github.com/ge9/IddSampleDriver))
 
 ### Build Commands
 
@@ -219,7 +212,6 @@ cargo run --example test_xtest
 - **`/dev/uinput`**: Input injection usually requires permissions through udev rules or root.
 - **Audio**: Depends on the system exposing a monitor or loopback input source.
 - **Windows encoders**: Native NVENC/AMF/QSV encoders use D3D11 zero-copy — frames stay on the GPU. No FFmpeg dependency on Windows.
-- **Windows virtual display**: Requires an IddCx driver (e.g. `usbmmidd`) installed and running.
 
 ## Project Structure
 
@@ -241,11 +233,7 @@ lunaris-media/
 │   │   ├── linux_drm.rs
 │   │   ├── linux_wayland.rs
 │   │   ├── linux_x11.rs
-│   │   ├── windows.rs
-│   │   └── virtual_display/
-│   │       ├── mod.rs
-│   │       ├── linux.rs
-│   │       └── windows.rs
+│   │   └── windows.rs
 │   ├── encode/
 │   │   ├── mod.rs
 │   │   ├── ffmpeg.rs

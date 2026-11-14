@@ -37,8 +37,6 @@ use tokio::sync::mpsc;
 use crate::audio;
 use crate::capture;
 use crate::cursor;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use crate::capture::virtual_display::VirtualDisplayHandle;
 use crate::encode;
 use crate::encode::EncoderConfig;
 use crate::error::MediaError;
@@ -197,28 +195,6 @@ impl MediaPipeline {
         // 2. Start capture
         #[allow(unused_mut)]
         let mut capture_display_id = display_id.to_string();
-
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        let mut _virtual_display: Option<Box<dyn VirtualDisplayHandle>> = None;
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let mut _virtual_display: Option<()> = None;
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        if self.config.virtual_display {
-            match crate::capture::virtual_display::create_virtual_display(
-                self.config.width,
-                self.config.height,
-                self.config.fps,
-            ) {
-                Ok(vd) => {
-                    capture_display_id = vd.display_id().to_string();
-                    log::info!("Created virtual display: {}", capture_display_id);
-                    _virtual_display = Some(vd);
-                }
-                Err(e) => {
-                    log::warn!("Failed to create virtual display: {}", e);
-                }
-            }
-        }
 
         // Raising the panel refresh via xrandr only applies to X11 outputs;
         // with portal/PipeWire capture the compositor owns the refresh rate.
@@ -870,8 +846,8 @@ impl MediaPipeline {
             log::warn!(
                 "Display '{}' does not advertise a ~{}Hz mode; leaving its refresh \
                  rate unchanged. Capture stays capped at the panel's real refresh \
-                 rate — use a genuine high-refresh output (or a forced-EDID / \
-                 virtual display) to exceed it.",
+                 rate — use a genuine high-refresh output (or a forced-EDID \
+                 display) to exceed it.",
                 display_id,
                 target_fps
             );

@@ -50,7 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitrate_kbps: 10_000,
         pixel_format: PixelFormat::NV12,
         preferred_encoder: None,
-        virtual_display: false,
         yuv444: false,
         microphone: false,
         ..Default::default()

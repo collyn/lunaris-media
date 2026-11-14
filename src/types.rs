@@ -67,8 +67,6 @@ pub struct StreamConfig {
     pub pixel_format: PixelFormat,
     /// Optional encoder preference (e.g. "nvenc", "vaapi", "software").
     pub preferred_encoder: Option<String>,
-    /// Create and capture a temporary virtual display when supported.
-    pub virtual_display: bool,
     /// Encode with full-resolution chroma (YUV 4:4:4, H.264 High 4:4:4).
     /// Sharper coloured text; needs NVENC or the software encoder.
     pub yuv444: bool,
@@ -96,7 +94,6 @@ impl Default for StreamConfig {
             bitrate_kbps: 10_000,
             pixel_format: PixelFormat::NV12,
             preferred_encoder: None,
-            virtual_display: false,
             yuv444: false,
             microphone: false,
             colorspace: crate::colorspace::from_client_config(DEFAULT_ENCODER_CSC_MODE, 0, false),

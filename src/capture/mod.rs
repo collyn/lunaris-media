@@ -32,8 +32,6 @@ pub mod linux_x11;
 pub mod egl_import;
 #[cfg(target_os = "macos")]
 pub mod macos;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub mod virtual_display;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
