@@ -845,6 +845,7 @@ impl MediaPipeline {
             d3d11_context,
             yuv444,
             colorspace: stream.colorspace,
+            hardware_only: false,
         })?;
         let encoder_info = encoder.encoder_info();
         // Only VAAPI imports DMA-BUFs zero-copy; for any other encoder let the

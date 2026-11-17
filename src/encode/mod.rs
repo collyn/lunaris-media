@@ -60,6 +60,11 @@ pub struct EncoderConfig {
     /// Colourspace, range and bit depth to convert to and to signal
     /// (Sunshine `encode_device->colorspace`, video.cpp:2040).
     pub colorspace: crate::colorspace::StreamColorspace,
+    /// Try hardware encoders only (no software fallback). For probes that
+    /// only want to know whether a hardware encoder opens: opening a software
+    /// encoder there costs much memory for nothing (libsvtav1 at 1080p60
+    /// takes about 1 GB, and the allocator keeps it after the encoder closes).
+    pub hardware_only: bool,
 }
 
 impl Default for EncoderConfig {
@@ -82,6 +87,7 @@ impl Default for EncoderConfig {
                 0,
                 false,
             ),
+            hardware_only: false,
         }
     }
 }
@@ -454,8 +460,18 @@ pub fn describe_d3d11_device(_device_ptr: Option<usize>) -> Option<String> {
 /// it, returning the encoder that worked (the same choice a pipeline would
 /// make). FFmpeg listing an encoder (e.g. `hevc_vaapi`) does not mean the
 /// GPU driver accepts it, so callers use this before offering a codec.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Option<EncoderInfo> {
+    probe_encoder_with(codec, width, height, fps, false)
+}
+
+/// Like [`probe_encoder`], trying hardware encoders only: `None` when no
+/// hardware encoder opens (a software one is never opened to find out).
+pub fn probe_hardware_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Option<EncoderInfo> {
+    probe_encoder_with(codec, width, height, fps, true)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn probe_encoder_with(codec: VideoCodec, width: u32, height: u32, fps: u32, hardware_only: bool) -> Option<EncoderInfo> {
     let mut encoder = ffmpeg::FfmpegEncoder::new().ok()?;
     let config = EncoderConfig {
         codec,
@@ -464,6 +480,7 @@ pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Op
         fps,
         bitrate_kbps: 8_000,
         keyframe_interval: KEYFRAME_INTERVAL_ON_DEMAND,
+        hardware_only,
         ..EncoderConfig::default()
     };
     match encoder.initialize(&config) {
@@ -482,7 +499,7 @@ pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Op
 /// capture backend's own routine; Sunshine's `probe_encoders` likewise probes
 /// against its real display device (`reset_display`, video.cpp).
 #[cfg(target_os = "windows")]
-pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Option<EncoderInfo> {
+fn probe_encoder_with(codec: VideoCodec, width: u32, height: u32, fps: u32, hardware_only: bool) -> Option<EncoderInfo> {
     use windows::core::Interface;
 
     let (device, context) = match crate::capture::windows::DxgiCapture::create_d3d11_device() {
@@ -501,6 +518,7 @@ pub fn probe_encoder(codec: VideoCodec, width: u32, height: u32, fps: u32) -> Op
         keyframe_interval: KEYFRAME_INTERVAL_ON_DEMAND,
         d3d11_device: Some(device.as_raw() as usize),
         d3d11_context: Some(context.as_raw() as usize),
+        hardware_only,
         ..EncoderConfig::default()
     };
     let result = create_encoder().and_then(|mut encoder| match encoder.initialize(&config) {

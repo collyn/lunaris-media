@@ -2334,6 +2334,9 @@ impl VideoEncoder for FfmpegEncoder {
             candidates.retain(|(_, hw)| matches!(hw, HwAccelType::Nvenc | HwAccelType::Software));
             log::info!("YUV 4:4:4: encoder candidates narrowed to {:?}", candidates);
         }
+        if config.hardware_only {
+            candidates.retain(|(_, hw)| *hw != HwAccelType::Software);
+        }
 
         let mut last_err = MediaError::EncoderInitFailed("No encoders available".into());
 
