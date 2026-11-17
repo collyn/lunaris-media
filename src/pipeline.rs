@@ -74,6 +74,11 @@ pub enum PipelineCommand {
     SetBitrate(u32),
     /// Change the target video FPS.
     SetFps(u32),
+    /// Encode at most this many frames a second, without reconfiguring the
+    /// capture or the encoder (0: no limit). Cheap enough to follow a
+    /// congestion controller every second; frames in between are not encoded.
+    /// With a rate control that budgets per frame the bitrate falls with it.
+    SetFrameLimit(u32),
     /// Stop the pipeline gracefully.
     Stop,
 }
@@ -356,6 +361,10 @@ impl MediaPipeline {
         log::info!("Pipeline constant-FPS output: {}", constant_fps);
 
         let mut last_sent_time = Instant::now() - Duration::from_secs(5);
+        // `PipelineCommand::SetFrameLimit`: frames a second (0: none) and
+        // when the next frame may be encoded.
+        let mut frame_limit: u32 = 0;
+        let mut frame_limit_due = Instant::now();
         let mut keyframe_requested = true; // Force first frame immediately
         let mut last_frame: Option<crate::capture::CapturedFrame> = None;
         let mut log_size_after_reinit = false;
@@ -449,6 +458,9 @@ impl MediaPipeline {
                                             }
                                             PipelineCommand::SetFps(new_fps) => {
                                                 self.config.fps = new_fps.clamp(1, 240);
+                                            }
+                                            PipelineCommand::SetFrameLimit(limit) => {
+                                                frame_limit = limit;
                                             }
                                         },
                                     }
@@ -553,6 +565,21 @@ impl MediaPipeline {
 
                             if !should_encode {
                                 continue;
+                            }
+
+                            // Frame limit: this frame is kept as `last_frame`
+                            // but not encoded before its turn. A requested key
+                            // frame is not held back.
+                            if frame_limit > 0 && !keyframe_requested {
+                                let now = Instant::now();
+                                let interval = Duration::from_nanos(1_000_000_000 / frame_limit as u64);
+                                // Half a capture interval of tolerance, so a
+                                // limit that divides the capture rate takes
+                                // every n-th frame despite jitter.
+                                if now + target_interval / 2 < frame_limit_due {
+                                    continue;
+                                }
+                                frame_limit_due = (frame_limit_due + interval).max(now + interval / 2);
                             }
 
                             keyframe_requested = false;
@@ -687,6 +714,11 @@ impl MediaPipeline {
                             frame_ticker = tokio::time::interval(tick_interval(target_interval));
                             frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             keyframe_requested = true;
+                        }
+                        PipelineCommand::SetFrameLimit(limit) => {
+                            log::debug!("Frame limit: {}", limit);
+                            frame_limit = limit;
+                            frame_limit_due = Instant::now();
                         }
                         PipelineCommand::Stop => {
                             log::info!("Stop command received");

@@ -13,12 +13,12 @@ use evdev::{AttributeSet, InputEvent, KeyCode, RelativeAxisCode, AbsoluteAxisCod
 
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_TYPE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    SendInput, INPUT, INPUT_0, INPUT_TYPE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC, KEYEVENTF_UNICODE,
+    VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC, KEYEVENTF_UNICODE, GetKeyState,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::GetLastError;
@@ -464,6 +464,52 @@ enum Backend {
     X11(X11Backend),
 }
 
+/// A lock key whose state [`InputInjector::lock_state`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockKey {
+    Caps,
+    Num,
+}
+
+/// The state of a lock key as the keyboards' LEDs under `dir` show it:
+/// `None` without such an LED, or when they do not agree.
+#[cfg(target_os = "linux")]
+fn led_state_from_sysfs(dir: &std::path::Path, lock: LockKey) -> Option<bool> {
+    let suffix = match lock {
+        LockKey::Caps => "::capslock",
+        LockKey::Num => "::numlock",
+    };
+    let mut state = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if !entry.file_name().to_string_lossy().ends_with(suffix) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path().join("brightness")) else { continue };
+        let on = text.trim().parse::<u32>().ok()? > 0;
+        match state {
+            None => state = Some(on),
+            Some(previous) if previous != on => return None,
+            Some(_) => {}
+        }
+    }
+    state
+}
+
+/// The part of the desktop the running (or last) capture streams, in the
+/// compositor's logical coordinates; `None` before any capture said so.
+#[cfg(target_os = "linux")]
+pub fn capture_region() -> Option<ScreenRegion> {
+    CAPTURE_MAPPING.lock().ok().and_then(|m| m.map(|(target, _)| target))
+}
+
+/// The enabled outputs of the desktop in logical coordinates (KDE's
+/// `kscreen-doctor`, else `xrandr`): what there is to know about the
+/// monitors where the capture backend cannot list them (Wayland portal).
+#[cfg(target_os = "linux")]
+pub fn desktop_outputs() -> Vec<ScreenRegion> {
+    desktop_layout()
+}
+
 /// A cross-platform input injector helper.
 pub struct InputInjector {
     #[cfg(target_os = "linux")]
@@ -883,6 +929,13 @@ impl InputInjector {
             let vk = VIRTUAL_KEY(vk_code);
             let scan = MapVirtualKeyW(vk_code as u32, MAPVK_VK_TO_VSC) as u16;
             let mut flags = KEYEVENTF_SCANCODE;
+            // These keys share their scan code with a numeric-keypad or
+            // left-hand key and are told apart by the extended flag; without
+            // it an arrow arrived as the keypad's (a digit with Num Lock on)
+            // and right Ctrl/Alt as the left ones.
+            if vk_is_extended(vk_code) {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
             if !is_press {
                 flags |= KEYEVENTF_KEYUP;
             }
@@ -899,6 +952,132 @@ impl InputInjector {
                 },
             };
             send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    /// Presses or releases the key at a physical position, with no layout or
+    /// virtual-key translation in between (what a remote client that sends
+    /// key positions means). `code` is the platform's own position code:
+    /// on Linux the kernel's key code (evdev; the X keycode minus 8), on
+    /// Windows the set-1 scan code, with extended keys as `0xE0xx`.
+    /// Returns whether the code could be injected.
+    pub fn key_position(&self, code: u32, is_press: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        match &self.backend {
+            Backend::Uinput(u) => {
+                // The virtual keyboard has the keys 1..=255.
+                if !(1..=255).contains(&code) {
+                    return false;
+                }
+                let events = [
+                    InputEvent::new(evdev::EventType::KEY.0, code as u16, if is_press { 1 } else { 0 }),
+                    InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
+                ];
+                if let Ok(mut dev) = u.keyboard.lock() {
+                    let _ = dev.emit(&events);
+                }
+                true
+            }
+            Backend::X11(x11) => {
+                // X keycodes are the kernel's plus 8, up to 255.
+                if !(1..=247).contains(&code) {
+                    return false;
+                }
+                let _lock = crate::X11_MUTEX.lock().unwrap();
+                unsafe {
+                    xtest::XTestFakeKeyEvent(x11.display, code + 8, if is_press { 1 } else { 0 }, 0);
+                    xlib::XFlush(x11.display);
+                }
+                true
+            }
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let extended = match code >> 8 {
+                0 => false,
+                0xE0 => true,
+                _ => return false,
+            };
+            let mut flags = KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if !is_press {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            let input = INPUT {
+                r#type: INPUT_TYPE(1), // INPUT_KEYBOARD
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: (code & 0xFF) as u16,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            send_input_checked(&[input], std::mem::size_of::<INPUT>() as i32) == 1
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = (code, is_press);
+            false
+        }
+    }
+
+    /// Whether a lock key is on at this computer, when that can be known.
+    ///
+    /// Windows: `GetKeyState`. X11: the keyboard's indicator state. The
+    /// uinput backend (Wayland) has no way to ask the compositor; the LEDs
+    /// of the attached keyboards (`/sys/class/leds/*::capslock`) are read
+    /// instead, and the answer is `None` when there is none or they
+    /// disagree.
+    pub fn lock_state(&self, lock: LockKey) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        match &self.backend {
+            Backend::X11(x11) => {
+                let _lock = crate::X11_MUTEX.lock().unwrap();
+                let mut state: libc::c_uint = 0;
+                // XkbUseCoreKbd; Success is 0.
+                let status = unsafe { xlib::XkbGetIndicatorState(x11.display, 0x0100, &mut state) };
+                if status != 0 {
+                    return None;
+                }
+                // The first two indicators of the default map: Caps Lock, Num Lock.
+                Some(match lock {
+                    LockKey::Caps => state & 0x1 != 0,
+                    LockKey::Num => state & 0x2 != 0,
+                })
+            }
+            Backend::Uinput(_) => led_state_from_sysfs(std::path::Path::new("/sys/class/leds"), lock),
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let vk = match lock {
+                LockKey::Caps => 0x14, // VK_CAPITAL
+                LockKey::Num => 0x90,  // VK_NUMLOCK
+            };
+            Some(GetKeyState(vk) & 0x1 == 0x1)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = lock;
+            None
+        }
+    }
+
+    /// Whether [`type_text`](Self::type_text) can type any Unicode character
+    /// by itself. False for the uinput backend, which only has keys: there
+    /// ASCII is typed on a US layout and the rest needs another route.
+    pub fn types_unicode(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.backend, Backend::X11(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
         }
     }
 
@@ -1004,6 +1183,64 @@ fn mouse_button_to_linux_keycode(button: u32) -> Option<KeyCode> {
         _ => return None,
     };
     Some(code)
+}
+
+/// Virtual keys whose scan code carries the E0 prefix on a PC keyboard
+/// (Microsoft "Keyboard Input Overview", Extended-Key Flag): the navigation
+/// cluster and arrows, Insert/Delete, the Windows and menu keys, keypad
+/// divide, Num Lock, and the right-hand Ctrl and Alt.
+#[cfg(any(target_os = "windows", test))]
+fn vk_is_extended(vk: u16) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0x6F | 0x90 | 0xA3 | 0xA5)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lock_state_tests {
+    use super::{led_state_from_sysfs, LockKey};
+
+    fn led(dir: &std::path::Path, name: &str, brightness: &str) {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(dir.join(name).join("brightness"), brightness).unwrap();
+    }
+
+    #[test]
+    fn leds_answer_only_when_they_agree() {
+        let dir = std::env::temp_dir().join(format!("lunaris-leds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(led_state_from_sysfs(&dir, LockKey::Caps), None);
+        led(&dir, "input1::capslock", "0\n");
+        led(&dir, "input1::numlock", "1\n");
+        led(&dir, "eth0::lan", "1\n");
+        assert_eq!(led_state_from_sysfs(&dir, LockKey::Caps), Some(false));
+        assert_eq!(led_state_from_sysfs(&dir, LockKey::Num), Some(true));
+        led(&dir, "input2::capslock", "0\n");
+        led(&dir, "input2::numlock", "0\n");
+        assert_eq!(led_state_from_sysfs(&dir, LockKey::Caps), Some(false));
+        assert_eq!(led_state_from_sysfs(&dir, LockKey::Num), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod extended_key_tests {
+    use super::vk_is_extended;
+
+    #[test]
+    fn navigation_and_right_hand_keys_are_extended() {
+        // Arrows, Home/End, Page Up/Down, Insert, Delete.
+        for vk in [0x25, 0x26, 0x27, 0x28, 0x24, 0x23, 0x21, 0x22, 0x2D, 0x2E] {
+            assert!(vk_is_extended(vk), "{:#x}", vk);
+        }
+        // Windows keys, menu, keypad divide, Num Lock, right Ctrl and Alt.
+        for vk in [0x5B, 0x5C, 0x5D, 0x6F, 0x90, 0xA3, 0xA5] {
+            assert!(vk_is_extended(vk), "{:#x}", vk);
+        }
+        // Letters, digits, the keypad digits, left modifiers, Enter, Shift.
+        for vk in [0x41, 0x30, 0x60, 0x64, 0x69, 0xA0, 0xA1, 0xA2, 0xA4, 0x0D, 0x10, 0x11, 0x12, 0x20, 0x70] {
+            assert!(!vk_is_extended(vk), "{:#x}", vk);
+        }
+    }
 }
 
 /// X keysym of a character: Latin-1 keysyms equal the code point, the rest

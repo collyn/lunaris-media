@@ -3283,6 +3283,20 @@ impl VideoEncoder for FfmpegEncoder {
             return Ok(());
         }
 
+        // FFmpeg's VAAPI encoders fix the rate control when they are opened
+        // (libavcodec/vaapi_encode.c `vaapi_encode_init_rate_control`, FFmpeg
+        // 8.1: `rc_params.bits_per_second` and `fr_params.framerate` are
+        // built once from the codec context and sent as global parameters),
+        // so writing the codec context below changed nothing. Open the
+        // encoder again with the new bitrate; capture keeps running, and the
+        // new session starts with an IDR frame.
+        if self.info.as_ref().map(|i| i.hw_type) == Some(HwAccelType::Vaapi) {
+            if self.config.as_ref().map(|c| c.bitrate_kbps) == Some(bitrate_kbps) {
+                return Ok(());
+            }
+            return self.reopen(|config| config.bitrate_kbps = bitrate_kbps);
+        }
+
         unsafe {
             let bitrate = (bitrate_kbps as i64) * 1000;
             (*self.codec_ctx).bit_rate = bitrate;
@@ -3321,6 +3335,16 @@ impl VideoEncoder for FfmpegEncoder {
             return Err(MediaError::EncoderNotInitialized);
         }
         let fps = fps.max(1);
+        // VAAPI: the frame rate of the rate control is fixed at open as well
+        // (see `set_bitrate`); with the old rate the encoder kept its budget
+        // per frame, so the bitrate followed the frame rate (measured with
+        // h264_vaapi: 30 -> 60 fps doubled it).
+        if self.info.as_ref().map(|i| i.hw_type) == Some(HwAccelType::Vaapi) {
+            if self.config.as_ref().map(|c| c.fps) == Some(fps) {
+                return Ok(());
+            }
+            return self.reopen(|config| config.fps = fps);
+        }
         if let Some(config) = &mut self.config {
             config.fps = fps;
             if config.keyframe_interval == 0 {
@@ -3455,6 +3479,34 @@ impl VideoEncoder for FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
+    /// Closes the encoder and opens it again with a changed configuration,
+    /// for settings an open encoder does not take. When the changed
+    /// configuration cannot be opened the previous one is restored.
+    fn reopen(&mut self, change: impl FnOnce(&mut EncoderConfig)) -> Result<(), MediaError> {
+        let Some(previous) = self.config.clone() else {
+            return Err(MediaError::EncoderNotInitialized);
+        };
+        let mut config = previous.clone();
+        change(&mut config);
+        let started = std::time::Instant::now();
+        self.shutdown();
+        let result = match self.initialize(&config) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log::warn!("Encoder could not be reopened with the new settings ({}); restoring the previous ones", e);
+                self.shutdown();
+                self.initialize(&previous).and(Err(e))
+            }
+        };
+        log::info!(
+            "Encoder reopened in {:.1} ms ({} fps, {} kbps)",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.config.as_ref().map(|c| c.fps).unwrap_or(0),
+            self.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(0),
+        );
+        result
+    }
+
     /// Stamp, send and drain one frame (shared tail of all encode paths).
     fn submit_frame(
         &mut self,

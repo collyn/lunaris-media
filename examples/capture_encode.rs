@@ -113,6 +113,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = kf_commands.send(PipelineCommand::RequestKeyframe).await;
     });
 
+    // ── Commands on a schedule: `--at 5:bitrate=4000 --at 10:fps=30
+    //    --at 15:limit=20` (seconds since start; kbps, fps, frames/s) ──
+    for (i, arg) in args.iter().enumerate() {
+        if arg != "--at" {
+            continue;
+        }
+        let Some((at, what)) = args.get(i + 1).and_then(|v| v.split_once(':')) else { continue };
+        let (Ok(at), Some((name, Ok(value)))) =
+            (at.parse::<f64>(), what.split_once('=').map(|(n, v)| (n, v.parse::<u32>())))
+        else {
+            continue;
+        };
+        let command = match name {
+            "bitrate" => PipelineCommand::SetBitrate(value),
+            "fps" => PipelineCommand::SetFps(value),
+            "limit" => PipelineCommand::SetFrameLimit(value),
+            _ => continue,
+        };
+        let scheduled = commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs_f64(at)).await;
+            println!("t={:.1}s command {:?}", at, command);
+            let _ = scheduled.send(command).await;
+        });
+    }
+    // Per second: frames, key frames, kbit/s and the longest gap between frames.
+    let per_second = args.iter().any(|a| a == "--per-second");
+    let mut second = (0u64, 0u32, 0u32, 0u64, 0f64);
+    let mut last_frame_at: Option<Instant> = None;
+
     // ── Event loop ──────────────────────────────────────────────────
     while let Some(event) = events.recv().await {
         match event {
@@ -122,6 +152,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if frame.frame_type == FrameType::Key {
                     keyframe_count += 1;
+                }
+                if per_second {
+                    let now = Instant::now();
+                    let index = start.elapsed().as_secs();
+                    if index != second.0 {
+                        println!(
+                            "t={:>2}s frames={:>3} keys={} kbps={:>6.0} max_gap_ms={:.0}",
+                            second.0,
+                            second.1,
+                            second.2,
+                            second.3 as f64 * 8.0 / 1000.0,
+                            second.4
+                        );
+                        second = (index, 0, 0, 0, 0.0);
+                    }
+                    second.1 += 1;
+                    second.2 += (frame.frame_type == FrameType::Key) as u32;
+                    second.3 += frame.data.len() as u64;
+                    if let Some(last) = last_frame_at.replace(now) {
+                        second.4 = second.4.max((now - last).as_secs_f64() * 1000.0);
+                    }
                 }
 
                 // Write to output file if requested.
