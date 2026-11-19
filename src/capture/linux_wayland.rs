@@ -41,7 +41,7 @@ pub fn pipewire_cursor() -> Option<PipewireCursor> {
     PIPEWIRE_CURSOR.lock().ok().and_then(|c| c.clone())
 }
 
-fn publish_cursor(meta: &FrameCursorMeta) {
+pub(crate) fn publish_cursor(meta: &FrameCursorMeta) {
     if let Ok(mut slot) = PIPEWIRE_CURSOR.lock() {
         let cur = slot.get_or_insert_with(PipewireCursor::default);
         cur.x = meta.x;
@@ -56,14 +56,14 @@ fn publish_cursor(meta: &FrameCursorMeta) {
 
 /// Rescale a coordinate from `from` pixels to `to` pixels (identity when
 /// either size is unknown).
-fn scale_coord(v: i32, from: u32, to: u32) -> i32 {
+pub(crate) fn scale_coord(v: i32, from: u32, to: u32) -> i32 {
     if from == 0 || to == 0 || from == to {
         return v;
     }
     ((v as i64 * to as i64) / from as i64) as i32
 }
 
-fn clear_cursor() {
+pub(crate) fn clear_cursor() {
     if let Ok(mut slot) = PIPEWIRE_CURSOR.lock() {
         *slot = None;
     }
@@ -862,6 +862,7 @@ fn run_pipewire_loop(
                             width,
                             height,
                             fourcc: neg.drm_format,
+                            aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE,
                         },
                         timestamp_us: now_us(),
                         width,

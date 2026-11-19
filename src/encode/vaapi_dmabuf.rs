@@ -38,6 +38,8 @@ const VA_ENTRYPOINT_VIDEO_PROC: libc::c_int = 10;
 const VA_PROGRESSIVE: libc::c_int = 0x1;
 const VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE: libc::c_int = 41;
 const VA_RT_FORMAT_RGB32: u32 = 0x0002_0000;
+/// `VA_RT_FORMAT_RGB32_10` (10 bits per colour channel).
+const VA_RT_FORMAT_RGB32_10: u32 = 0x0020_0000;
 const VA_SURFACE_ATTRIB_MEMORY_TYPE: u32 = 6;
 const VA_SURFACE_ATTRIB_EXTERNAL_BUFFER_DESCRIPTOR: u32 = 7;
 const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
@@ -49,6 +51,11 @@ const VA_FOURCC_BGRX: u32 = 0x5852_4742;
 const VA_FOURCC_BGRA: u32 = 0x4152_4742;
 const VA_FOURCC_RGBX: u32 = 0x5842_4752;
 const VA_FOURCC_RGBA: u32 = 0x4142_4752;
+/// 10-bit RGB: the VA codes equal the DRM ones ('AR30', 'XR30', 'AB30', 'XB30').
+const VA_FOURCC_A2R10G10B10: u32 = 0x3033_5241;
+const VA_FOURCC_X2R10G10B10: u32 = 0x3033_5258;
+const VA_FOURCC_A2B10G10R10: u32 = 0x3033_4241;
+const VA_FOURCC_X2B10G10R10: u32 = 0x3033_4258;
 
 /// `VAProcColorStandardBT601` (va_vpp.h:319, enum `_VAProcColorStandardType`).
 const VA_PROC_COLOR_STANDARD_BT601: u32 = 1;
@@ -256,7 +263,8 @@ impl VaApi {
     }
 }
 
-/// Description of one single-plane RGB DMA-BUF frame.
+/// Description of one RGB DMA-BUF frame (plane 0 plus optional further
+/// planes in the same buffer object, e.g. AMD DCC metadata).
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufFrame {
     pub fd: RawFd,
@@ -267,6 +275,7 @@ pub struct DmabufFrame {
     pub width: u32,
     pub height: u32,
     pub drm_format: u32,
+    pub aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +287,7 @@ struct SurfaceKey {
     width: u32,
     height: u32,
     drm_format: u32,
+    aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes,
 }
 
 /// Maximum number of cached imported surfaces before the cache is flushed
@@ -301,13 +311,19 @@ pub struct VaapiDmabufConverter {
 // converter (it is dropped before the device context is unreferenced).
 unsafe impl Send for VaapiDmabufConverter {}
 
-fn drm_to_va_fourcc(drm: u32) -> Option<u32> {
+/// VA fourcc and render-target format for a DRM format.
+fn drm_to_va_fourcc(drm: u32) -> Option<(u32, u32)> {
     use crate::capture::dmabuf_caps::*;
     Some(match drm {
-        DRM_FORMAT_XRGB8888 => VA_FOURCC_BGRX,
-        DRM_FORMAT_ARGB8888 => VA_FOURCC_BGRA,
-        DRM_FORMAT_XBGR8888 => VA_FOURCC_RGBX,
-        DRM_FORMAT_ABGR8888 => VA_FOURCC_RGBA,
+        DRM_FORMAT_XRGB8888 => (VA_FOURCC_BGRX, VA_RT_FORMAT_RGB32),
+        DRM_FORMAT_ARGB8888 => (VA_FOURCC_BGRA, VA_RT_FORMAT_RGB32),
+        DRM_FORMAT_XBGR8888 => (VA_FOURCC_RGBX, VA_RT_FORMAT_RGB32),
+        DRM_FORMAT_ABGR8888 => (VA_FOURCC_RGBA, VA_RT_FORMAT_RGB32),
+        // 10-bit scan-out formats (KMS capture of a 10 bpc desktop).
+        DRM_FORMAT_ARGB2101010 => (VA_FOURCC_A2R10G10B10, VA_RT_FORMAT_RGB32_10),
+        DRM_FORMAT_XRGB2101010 => (VA_FOURCC_X2R10G10B10, VA_RT_FORMAT_RGB32_10),
+        DRM_FORMAT_ABGR2101010 => (VA_FOURCC_A2B10G10R10, VA_RT_FORMAT_RGB32_10),
+        DRM_FORMAT_XBGR2101010 => (VA_FOURCC_X2B10G10R10, VA_RT_FORMAT_RGB32_10),
         _ => return None,
     })
 }
@@ -390,6 +406,7 @@ impl VaapiDmabufConverter {
             width: frame.width,
             height: frame.height,
             drm_format: frame.drm_format,
+            aux_planes: frame.aux_planes,
         };
         if let Some(&surface) = self.surfaces.get(&key) {
             return Ok(surface);
@@ -398,7 +415,7 @@ impl VaapiDmabufConverter {
             self.flush_cache();
         }
 
-        let va_fourcc = drm_to_va_fourcc(frame.drm_format).ok_or_else(|| {
+        let (va_fourcc, rt_format) = drm_to_va_fourcc(frame.drm_format).ok_or_else(|| {
             MediaError::EncodeError(format!("unsupported DRM format 0x{:08X}", frame.drm_format))
         })?;
         let size = if frame.size > 0 {
@@ -424,6 +441,13 @@ impl VaapiDmabufConverter {
         desc.layers[0].object_index[0] = 0;
         desc.layers[0].offset[0] = frame.offset;
         desc.layers[0].pitch[0] = frame.stride;
+        // Metadata planes (DCC/CCS) of the same buffer object.
+        for (i, &(offset, pitch)) in frame.aux_planes.as_slice().iter().enumerate() {
+            desc.layers[0].num_planes += 1;
+            desc.layers[0].object_index[i + 1] = 0;
+            desc.layers[0].offset[i + 1] = offset;
+            desc.layers[0].pitch[i + 1] = pitch;
+        }
 
         let mut attribs = [
             VASurfaceAttrib {
@@ -447,7 +471,7 @@ impl VaapiDmabufConverter {
         let status = unsafe {
             (self.va.create_surfaces)(
                 self.display,
-                VA_RT_FORMAT_RGB32,
+                rt_format,
                 frame.width,
                 frame.height,
                 &mut surface,
@@ -458,12 +482,13 @@ impl VaapiDmabufConverter {
         };
         self.va.check("vaCreateSurfaces(DRM_PRIME_2)", status)?;
         log::debug!(
-            "VAAPI zero-copy: imported DMA-BUF ino={} {}x{} fmt=0x{:08X} mod=0x{:016X} → surface {}",
+            "VAAPI zero-copy: imported DMA-BUF ino={} {}x{} fmt=0x{:08X} mod=0x{:016X} planes={} → surface {}",
             key.inode,
             frame.width,
             frame.height,
             frame.drm_format,
             frame.modifier,
+            1 + frame.aux_planes.count,
             surface
         );
         self.surfaces.insert(key, surface);

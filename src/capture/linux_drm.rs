@@ -580,6 +580,7 @@ impl DrmCapture {
                 width: fb2.width,
                 height: fb2.height,
                 fourcc: fb2.pixel_format,
+                aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE,
             },
             timestamp_us,
             width: fb2.width,

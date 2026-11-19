@@ -192,6 +192,8 @@ pub struct EglImporter {
     /// Cached DRM modifier found during first-frame probing.
     /// Once a working modifier is found, it's reused for all subsequent imports.
     cached_modifier: Option<u64>,
+    /// Further planes (same fd) of the buffer being imported right now.
+    aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes,
 
     // Persistent GL resources for fast DMA-BUF import (reused across frames to eliminate CPU allocation overhead)
     cached_width: u32,
@@ -572,6 +574,7 @@ impl EglImporter {
             context,
             surface: draw_surf,
             cached_modifier: None,
+            aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE,
             cached_width: 0,
             cached_height: 0,
             src_tex: 0,
@@ -767,6 +770,27 @@ impl EglImporter {
         Err(MediaError::CaptureError(format!(
             "Failed to create EGL display: 0x{:04X}", err
         )))
+    }
+
+    /// Like [`import_dmabuf`](Self::import_dmabuf) for a buffer with further
+    /// planes in the same buffer object (AMD DCC / Intel CCS metadata). Such
+    /// buffers always carry an explicit modifier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dmabuf_planes(
+        &mut self,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fourcc: u32,
+        offset: u32,
+        modifier: u64,
+        aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes,
+    ) -> Result<Vec<u8>, MediaError> {
+        self.aux_planes = aux_planes;
+        let result = self.import_dmabuf(fd, width, height, stride, fourcc, offset, modifier);
+        self.aux_planes = crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE;
+        result
     }
 
     /// Import a DMA-BUF fd and read back linear pixel data via GL.
@@ -1371,7 +1395,7 @@ impl EglImporter {
             let image = if use_modifier {
                 let modifier_lo = (modifier & 0xFFFFFFFF) as EGLint;
                 let modifier_hi = ((modifier >> 32) & 0xFFFFFFFF) as EGLint;
-                let attrs: [EGLint; 17] = [
+                let mut attrs: Vec<EGLint> = vec![
                     EGL_WIDTH as EGLint, width as EGLint,
                     EGL_HEIGHT as EGLint, height as EGLint,
                     EGL_LINUX_DRM_FOURCC_EXT, fourcc as EGLint,
@@ -1380,8 +1404,25 @@ impl EglImporter {
                     EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as EGLint,
                     EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, modifier_lo,
                     EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, modifier_hi,
-                    EGL_NONE,
                 ];
+                // EGL_EXT_image_dma_buf_import(_modifiers) attributes of
+                // planes 1..3: FD, OFFSET, PITCH, MODIFIER_LO, MODIFIER_HI.
+                const AUX_PLANE_ATTRS: [[EGLint; 5]; 3] = [
+                    [0x3275, 0x3276, 0x3277, 0x3445, 0x3446],
+                    [0x3278, 0x3279, 0x327A, 0x3447, 0x3448],
+                    [0x3440, 0x3441, 0x3442, 0x3449, 0x344A],
+                ];
+                for (i, &(aux_offset, aux_pitch)) in self.aux_planes.as_slice().iter().enumerate() {
+                    let a = AUX_PLANE_ATTRS[i];
+                    attrs.extend_from_slice(&[
+                        a[0], fd as EGLint,
+                        a[1], aux_offset as EGLint,
+                        a[2], aux_pitch as EGLint,
+                        a[3], modifier_lo,
+                        a[4], modifier_hi,
+                    ]);
+                }
+                attrs.push(EGL_NONE);
                 let img = unsafe {
                     create_khr(self.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
                         std::ptr::null_mut(), attrs.as_ptr())

@@ -3592,7 +3592,8 @@ impl FfmpegEncoder {
         buffer: &GpuBuffer,
         pts_us: u64,
     ) -> Result<Vec<EncodedVideoFrame>, MediaError> {
-        let GpuBuffer::DmaBuf { fd, offset, stride, modifier, size, width, height, fourcc } = buffer
+        let GpuBuffer::DmaBuf { fd, offset, stride, modifier, size, width, height, fourcc, aux_planes } =
+            buffer
         else {
             return Err(MediaError::EncodeError("encode_dmabuf: not a DMA-BUF".into()));
         };
@@ -3605,6 +3606,7 @@ impl FfmpegEncoder {
             width: *width,
             height: *height,
             drm_format: *fourcc,
+            aux_planes: *aux_planes,
         };
         let hw_type = self.info.as_ref().unwrap().hw_type;
 
@@ -3628,7 +3630,7 @@ impl FfmpegEncoder {
             self.dmabuf_readback = Some(crate::capture::egl_import::EglImporter::new()?);
             log::info!("DMA-BUF readback via EGL enabled for {:?} encoder", hw_type);
         }
-        let bgra = self.dmabuf_readback.as_mut().unwrap().import_dmabuf(
+        let bgra = self.dmabuf_readback.as_mut().unwrap().import_dmabuf_planes(
             frame.fd,
             frame.width,
             frame.height,
@@ -3636,6 +3638,7 @@ impl FfmpegEncoder {
             frame.drm_format,
             frame.offset,
             frame.modifier,
+            frame.aux_planes,
         )?;
         let cpu = GpuBuffer::CpuBuffer {
             data: bgra,

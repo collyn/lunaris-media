@@ -510,6 +510,121 @@ pub fn desktop_outputs() -> Vec<ScreenRegion> {
     desktop_layout()
 }
 
+/// Logical geometry of the enabled output called `name` (the connector name,
+/// e.g. "DP-2"), from `kscreen-doctor -j` or `xrandr --listmonitors`. Used by
+/// capture backends that know which output they stream but not where the
+/// compositor placed it (KMS).
+#[cfg(target_os = "linux")]
+pub fn desktop_output_named(name: &str) -> Option<ScreenRegion> {
+    if let Ok(out) = std::process::Command::new("kscreen-doctor").arg("-j").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(region) = kscreen_output_named(&text, name) {
+                return Some(region);
+            }
+        }
+    }
+    let out = std::process::Command::new("xrandr").arg("--listmonitors").output().ok()?;
+    xrandr_monitor_named(&String::from_utf8_lossy(&out.stdout), name)
+}
+
+/// Top-level `"<key>": "<string>"` of a JSON object (nested objects/arrays
+/// skipped, so a mode's "name" is not mistaken for the output's).
+#[cfg(target_os = "linux")]
+fn json_top_level_string(obj: &str, key: &str) -> Option<String> {
+    let bytes = obj.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut last_string: Option<(usize, usize, i32)> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                // A value right after `"key":` at depth 1.
+                if let Some((ks, ke, kd)) = last_string.take() {
+                    if kd == 1 && depth == 1 && &obj[ks..ke] == key {
+                        let between = &obj[ke + 1..i];
+                        if between.trim() == ":" {
+                            return Some(obj[start..j].to_string());
+                        }
+                    }
+                }
+                last_string = Some((start, j, depth));
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn kscreen_output_named(text: &str, name: &str) -> Option<ScreenRegion> {
+    let outputs = text.split("\"outputs\"").nth(1)?;
+    let bytes = outputs.as_bytes();
+    let (mut depth, mut start) = (0i32, None);
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s0) = start.take() {
+                        let obj = &outputs[s0..=i];
+                        if json_top_level_string(obj, "name").as_deref() == Some(name) {
+                            return parse_kscreen_output(obj);
+                        }
+                    }
+                }
+                if depth < 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `xrandr --listmonitors` line for `name` (" 0: +*DP-2 1920/527x1080/296+0+0  DP-2").
+#[cfg(target_os = "linux")]
+fn xrandr_monitor_named(text: &str, name: &str) -> Option<ScreenRegion> {
+    text.lines().skip(1).find_map(|line| {
+        if line.split_whitespace().last()? != name {
+            return None;
+        }
+        let geom = line.split_whitespace().nth(2)?;
+        let (w, rest) = geom.split_once('/')?;
+        let (_, rest) = rest.split_once('x')?;
+        let (h, rest) = rest.split_once('/')?;
+        let mut parts = rest.split('+').skip(1);
+        Some(ScreenRegion {
+            x: parts.next()?.parse().ok()?,
+            y: parts.next()?.parse().ok()?,
+            width: w.parse().ok()?,
+            height: h.parse().ok()?,
+        })
+    })
+}
+
 /// A cross-platform input injector helper.
 pub struct InputInjector {
     #[cfg(target_os = "linux")]
@@ -1626,6 +1741,40 @@ fn vk_to_keysym(vk: u16) -> Option<u32> {
         _ => return None,
     };
     Some(sym)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod named_output_tests {
+    use super::{kscreen_output_named, xrandr_monitor_named, ScreenRegion};
+
+    #[test]
+    fn kscreen_output_found_by_connector_name() {
+        // Abridged `kscreen-doctor -j`: modes (with their own "name") come
+        // before the output's name, as in the real output.
+        let text = r#"{"outputs": [
+            {"enabled": true, "id": 1, "modes": [{"id": "1", "name": "1920x1080@60", "size": {"height": 1080, "width": 1920}}],
+             "name": "HDMI-A-2", "pos": {"x": 1920, "y": 0}, "rotation": 1, "scale": 1, "size": {"height": 1080, "width": 1920}},
+            {"enabled": true, "id": 2, "modes": [{"id": "1", "name": "DP-2", "size": {"height": 1, "width": 1}}],
+             "name": "DP-2", "pos": {"x": 0, "y": 0}, "rotation": 1, "scale": 1, "size": {"height": 1080, "width": 1920}}
+        ]}"#;
+        assert_eq!(
+            kscreen_output_named(text, "HDMI-A-2"),
+            Some(ScreenRegion { x: 1920, y: 0, width: 1920, height: 1080 })
+        );
+        assert_eq!(kscreen_output_named(text, "DP-2").map(|r| r.x), Some(0));
+        assert_eq!(kscreen_output_named(text, "1920x1080@60"), None);
+        assert_eq!(kscreen_output_named(text, "eDP-1"), None);
+    }
+
+    #[test]
+    fn xrandr_monitor_found_by_name() {
+        let text = "Monitors: 2\n 0: +*DP-2 1920/527x1080/296+0+0  DP-2\n 1: +HDMI-A-2 1920/600x1080/340+1920+0  HDMI-A-2\n";
+        assert_eq!(
+            xrandr_monitor_named(text, "HDMI-A-2"),
+            Some(ScreenRegion { x: 1920, y: 0, width: 1920, height: 1080 })
+        );
+        assert_eq!(xrandr_monitor_named(text, "DP-1"), None);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

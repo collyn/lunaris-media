@@ -9,7 +9,7 @@
 //!
 //! | Platform | Primary              | Fallback 1          | Fallback 2 |
 //! |----------|----------------------|---------------------|------------|
-//! | Linux    | DRM/KMS (zero-copy)  | PipeWire (Wayland)  | X11        |
+//! | Linux    | Capture service / DRM/KMS (zero-copy) | PipeWire (Wayland) | X11 |
 //! | Windows  | DXGI Desktop Dup     | —                   | —          |
 //! | macOS    | ScreenCaptureKit     | —                   | —          |
 
@@ -17,6 +17,9 @@ pub mod gpu_buffer;
 
 #[cfg(target_os = "linux")]
 pub mod dmabuf_caps;
+/// Unattended capture through the root capture service (no portal prompt).
+#[cfg(target_os = "linux")]
+pub mod drm_service;
 #[cfg(target_os = "linux")]
 pub mod linux_drm;
 #[cfg(target_os = "linux")]
@@ -165,10 +168,94 @@ pub trait ScreenCapture: Send {
     }
 }
 
+/// `true` when this process may export KMS framebuffers itself
+/// (`CAP_SYS_ADMIN` effective or permitted, e.g. `setcap cap_sys_admin+p`).
+#[cfg(target_os = "linux")]
+fn has_cap_sys_admin() -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return false };
+    status
+        .lines()
+        .filter(|l| l.starts_with("CapEff:") || l.starts_with("CapPrm:"))
+        .filter_map(|l| u64::from_str_radix(l.split_whitespace().nth(1)?, 16).ok())
+        .any(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
+}
+
+/// Wayland backends in order; `None` falls through to X11.
+///
+/// 1. The Lunaris capture service (root helper owning DRM): no prompt.
+/// 2. Direct KMS when this process itself has `CAP_SYS_ADMIN`.
+/// 3. PipeWire through the XDG Desktop Portal (asks the person once; the
+///    restore token remembers the answer).
+///
+/// `LUNARIS_CAPTURE=service|kms|portal` tries that one first (falling back
+/// to the others with a warning if it is unavailable).
+#[cfg(target_os = "linux")]
+fn wayland_capture() -> Option<Box<dyn ScreenCapture>> {
+    let forced = std::env::var("LUNARIS_CAPTURE").unwrap_or_default().to_ascii_lowercase();
+    let forced = match forced.as_str() {
+        "drm" => "kms".to_string(),
+        "pipewire" => "portal".to_string(),
+        _ => forced,
+    };
+    let mut order: Vec<&str> = vec!["service", "kms", "portal"];
+    if let Some(pos) = order.iter().position(|b| *b == forced) {
+        let b = order.remove(pos);
+        order.insert(0, b);
+    } else if !forced.is_empty() {
+        log::warn!("LUNARIS_CAPTURE={} is not one of service, kms, portal; ignoring it", forced);
+    }
+    for backend in order {
+        let is_forced = backend == forced;
+        match backend {
+            "service" => {
+                let path = drm_service::socket_path();
+                if !is_forced && !path.exists() {
+                    log::info!("Capture service not installed ({} missing)", path.display());
+                    continue;
+                }
+                match drm_service::DrmServiceCapture::connect(&path) {
+                    Ok(c) => {
+                        log::info!(
+                            "Using the Lunaris capture service on {} (Wayland, no portal prompt, {} display(s))",
+                            path.display(),
+                            c.wire_displays().len()
+                        );
+                        return Some(Box::new(c));
+                    }
+                    Err(e) if is_forced => log::warn!("LUNARIS_CAPTURE=service but {}; trying others", e),
+                    Err(e) => log::info!("Capture service not usable: {}", e),
+                }
+            }
+            "kms" => {
+                if !is_forced && !has_cap_sys_admin() {
+                    continue;
+                }
+                match linux_drm::DrmCapture::new() {
+                    Ok(drm) => {
+                        log::info!("Using direct DRM/KMS capture on Wayland (this process has CAP_SYS_ADMIN)");
+                        return Some(Box::new(drm));
+                    }
+                    Err(e) => log::warn!("KMS capture unavailable: {}", e),
+                }
+            }
+            _ => {
+                log::info!("Using the XDG portal (PipeWire) on Wayland: the first session asks on this screen");
+                match linux_wayland::PipeWireCapture::new() {
+                    Ok(pw) => return Some(Box::new(pw)),
+                    Err(e) => log::warn!("PipeWire not available on Wayland: {}, trying X11 fallback", e),
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Create a [`ScreenCapture`] backend appropriate for the current platform.
 ///
-/// On Linux this tries PipeWire first (for Wayland compositors), falling back
-/// to X11 if PipeWire is unavailable. On other platforms the native API is used
+/// On Linux/Wayland this tries the capture service, direct KMS (with
+/// `CAP_SYS_ADMIN`) and the portal in that order (see `wayland_capture`),
+/// falling back to X11. On other platforms the native API is used
 /// directly.
 pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
     #[cfg(target_os = "linux")]
@@ -178,32 +265,8 @@ pub fn create_screen_capture() -> Result<Box<dyn ScreenCapture>, MediaError> {
             == "wayland";
 
         if is_wayland {
-            // On Wayland:
-            // - NvFBC is X11-only (uses GLX/X11 framebuffer capture)
-            // - PipeWire via the XDG Desktop Portal is the default (needs no
-            //   privileges, gives cursor metadata, DMA-BUF zero-copy).
-            // - KMS (like Sunshine's kmsgrab) is opt-in with
-            //   LUNARIS_CAPTURE=kms; it needs `setcap cap_sys_admin+p` on the
-            //   binary but skips the portal prompt entirely.
-            let forced = std::env::var("LUNARIS_CAPTURE").unwrap_or_default().to_ascii_lowercase();
-            if forced == "kms" || forced == "drm" {
-                match linux_drm::DrmCapture::new() {
-                    Ok(drm) => {
-                        log::info!("Using DRM/KMS screen capture on Wayland (LUNARIS_CAPTURE=kms)");
-                        return Ok(Box::new(drm));
-                    }
-                    Err(e) => log::warn!("KMS capture requested but unavailable: {}; using PipeWire", e),
-                }
-            }
-            log::info!("Wayland session detected — trying PipeWire first");
-            match linux_wayland::PipeWireCapture::new() {
-                Ok(pw) => {
-                    log::info!("Using PipeWire screen capture (Wayland, DMA-BUF)");
-                    return Ok(Box::new(pw));
-                }
-                Err(e) => {
-                    log::warn!("PipeWire not available on Wayland: {}, trying X11 fallback", e);
-                }
+            if let Some(capture) = wayland_capture() {
+                return Ok(capture);
             }
         } else {
             // X11 session: NvFBC > DRM > PipeWire > X11

@@ -7,6 +7,40 @@
 
 use crate::types::PixelFormat;
 
+/// Planes 1..=3 of a multi-plane DMA-BUF whose planes all live in the same
+/// buffer object (offset, pitch), as KMS scan-out buffers with compression
+/// metadata do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DmaBufAuxPlanes {
+    /// Number of valid entries in `planes`.
+    pub count: u8,
+    /// (offset, pitch) of each further plane.
+    pub planes: [(u32, u32); 3],
+}
+
+impl DmaBufAuxPlanes {
+    /// No further planes.
+    pub const NONE: DmaBufAuxPlanes = DmaBufAuxPlanes { count: 0, planes: [(0, 0); 3] };
+
+    /// Build from (offset, pitch) pairs; `None` if there are more than 3.
+    pub fn from_slice(planes: &[(u32, u32)]) -> Option<Self> {
+        if planes.len() > 3 {
+            return None;
+        }
+        let mut aux = Self::NONE;
+        for (i, p) in planes.iter().enumerate() {
+            aux.planes[i] = *p;
+        }
+        aux.count = planes.len() as u8;
+        Some(aux)
+    }
+
+    /// The valid (offset, pitch) pairs.
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        &self.planes[..self.count.min(3) as usize]
+    }
+}
+
 /// Represents a GPU-resident buffer that can be passed directly to a hardware
 /// encoder without copying through CPU memory.
 pub enum GpuBuffer {
@@ -32,6 +66,10 @@ pub enum GpuBuffer {
         height: u32,
         /// DRM fourcc pixel format code.
         fourcc: u32,
+        /// Further planes of the same buffer object (same `fd`), e.g. the
+        /// compression metadata of AMD DCC or Intel CCS scan-out buffers.
+        /// Empty for ordinary single-plane buffers.
+        aux_planes: DmaBufAuxPlanes,
     },
 
     /// Linux/NVIDIA: CUDA device memory pointer.

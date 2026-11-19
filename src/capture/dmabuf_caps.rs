@@ -23,6 +23,11 @@ pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'XR24' — memory order B,G
 pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // 'AR24' — memory order B,G,R,A
 pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258; // 'XB24' — memory order R,G,B,X
 pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241; // 'AB24' — memory order R,G,B,A
+/// 10-bit RGB scan-out formats (what KMS capture sees on a 10 bpc desktop).
+pub const DRM_FORMAT_XRGB2101010: u32 = 0x3033_5258; // 'XR30'
+pub const DRM_FORMAT_ARGB2101010: u32 = 0x3033_5241; // 'AR30'
+pub const DRM_FORMAT_XBGR2101010: u32 = 0x3033_4258; // 'XB30'
+pub const DRM_FORMAT_ABGR2101010: u32 = 0x3033_4241; // 'AB30'
 
 /// `DRM_FORMAT_MOD_LINEAR`.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -40,11 +45,25 @@ pub const PREFERRED_DRM_FORMATS: [u32; 4] = [
     DRM_FORMAT_ABGR8888,
 ];
 
+/// Render node of the GPU whose framebuffers the running capture delivers
+/// (set by backends that know it, e.g. the capture service backend).
+static CAPTURE_RENDER_NODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Tell the encoders which render node the captured DMA-BUFs belong to
+/// (`None` returns to auto-detection).
+pub fn set_capture_render_node(node: Option<String>) {
+    if let Ok(mut slot) = CAPTURE_RENDER_NODE.lock() {
+        *slot = node;
+    }
+}
+
 /// Resolve the render node (`/dev/dri/renderD*`) of the GPU that drives the
 /// connected displays.
 ///
 /// Order of precedence:
 /// 1. `LUNARIS_RENDER_NODE` (explicit override, e.g. `/dev/dri/renderD129`).
+/// 1b. The node the running capture backend reported
+///    ([`set_capture_render_node`]).
 /// 2. The render node belonging to the first DRM card that has a connected
 ///    connector (that is the GPU the compositor scans out from).
 /// 3. The first render node found.
@@ -58,6 +77,9 @@ pub fn display_render_node() -> Option<String> {
             "LUNARIS_RENDER_NODE='{}' does not exist; auto-detecting",
             node
         );
+    }
+    if let Some(node) = CAPTURE_RENDER_NODE.lock().ok().and_then(|n| n.clone()) {
+        return Some(node);
     }
 
     for card in cards_with_connected_display() {
@@ -395,5 +417,9 @@ mod tests {
         assert_eq!(DRM_FORMAT_ARGB8888, fourcc(b"AR24"));
         assert_eq!(DRM_FORMAT_XBGR8888, fourcc(b"XB24"));
         assert_eq!(DRM_FORMAT_ABGR8888, fourcc(b"AB24"));
+        assert_eq!(DRM_FORMAT_XRGB2101010, fourcc(b"XR30"));
+        assert_eq!(DRM_FORMAT_ARGB2101010, fourcc(b"AR30"));
+        assert_eq!(DRM_FORMAT_XBGR2101010, fourcc(b"XB30"));
+        assert_eq!(DRM_FORMAT_ABGR2101010, fourcc(b"AB30"));
     }
 }
