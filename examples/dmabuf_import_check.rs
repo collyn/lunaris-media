@@ -6,6 +6,7 @@
 //! the same GPU's render node (GBM), fills it with a known picture, and then
 //!   1. imports it with EGL and reads it back (the readback path), and
 //!   2. encodes it with the real VAAPI encoder through the zero-copy import
+//!      (or, if VA-API refuses the buffer, the GPU copy into a VA surface)
 //!      (`GpuBuffer::DmaBuf` with its auxiliary planes), decodes the result
 //!      and checks the colours.
 //!
@@ -225,7 +226,9 @@ fn main() {
             Ok(()) => {
                 println!("encoder: {} ({:?})", encoder.encoder_info().name, encoder.encoder_info().hw_type);
                 let mut bitstream = Vec::new();
-                for i in 0..8u64 {
+                let mut timed = std::time::Duration::ZERO;
+                const FRAMES: u64 = 60;
+                for i in 0..FRAMES {
                     let dup = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0);
                     let buffer = GpuBuffer::DmaBuf {
                         fd: dup,
@@ -241,7 +244,12 @@ fn main() {
                     if i == 0 {
                         encoder.request_keyframe();
                     }
-                    match encoder.encode(&buffer, i * 16_666) {
+                    let started = std::time::Instant::now();
+                    let encoded = encoder.encode(&buffer, i * 16_666);
+                    if i > 0 {
+                        timed += started.elapsed();
+                    }
+                    match encoded {
                         Ok(frames) => frames.into_iter().for_each(|f| bitstream.extend_from_slice(&f.data)),
                         Err(e) => {
                             println!("FAIL encode: {}", e);
@@ -250,14 +258,28 @@ fn main() {
                         }
                     }
                 }
+                println!(
+                    "encode time per frame (after the first): {:.2} ms",
+                    timed.as_secs_f64() * 1000.0 / (FRAMES - 1) as f64
+                );
                 let log = LOG.lock().unwrap().clone();
                 let zero_copy = log.iter().any(|l| l.contains("VAAPI zero-copy: imported DMA-BUF"));
-                let fell_back = log.iter().any(|l| l.contains("zero-copy import failed"));
-                println!(
-                    "VAAPI zero-copy import: {}",
-                    if zero_copy && !fell_back { "OK" } else if fell_back { "FAILED (fell back to EGL readback)" } else { "not seen" }
-                );
-                ok &= zero_copy && !fell_back;
+                let refused = log.iter().any(|l| {
+                    l.contains("VAAPI cannot import the captured buffer") || l.contains("wrongly; copying captured buffers")
+                });
+                let gpu_copy = log.iter().any(|l| l.contains("VAAPI: staging surface"));
+                let readback = log.iter().any(|l| l.contains("falling back to EGL readback"));
+                let path = if readback {
+                    "FAILED (CPU readback)"
+                } else if zero_copy && !refused {
+                    "OK (direct import)"
+                } else if refused && gpu_copy {
+                    "OK (direct import refused, GPU copy into a VA surface)"
+                } else {
+                    "not seen"
+                };
+                println!("VAAPI path: {}", path);
+                ok &= !readback && (zero_copy || gpu_copy);
                 match decode_check(&bitstream, w, h) {
                     Ok(msg) => println!("decoded picture: {}", msg),
                     Err(msg) => {

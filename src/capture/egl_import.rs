@@ -149,6 +149,7 @@ type GlReadPixelsFn = unsafe extern "C" fn(
     format: GLenum, type_: GLenum, pixels: *mut std::ffi::c_void,
 );
 type GlGetErrorFn = unsafe extern "C" fn() -> GLenum;
+type GlFinishFn = unsafe extern "C" fn();
 type GlEGLImageTargetTexture2DOESFn =
     unsafe extern "C" fn(target: GLenum, image: EGLImage);
 type GlTexImage2DFn = unsafe extern "C" fn(
@@ -176,6 +177,21 @@ type GlVertex2fFn = unsafe extern "C" fn(x: f32, y: f32);
 // EglImporter
 // ---------------------------------------------------------------------------
 
+/// One DMA-BUF picture: plane 0 plus further planes in the same buffer
+/// object (Intel CCS / AMD DCC metadata).
+#[derive(Clone, Copy, Debug)]
+pub struct DmabufPlanes {
+    pub fd: RawFd,
+    pub width: u32,
+    pub height: u32,
+    /// DRM fourcc.
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub offset: u32,
+    pub pitch: u32,
+    pub aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes,
+}
+
 /// Manages an EGL context and provides DMA-BUF → CPU conversion.
 ///
 /// The EGL context is headless (no window surface) and only used for importing
@@ -202,6 +218,10 @@ pub struct EglImporter {
     src_fbo: GLuint,
     dst_tex: GLuint,
     dst_fbo: GLuint,
+    /// Textures and framebuffer of [`copy_dmabuf`](Self::copy_dmabuf).
+    copy_src_tex: GLuint,
+    copy_dst_tex: GLuint,
+    copy_fbo: GLuint,
 
     // EGL function pointers
     eglGetError: EglGetErrorFn,
@@ -224,6 +244,7 @@ pub struct EglImporter {
     glFramebufferTexture2D: GlFramebufferTexture2DFn,
     glReadPixels: GlReadPixelsFn,
     glGetError: GlGetErrorFn,
+    glFinish: GlFinishFn,
     glEGLImageTargetTexture2DOES: GlEGLImageTargetTexture2DOESFn,
     glTexImage2D: GlTexImage2DFn,
     glEnable: Option<GlEnableFn>,
@@ -296,6 +317,7 @@ impl EglImporter {
         let glFramebufferTexture2D: GlFramebufferTexture2DFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glFramebufferTexture2D")) };
         let glReadPixels: GlReadPixelsFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glReadPixels")) };
         let glGetError: GlGetErrorFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glGetError")) };
+        let glFinish: GlFinishFn = unsafe { std::mem::transmute(load_sym!(gleslib, "glFinish")) };
 
         // glEGLImageTargetTexture2DOES is an extension that must be loaded
         // via eglGetProcAddress — it is NOT exported from libGLESv2.so.2 directly.
@@ -586,6 +608,9 @@ impl EglImporter {
             src_fbo: 0,
             dst_tex: 0,
             dst_fbo: 0,
+            copy_src_tex: 0,
+            copy_dst_tex: 0,
+            copy_fbo: 0,
             eglGetError,
             eglGetProcAddress,
             eglMakeCurrent,
@@ -604,6 +629,7 @@ impl EglImporter {
             glFramebufferTexture2D,
             glReadPixels,
             glGetError,
+            glFinish,
             glEGLImageTargetTexture2DOES,
             glTexImage2D,
             glEnable,
@@ -1039,6 +1065,101 @@ impl EglImporter {
             (self.eglDestroyImage)(self.display, image);
         }
 
+        result
+    }
+
+    /// Copy the picture of one DMA-BUF into another on the GPU.
+    ///
+    /// For a source another API cannot import (VA-API refuses some Intel
+    /// scan-out buffers that EGL reads fine): the picture is drawn into a
+    /// buffer that API allocated itself, with no CPU readback. Both buffers
+    /// must carry an explicit modifier and have the same size. Returns once
+    /// the GPU finished, so the source may be recycled and the target read.
+    ///
+    /// Like [`import_dmabuf`](Self::import_dmabuf), callable from any thread.
+    pub fn copy_dmabuf(&mut self, src: &DmabufPlanes, dst: &DmabufPlanes) -> Result<(), MediaError> {
+        let ok = unsafe {
+            (self.eglMakeCurrent)(self.display, self.surface, self.surface, self.context)
+        };
+        if ok == EGL_FALSE {
+            let err = unsafe { (self.eglGetError)() };
+            return Err(MediaError::CaptureError(format!(
+                "eglMakeCurrent failed in copy_dmabuf: 0x{:04X}", err
+            )));
+        }
+        let result = self.copy_dmabuf_current(src, dst);
+        unsafe {
+            (self.eglMakeCurrent)(self.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
+        result
+    }
+
+    fn image_of(&mut self, b: &DmabufPlanes) -> Result<EGLImage, MediaError> {
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+        if b.modifier == DRM_FORMAT_MOD_INVALID {
+            return Err(MediaError::CaptureError("copy_dmabuf: buffer without a modifier".into()));
+        }
+        self.aux_planes = b.aux_planes;
+        let image =
+            self.create_egl_image(b.fd, b.width, b.height, b.pitch, b.fourcc, b.offset, b.modifier, true);
+        self.aux_planes = crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE;
+        image
+    }
+
+    fn copy_dmabuf_current(&mut self, src: &DmabufPlanes, dst: &DmabufPlanes) -> Result<(), MediaError> {
+        if src.width != dst.width || src.height != dst.height {
+            return Err(MediaError::CaptureError(format!(
+                "copy_dmabuf: size {}x{} into {}x{}",
+                src.width, src.height, dst.width, dst.height
+            )));
+        }
+        let src_image = self.image_of(src)?;
+        let dst_image = match self.image_of(dst) {
+            Ok(i) => i,
+            Err(e) => {
+                unsafe { (self.eglDestroyImage)(self.display, src_image) };
+                return Err(e);
+            }
+        };
+        unsafe {
+            (self.glGetError)();
+            if self.copy_fbo == 0 {
+                (self.glGenTextures)(1, &mut self.copy_src_tex);
+                (self.glGenTextures)(1, &mut self.copy_dst_tex);
+                (self.glGenFramebuffers)(1, &mut self.copy_fbo);
+            }
+            (self.glBindTexture)(GL_TEXTURE_2D, self.copy_src_tex);
+            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            (self.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            (self.glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, src_image);
+            (self.glBindTexture)(GL_TEXTURE_2D, self.copy_dst_tex);
+            (self.glEGLImageTargetTexture2DOES)(GL_TEXTURE_2D, dst_image);
+            (self.glBindFramebuffer)(GL_FRAMEBUFFER, self.copy_fbo);
+            (self.glFramebufferTexture2D)(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.copy_dst_tex, 0,
+            );
+        }
+        // Texture row 0 is the first row in memory in both buffers and the
+        // quad maps it to framebuffer row 0: an upright 1:1 copy.
+        let drawn = self.draw_textured_quad(self.copy_src_tex, self.copy_fbo, dst.width, dst.height);
+        let result = unsafe {
+            (self.glFinish)();
+            let gl_err = (self.glGetError)();
+            if !drawn {
+                Err(MediaError::CaptureError("copy_dmabuf: cannot draw".into()))
+            } else if gl_err != GL_NO_ERROR {
+                Err(MediaError::CaptureError(format!("copy_dmabuf: GL error 0x{:04X}", gl_err)))
+            } else {
+                Ok(())
+            }
+        };
+        unsafe {
+            (self.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            (self.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.eglDestroyImage)(self.display, src_image);
+            (self.eglDestroyImage)(self.display, dst_image);
+        }
         result
     }
 

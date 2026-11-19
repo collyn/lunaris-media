@@ -312,6 +312,9 @@ pub struct FfmpegEncoder {
     /// Set after the zero-copy path failed once; DMA-BUFs then use readback.
     #[cfg(target_os = "linux")]
     dmabuf_zero_copy_failed: bool,
+    /// Set after the GPU copy into a VA staging surface failed once.
+    #[cfg(target_os = "linux")]
+    dmabuf_gpu_copy_failed: bool,
     /// EGL readback used when a DMA-BUF cannot be consumed zero-copy.
     #[cfg(target_os = "linux")]
     dmabuf_readback: Option<crate::capture::egl_import::EglImporter>,
@@ -389,6 +392,8 @@ impl FfmpegEncoder {
             vaapi_dmabuf: None,
             #[cfg(target_os = "linux")]
             dmabuf_zero_copy_failed: false,
+            #[cfg(target_os = "linux")]
+            dmabuf_gpu_copy_failed: false,
             #[cfg(target_os = "linux")]
             dmabuf_readback: None,
             force_keyframe: false,
@@ -3433,6 +3438,7 @@ impl VideoEncoder for FfmpegEncoder {
             self.vaapi_dmabuf = None;
             self.dmabuf_readback = None;
             self.dmabuf_zero_copy_failed = false;
+            self.dmabuf_gpu_copy_failed = false;
         }
 
         unsafe {
@@ -3599,7 +3605,9 @@ impl FfmpegEncoder {
     ///
     /// VAAPI: import the buffer as a VA surface and colour-convert/scale it
     /// into an NV12 pool surface with VPP — zero-copy, all on the GPU.
-    /// Other encoders (or if VPP fails): EGL readback into a CPU buffer.
+    /// If VA-API cannot import the buffer (some Intel scan-out buffers),
+    /// EGL draws it into a VA-allocated RGB surface first — still on the GPU.
+    /// Other encoders (or if both fail): EGL readback into a CPU buffer.
     #[cfg(target_os = "linux")]
     fn encode_dmabuf(
         &mut self,
@@ -3624,15 +3632,44 @@ impl FfmpegEncoder {
         };
         let hw_type = self.info.as_ref().unwrap().hw_type;
 
+        if hw_type == HwAccelType::Vaapi
+            && !self.dmabuf_zero_copy_failed
+            && super::vaapi_dmabuf::misreads_modifier(frame.modifier)
+        {
+            log::info!(
+                "VAAPI reads modifier 0x{:016X} wrongly; copying captured buffers on the GPU instead",
+                frame.modifier
+            );
+            self.dmabuf_zero_copy_failed = true;
+        }
         if hw_type == HwAccelType::Vaapi && !self.hw_frames_ctx.is_null() && !self.dmabuf_zero_copy_failed {
             match self.vaapi_convert_dmabuf(&frame) {
                 Ok(()) => return self.submit_frame(self.frame, pts_us),
                 Err(e) => {
                     log::warn!(
-                        "VAAPI zero-copy import failed ({}); falling back to EGL readback",
+                        "VAAPI cannot import the captured buffer (fmt=0x{:08X} mod=0x{:016X} planes={}): {}; \
+                         copying it on the GPU instead",
+                        frame.drm_format,
+                        frame.modifier,
+                        1 + frame.aux_planes.count,
                         e
                     );
                     self.dmabuf_zero_copy_failed = true;
+                    unsafe { ffi::av_frame_unref(self.frame) };
+                }
+            }
+        }
+
+        if hw_type == HwAccelType::Vaapi
+            && !self.hw_frames_ctx.is_null()
+            && self.dmabuf_zero_copy_failed
+            && !self.dmabuf_gpu_copy_failed
+        {
+            match self.vaapi_copy_dmabuf(&frame) {
+                Ok(()) => return self.submit_frame(self.frame, pts_us),
+                Err(e) => {
+                    log::warn!("GPU copy into a VA surface failed ({}); falling back to EGL readback", e);
+                    self.dmabuf_gpu_copy_failed = true;
                     self.vaapi_dmabuf = None;
                     unsafe { ffi::av_frame_unref(self.frame) };
                 }
@@ -3664,12 +3701,48 @@ impl FfmpegEncoder {
         self.encode(&cpu, pts_us)
     }
 
-    /// Fill `self.frame` with an NV12 pool surface converted from `frame`.
+    /// Fill `self.frame` with an NV12 pool surface converted from `frame`
+    /// after EGL drew it into the converter's staging surface.
     #[cfg(target_os = "linux")]
-    fn vaapi_convert_dmabuf(
+    fn vaapi_copy_dmabuf(
         &mut self,
         frame: &super::vaapi_dmabuf::DmabufFrame,
     ) -> Result<(), MediaError> {
+        self.ensure_vaapi_converter()?;
+        if self.dmabuf_readback.is_none() {
+            self.dmabuf_readback = Some(crate::capture::egl_import::EglImporter::new()?);
+        }
+        let converter = self.vaapi_dmabuf.as_mut().unwrap();
+        let target = converter.staging(frame.width, frame.height, frame.drm_format)?;
+        let src = crate::capture::egl_import::DmabufPlanes {
+            fd: frame.fd,
+            width: frame.width,
+            height: frame.height,
+            fourcc: frame.drm_format,
+            modifier: frame.modifier,
+            offset: frame.offset,
+            pitch: frame.stride,
+            aux_planes: frame.aux_planes,
+        };
+        self.dmabuf_readback.as_mut().unwrap().copy_dmabuf(&src, &target)?;
+        unsafe {
+            ffi::av_frame_unref(self.frame);
+            let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);
+            if ret < 0 {
+                return Err(ff_err(ret));
+            }
+            let dst = (*self.frame).data[3] as usize as u32;
+            let c = self.config.as_ref().unwrap();
+            (*self.frame).width = c.width as libc::c_int;
+            (*self.frame).height = c.height as libc::c_int;
+            self.vaapi_dmabuf.as_mut().unwrap().convert_staging(dst)?;
+        }
+        Ok(())
+    }
+
+    /// Create the VPP converter on the encoder's VADisplay if needed.
+    #[cfg(target_os = "linux")]
+    fn ensure_vaapi_converter(&mut self) -> Result<(), MediaError> {
         let (out_w, out_h, colorspace) = {
             let c = self.config.as_ref().unwrap();
             (c.width, c.height, c.colorspace)
@@ -3684,7 +3757,20 @@ impl FfmpegEncoder {
                 super::vaapi_dmabuf::VaapiDmabufConverter::new(display, out_w, out_h, colorspace)?
             });
         }
+        Ok(())
+    }
 
+    /// Fill `self.frame` with an NV12 pool surface converted from `frame`.
+    #[cfg(target_os = "linux")]
+    fn vaapi_convert_dmabuf(
+        &mut self,
+        frame: &super::vaapi_dmabuf::DmabufFrame,
+    ) -> Result<(), MediaError> {
+        self.ensure_vaapi_converter()?;
+        let (out_w, out_h) = {
+            let c = self.config.as_ref().unwrap();
+            (c.width, c.height)
+        };
         unsafe {
             ffi::av_frame_unref(self.frame);
             let ret = ffi::av_hwframe_get_buffer(self.hw_frames_ctx, self.frame, 0);

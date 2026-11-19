@@ -40,12 +40,18 @@ const VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE: libc::c_int = 41;
 const VA_RT_FORMAT_RGB32: u32 = 0x0002_0000;
 /// `VA_RT_FORMAT_RGB32_10` (10 bits per colour channel).
 const VA_RT_FORMAT_RGB32_10: u32 = 0x0020_0000;
+/// `VASurfaceAttribPixelFormat` (va.h, enum `VASurfaceAttribType`).
+const VA_SURFACE_ATTRIB_PIXEL_FORMAT: u32 = 1;
 const VA_SURFACE_ATTRIB_MEMORY_TYPE: u32 = 6;
 const VA_SURFACE_ATTRIB_EXTERNAL_BUFFER_DESCRIPTOR: u32 = 7;
 const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 const VA_GENERIC_VALUE_TYPE_INTEGER: u32 = 1;
 const VA_GENERIC_VALUE_TYPE_POINTER: u32 = 3;
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+/// `VA_EXPORT_SURFACE_READ_WRITE` (va.h).
+const VA_EXPORT_SURFACE_READ_WRITE: u32 = 0x0003;
+/// `VA_EXPORT_SURFACE_COMPOSED_LAYERS` (va.h): one layer with every plane.
+const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
 
 const VA_FOURCC_BGRX: u32 = 0x5852_4742;
 const VA_FOURCC_BGRA: u32 = 0x4152_4742;
@@ -195,6 +201,8 @@ type VaRenderPictureFn =
 type VaEndPictureFn = unsafe extern "C" fn(VADisplay, VAContextID) -> VAStatus;
 type VaSyncSurfaceFn = unsafe extern "C" fn(VADisplay, VASurfaceID) -> VAStatus;
 type VaErrorStrFn = unsafe extern "C" fn(VAStatus) -> *const libc::c_char;
+type VaExportSurfaceHandleFn =
+    unsafe extern "C" fn(VADisplay, VASurfaceID, u32, u32, *mut libc::c_void) -> VAStatus;
 
 struct VaApi {
     _lib: libloading::Library,
@@ -211,6 +219,7 @@ struct VaApi {
     end_picture: VaEndPictureFn,
     sync_surface: VaSyncSurfaceFn,
     error_str: VaErrorStrFn,
+    export_surface_handle: VaExportSurfaceHandleFn,
 }
 
 impl VaApi {
@@ -240,6 +249,7 @@ impl VaApi {
             end_picture: sym!("vaEndPicture"),
             sync_surface: sym!("vaSyncSurface"),
             error_str: sym!("vaErrorStr"),
+            export_surface_handle: sym!("vaExportSurfaceHandle"),
             _lib: lib,
         })
     }
@@ -305,11 +315,36 @@ pub struct VaapiDmabufConverter {
     /// Colourspace and range the NV12 output is converted to.
     colorspace: StreamColorspace,
     surfaces: HashMap<SurfaceKey, VASurfaceID>,
+    /// RGB surface allocated by the driver, for sources it cannot import.
+    staging: Option<Staging>,
+}
+
+/// A driver-allocated RGB surface and the DMA-BUF it was exported as.
+struct Staging {
+    surface: VASurfaceID,
+    /// Exported buffer objects (closed on drop).
+    fds: Vec<RawFd>,
+    planes: crate::capture::egl_import::DmabufPlanes,
+    drm_format: u32,
 }
 
 // The VADisplay is owned by FFmpeg's hw device context, which outlives this
 // converter (it is dropped before the device context is unreferenced).
 unsafe impl Send for VaapiDmabufConverter {}
+
+/// `I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS` (drm_fourcc.h).
+const I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS: u64 = 0x0100_0000_0000_0006;
+
+/// Modifiers VA-API imports without error but reads as the wrong picture.
+///
+/// Intel iHD on Tiger Lake (Iris Xe): an RGB buffer with
+/// `Y_TILED_GEN12_RC_CCS` imports and encodes as a black-green picture
+/// (`examples/dmabuf_import_check --modifier 0x0100000000000006`), while EGL
+/// reads it correctly. `RC_CCS_CC` (…0008) is refused outright instead.
+/// Such buffers take the GPU copy into a staging surface.
+pub fn misreads_modifier(modifier: u64) -> bool {
+    modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS
+}
 
 /// VA fourcc and render-target format for a DRM format.
 fn drm_to_va_fourcc(drm: u32) -> Option<(u32, u32)> {
@@ -387,6 +422,7 @@ impl VaapiDmabufConverter {
             out_height,
             colorspace,
             surfaces: HashMap::new(),
+            staging: None,
         })
     }
 
@@ -501,12 +537,142 @@ impl VaapiDmabufConverter {
     /// may recycle its buffer as soon as this returns.
     pub fn convert(&mut self, frame: &DmabufFrame, dst: u32) -> Result<(), MediaError> {
         let src = self.import(frame)?;
+        self.convert_surface(src, frame.width, frame.height, dst)
+    }
+
+    /// A `width`×`height` RGB surface of the driver's own layout, exported
+    /// as a DMA-BUF that can be drawn into (EGL); converted to NV12 with
+    /// [`convert_staging`](Self::convert_staging). For sources VA-API cannot
+    /// import itself, such as some Intel scan-out buffers.
+    pub fn staging(
+        &mut self,
+        width: u32,
+        height: u32,
+        drm_format: u32,
+    ) -> Result<crate::capture::egl_import::DmabufPlanes, MediaError> {
+        if let Some(s) = &self.staging {
+            if s.planes.width == width && s.planes.height == height && s.drm_format == drm_format {
+                return Ok(s.planes);
+            }
+        }
+        self.drop_staging();
+        let (va_fourcc, rt_format) = drm_to_va_fourcc(drm_format).ok_or_else(|| {
+            MediaError::EncodeError(format!("unsupported DRM format 0x{:08X}", drm_format))
+        })?;
+        let mut attribs = [VASurfaceAttrib {
+            type_: VA_SURFACE_ATTRIB_PIXEL_FORMAT,
+            flags: VA_SURFACE_ATTRIB_SETTABLE,
+            value: VAGenericValue { type_: VA_GENERIC_VALUE_TYPE_INTEGER, value: va_fourcc as u64 },
+        }];
+        let mut surface: VASurfaceID = VA_INVALID_ID;
+        unsafe {
+            self.va.check(
+                "vaCreateSurfaces(staging)",
+                (self.va.create_surfaces)(
+                    self.display,
+                    rt_format,
+                    width,
+                    height,
+                    &mut surface,
+                    1,
+                    attribs.as_mut_ptr(),
+                    attribs.len() as libc::c_uint,
+                ),
+            )?;
+        }
+        let mut desc = VADRMPRIMESurfaceDescriptor::default();
+        let status = unsafe {
+            (self.va.export_surface_handle)(
+                self.display,
+                surface,
+                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+                &mut desc as *mut _ as *mut libc::c_void,
+            )
+        };
+        if let Err(e) = self.va.check("vaExportSurfaceHandle", status) {
+            unsafe { (self.va.destroy_surfaces)(self.display, &mut surface, 1) };
+            return Err(e);
+        }
+        let fds: Vec<RawFd> =
+            desc.objects[..(desc.num_objects as usize).min(4)].iter().map(|o| o.fd).collect();
+        let layer = desc.layers[0];
+        let planes = (layer.num_planes as usize).clamp(1, 4);
+        let aux: Vec<(u32, u32)> =
+            (1..planes).map(|i| (layer.offset[i], layer.pitch[i])).collect();
+        let staging = Staging {
+            surface,
+            fds,
+            planes: crate::capture::egl_import::DmabufPlanes {
+                fd: desc.objects[0].fd,
+                width,
+                height,
+                fourcc: layer.drm_format,
+                modifier: desc.objects[0].drm_format_modifier,
+                offset: layer.offset[0],
+                pitch: layer.pitch[0],
+                aux_planes: crate::capture::gpu_buffer::DmaBufAuxPlanes::from_slice(&aux)
+                    .unwrap_or(crate::capture::gpu_buffer::DmaBufAuxPlanes::NONE),
+            },
+            drm_format,
+        };
+        // EGL takes one buffer object holding every plane.
+        let one_object = desc.num_objects == 1
+            && desc.num_layers == 1
+            && layer.object_index[..planes].iter().all(|&i| i == 0);
+        if !one_object {
+            let msg = format!(
+                "staging surface exported as {} object(s), {} layer(s)",
+                desc.num_objects, desc.num_layers
+            );
+            self.free_staging(staging);
+            return Err(MediaError::EncodeError(msg));
+        }
+        log::info!(
+            "VAAPI: staging surface {}x{} fmt=0x{:08X} mod=0x{:016X} planes={} for sources VA-API cannot import",
+            width,
+            height,
+            layer.drm_format,
+            staging.planes.modifier,
+            planes
+        );
+        let planes_out = staging.planes;
+        self.staging = Some(staging);
+        Ok(planes_out)
+    }
+
+    /// Colour-convert the staging surface (after the picture was drawn into
+    /// it) into the NV12 surface `dst`.
+    pub fn convert_staging(&mut self, dst: u32) -> Result<(), MediaError> {
+        let (src, w, h) = match &self.staging {
+            Some(s) => (s.surface, s.planes.width, s.planes.height),
+            None => return Err(MediaError::EncodeError("no staging surface".into())),
+        };
+        self.convert_surface(src, w, h, dst)
+    }
+
+    fn free_staging(&mut self, staging: Staging) {
+        for fd in staging.fds {
+            unsafe { libc::close(fd) };
+        }
+        let mut id = staging.surface;
+        unsafe { (self.va.destroy_surfaces)(self.display, &mut id, 1) };
+    }
+
+    fn drop_staging(&mut self) {
+        if let Some(s) = self.staging.take() {
+            self.free_staging(s);
+        }
+    }
+
+    /// Colour-convert (and scale) the RGB surface `src` into NV12 `dst`.
+    fn convert_surface(&mut self, src: VASurfaceID, width: u32, height: u32, dst: u32) -> Result<(), MediaError> {
 
         let src_rect = VARectangle {
             x: 0,
             y: 0,
-            width: frame.width.min(u16::MAX as u32) as u16,
-            height: frame.height.min(u16::MAX as u32) as u16,
+            width: width.min(u16::MAX as u32) as u16,
+            height: height.min(u16::MAX as u32) as u16,
         };
         let dst_rect = VARectangle {
             x: 0,
@@ -606,6 +772,7 @@ impl VaapiDmabufConverter {
 impl Drop for VaapiDmabufConverter {
     fn drop(&mut self) {
         self.flush_cache();
+        self.drop_staging();
         unsafe {
             if self.context != VA_INVALID_ID {
                 (self.va.destroy_context)(self.display, self.context);
