@@ -567,6 +567,11 @@ impl EglImporter {
         let glTexCoord2f: Option<GlTexCoord2fFn> = load_gl_opt!("glTexCoord2f\0");
         let glVertex2f: Option<GlVertex2fFn> = load_gl_opt!("glVertex2f\0");
 
+        // Leave the context current on no thread: the importer may be used
+        // from another thread (see `import_dmabuf`), and a context still
+        // current here would make that fail with EGL_BAD_ACCESS.
+        unsafe { eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) };
+
         Ok(Self {
             _egllib: egllib,
             _gleslib: gleslib,
@@ -795,8 +800,12 @@ impl EglImporter {
 
     /// Import a DMA-BUF fd and read back linear pixel data via GL.
     ///
-    /// The EGL context must be current on the calling thread (it is made
-    /// current in [`new`] and must not have been changed since).
+    /// May be called from any thread, one call at a time (`&mut self`): the
+    /// context is made current on the calling thread for the call and
+    /// released again before it returns. An encoder running on a tokio task
+    /// moves between worker threads at every `.await`; a context left
+    /// current on the previous thread makes `eglMakeCurrent` on the next one
+    /// fail with EGL_BAD_ACCESS (0x3002) for every frame.
     ///
     /// Returns `Vec<u8>` containing linear BGRA pixel data.
     pub fn import_dmabuf(
@@ -809,9 +818,6 @@ impl EglImporter {
         offset: u32,
         modifier: u64,
     ) -> Result<Vec<u8>, MediaError> {
-        // Ensure EGL context is current on the calling thread.
-        // The PipeWire process callback may run on a different thread from
-        // where EglImporter::new() was called. EGL contexts are per-thread.
         let ok = unsafe {
             (self.eglMakeCurrent)(self.display, self.surface, self.surface, self.context)
         };
@@ -821,6 +827,25 @@ impl EglImporter {
                 "eglMakeCurrent failed in import_dmabuf: 0x{:04X}", err
             )));
         }
+        let result = self.import_dmabuf_current(fd, width, height, stride, fourcc, offset, modifier);
+        unsafe {
+            (self.eglMakeCurrent)(self.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
+        result
+    }
+
+    /// [`import_dmabuf`](Self::import_dmabuf) with the context current.
+    #[allow(clippy::too_many_arguments)]
+    fn import_dmabuf_current(
+        &mut self,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fourcc: u32,
+        offset: u32,
+        modifier: u64,
+    ) -> Result<Vec<u8>, MediaError> {
 
         // --- 1. Create EGLImage from DMA-BUF ---
         // Prefer eglCreateImageKHR (EGLint attrs) over eglCreateImage (EGLAttrib attrs).
@@ -1490,6 +1515,68 @@ impl Drop for EglImporter {
 }
 
 // SAFETY: EglImporter holds raw EGL/GL state (display, context, function pointers).
-// The EGL context must be used from a single thread. The caller is responsible for
-// ensuring import_dmabuf() is called from the thread that created the importer.
+// Its context is current on no thread between calls: `import_dmabuf` (which
+// takes `&mut self`, so one call at a time) makes it current on the calling
+// thread and releases it before returning. Moving it to another thread is
+// therefore fine; it is not `Sync`.
 unsafe impl Send for EglImporter {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The importer is made on one thread and used on others, as an encoder
+    /// on a tokio task is. Every call must get past `eglMakeCurrent` (the fd
+    /// is not a buffer, so the import itself fails later, differently).
+    /// Skipped where EGL cannot be set up (no GPU).
+    #[test]
+    fn usable_from_another_thread() {
+        use std::sync::mpsc;
+        // Two threads that stay alive, as tokio's workers do (a thread that
+        // ends releases what is current on it, which would hide the fault).
+        // Each takes the importer, uses it (the first one makes it) and
+        // hands it back with the error of the call.
+        type Msg = Option<EglImporter>;
+        type Done = (Msg, Option<String>);
+        let (done_tx, done_rx) = mpsc::channel::<Done>();
+        let worker = |rx: mpsc::Receiver<Msg>, done: mpsc::Sender<Done>| {
+            std::thread::spawn(move || {
+                for importer in rx {
+                    let mut importer = match importer.map(Ok).unwrap_or_else(EglImporter::new) {
+                        Ok(importer) => importer,
+                        Err(e) => {
+                            let _ = done.send((None, Some(format!("no EGL: {e}"))));
+                            continue;
+                        }
+                    };
+                    let err = importer.import_dmabuf(-1, 64, 64, 256, 0x34325241, 0, 0).err().map(|e| e.to_string());
+                    let _ = done.send((Some(importer), err));
+                }
+            })
+        };
+        let (a_tx, a_rx) = mpsc::channel::<Msg>();
+        let (b_tx, b_rx) = mpsc::channel::<Msg>();
+        let a = worker(a_rx, done_tx.clone());
+        let b = worker(b_rx, done_tx);
+
+        a_tx.send(None).unwrap();
+        let (mut importer, err) = done_rx.recv().unwrap();
+        if importer.is_none() {
+            eprintln!("skipped: {}", err.unwrap_or_default());
+            return;
+        }
+        for round in 0..4 {
+            let to = if round % 2 == 0 { &b_tx } else { &a_tx };
+            to.send(importer.take()).unwrap();
+            let (back, err) = done_rx.recv().unwrap();
+            // The fd is not a buffer: the import fails, but after
+            // eglMakeCurrent, never at it.
+            let err = err.unwrap_or_default();
+            assert!(!err.contains("eglMakeCurrent"), "round {round}: {err}");
+            importer = back;
+        }
+        drop((a_tx, b_tx));
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+}

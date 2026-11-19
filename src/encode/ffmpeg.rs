@@ -1547,6 +1547,20 @@ fn get_d3d11_vendor_id(device_ptr: usize) -> Option<u32> {
                     hw_type,
                     ret
                 );
+                // The usual cause on Linux: no VA-API driver for the GPU is
+                // installed (libva then fails with "unknown libva error").
+                // Said once per run; the probes try VAAPI many times.
+                #[cfg(target_os = "linux")]
+                if hw_type == HwAccelType::Vaapi {
+                    static HINT: std::sync::Once = std::sync::Once::new();
+                    HINT.call_once(|| {
+                        log::warn!(
+                            "VA-API could not start, so encoding falls back to the CPU. Is the VA-API driver \
+                             for this GPU installed? Intel: intel-media-va-driver; AMD: mesa-va-drivers \
+                             (`vainfo` shows whether one loads)."
+                        );
+                    });
+                }
                 return Err(ff_err(ret));
             }
 
