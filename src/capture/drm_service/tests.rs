@@ -49,6 +49,12 @@ struct FakeState {
     screen: Screen,
     cursor: Option<CursorPlaneState>,
     cursor_reads: u32,
+    /// How long one cursor picture read takes (VRAM reads are slow).
+    cursor_read_delay: Duration,
+    /// Vertical blank period (`None`: no vblank, the session paces by clock).
+    vblank: Option<Duration>,
+    /// Framebuffer id every grab reports (`None`: 0, a new buffer each grab).
+    fixed_fb: Option<u32>,
     tag: String,
 }
 
@@ -62,6 +68,9 @@ impl FakeSource {
             screen: Screen::On,
             cursor: Some(CursorPlaneState { plane_id: 9, fb_id: 500, x: 10, y: 5, hot_x: 0, hot_y: 0 }),
             cursor_reads: 0,
+            cursor_read_delay: Duration::ZERO,
+            vblank: None,
+            fixed_fb: None,
             tag: tag.into(),
         })))
     }
@@ -105,6 +114,7 @@ impl FrameSource for FakeSource {
                             exportable: true,
                         },
                         buffer_id: super::kms::fd_inode(&fd),
+                        fb_id: st.fixed_fb.unwrap_or(0),
                         fds: vec![fd],
                         planes: vec![WirePlane { fd_index: 0, offset: 0, stride }],
                     },
@@ -113,14 +123,30 @@ impl FrameSource for FakeSource {
             }
         })
     }
+    fn wait_vblank(&mut self, _d: &WireDisplay) -> std::io::Result<()> {
+        let period = self.0.lock().unwrap().vblank;
+        match period {
+            Some(p) => {
+                std::thread::sleep(p);
+                Ok(())
+            }
+            None => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+        }
+    }
     fn cursor_state(&mut self, _d: &WireDisplay) -> Option<CursorPlaneState> {
         self.0.lock().unwrap().cursor.clone()
     }
-    fn cursor_picture(&mut self, _d: &WireDisplay, fb_id: u32) -> Option<CursorPicture> {
-        let mut st = self.0.lock().unwrap();
-        st.cursor_reads += 1;
+    fn cursor_reader(&mut self, _d: &WireDisplay, fb_id: u32) -> super::producer::CursorJob {
+        let delay = {
+            let mut st = self.0.lock().unwrap();
+            st.cursor_reads += 1;
+            st.cursor_read_delay
+        };
         // Picture depends on the framebuffer id only.
-        Some(CursorPicture { width: 2, height: 1, rgba: vec![fb_id as u8, 0, 0, 255, 0, 0, 0, 128] })
+        Box::new(move || {
+            std::thread::sleep(delay);
+            Some(CursorPicture { width: 2, height: 1, rgba: vec![fb_id as u8, 0, 0, 255, 0, 0, 0, 128] })
+        })
     }
 }
 
@@ -570,4 +596,154 @@ fn connect_burst_does_not_leak() {
     server.shutdown();
     assert_eq!(open_fds_matching("e2e-burst-fb"), 0, "descriptor leak");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn slow_cursor_reads_do_not_stall_frames() {
+    // Each cursor read takes 150 ms (a 33-2000 ms read was measured on VRAM)
+    // and the shape changes all the time: frames must keep their pace.
+    let source = FakeSource::new("e2e-slowcur");
+    source.set(|s| s.cursor_read_delay = Duration::from_millis(150));
+    let h = Harness::new(source.clone(), FakeAuth::new());
+    h.handshake();
+    h.client.send(&Message::Start { display_id: 1, max_fps: 100, max_in_flight: 4 }, &[]).unwrap();
+    let t0 = Instant::now();
+    let (mut frames, mut max_gap, mut last) = (0u32, Duration::ZERO, Instant::now());
+    let mut fb = 500u32;
+    let mut images = Vec::new();
+    while t0.elapsed() < Duration::from_millis(1000) {
+        let Some((m, fds)) = h.client.recv(Some(Duration::from_millis(200))).unwrap() else { continue };
+        match m {
+            Message::Frame(f) => {
+                drop(fds);
+                h.client.send(&Message::FrameAck { seq: f.seq }, &[]).unwrap();
+                if frames > 0 {
+                    max_gap = max_gap.max(last.elapsed());
+                }
+                last = Instant::now();
+                frames += 1;
+                if frames % 10 == 0 {
+                    fb += 1;
+                    source.set(|s| s.cursor.as_mut().unwrap().fb_id = fb);
+                }
+            }
+            Message::Cursor(c) => {
+                if let Some(img) = c.image {
+                    images.push(img[0]);
+                }
+            }
+            _ => {}
+        }
+    }
+    h.client.send(&Message::Stop, &[]).unwrap();
+    h.finish();
+    assert!(frames >= 60, "only {} frames in 1 s at 100 fps", frames);
+    assert!(max_gap < Duration::from_millis(100), "a frame waited {:?} for a cursor read", max_gap);
+    // Pictures still arrive, each matching the framebuffer it was read from.
+    assert!(!images.is_empty() && images[0] == 500u32 as u8, "pictures {:?}", images);
+}
+
+/// Frames (acknowledged at once) and cursor messages received for `dur`.
+fn count_frames(h: &Harness, dur: Duration, mut each: impl FnMut(&Message)) -> u32 {
+    let t0 = Instant::now();
+    let mut frames = 0;
+    while t0.elapsed() < dur {
+        let Some((m, fds)) = h.client.recv(Some(Duration::from_millis(50))).unwrap() else { continue };
+        drop(fds);
+        if let Message::Frame(f) = &m {
+            h.client.send(&Message::FrameAck { seq: f.seq }, &[]).unwrap();
+            frames += 1;
+        }
+        each(&m);
+    }
+    frames
+}
+
+#[test]
+fn vblank_paces_frames_to_the_refresh_rate() {
+    // 100 Hz display, client allows 240: one frame per flip, not 240.
+    let source = FakeSource::new("e2e-vbl");
+    source.set(|s| s.vblank = Some(Duration::from_millis(10)));
+    let h = Harness::new(source, FakeAuth::new());
+    h.handshake();
+    h.client.send(&Message::Start { display_id: 1, max_fps: 240, max_in_flight: 4 }, &[]).unwrap();
+    let frames = count_frames(&h, Duration::from_secs(1), |_| {});
+    h.client.send(&Message::Stop, &[]).unwrap();
+    h.finish();
+    assert!((80..=105).contains(&frames), "{} frames at 100 Hz", frames);
+}
+
+#[test]
+fn frame_rate_cap_holds_with_vblank() {
+    // 200 Hz display, client asks for 50.
+    let source = FakeSource::new("e2e-cap");
+    source.set(|s| s.vblank = Some(Duration::from_millis(5)));
+    let h = Harness::new(source, FakeAuth::new());
+    h.handshake();
+    h.client.send(&Message::Start { display_id: 1, max_fps: 50, max_in_flight: 4 }, &[]).unwrap();
+    let frames = count_frames(&h, Duration::from_secs(1), |_| {});
+    h.client.send(&Message::Stop, &[]).unwrap();
+    h.finish();
+    assert!((42..=55).contains(&frames), "{} frames for a cap of 50", frames);
+}
+
+#[test]
+fn unchanged_picture_is_not_sent_again_but_the_cursor_is() {
+    let source = FakeSource::new("e2e-static");
+    source.set(|s| {
+        s.vblank = Some(Duration::from_millis(10));
+        s.fixed_fb = Some(77);
+    });
+    let h = Harness::new(source.clone(), FakeAuth::new());
+    h.handshake();
+    h.client.send(&Message::Start { display_id: 1, max_fps: 100, max_in_flight: 4 }, &[]).unwrap();
+    let mut cursor_x = Vec::new();
+    let mut moved = false;
+    let t0 = Instant::now();
+    let frames = count_frames(&h, Duration::from_millis(1500), |m| {
+        if let Message::Cursor(c) = m {
+            cursor_x.push(c.x);
+        }
+        if !moved && t0.elapsed() > Duration::from_millis(300) {
+            moved = true;
+            source.set(|s| s.cursor.as_mut().unwrap().x = 40);
+        }
+    });
+    // The first picture, then one refresh after a second.
+    assert!((1..=3).contains(&frames), "{} frames of a static screen", frames);
+    assert!(cursor_x.contains(&40), "cursor moves still reported: {:?}", cursor_x);
+    // A new picture (the compositor flips) goes out at the next vblank.
+    source.set(|s| s.fixed_fb = Some(78));
+    let frames = count_frames(&h, Duration::from_millis(200), |_| {});
+    assert!(frames >= 1, "new picture not sent");
+    h.client.send(&Message::Stop, &[]).unwrap();
+    h.finish();
+}
+
+#[test]
+fn picture_comes_back_at_once_after_the_screen_was_off() {
+    let source = FakeSource::new("e2e-wake");
+    source.set(|s| {
+        s.vblank = Some(Duration::from_millis(10));
+        s.fixed_fb = Some(5);
+    });
+    let h = Harness::new(source.clone(), FakeAuth::new());
+    h.handshake();
+    h.client.send(&Message::Start { display_id: 1, max_fps: 60, max_in_flight: 4 }, &[]).unwrap();
+    h.wait_for(|m| matches!(m, Message::Frame(_)));
+    // Screen off: no vblank and no framebuffer; then on with the same id.
+    source.set(|s| {
+        s.vblank = None;
+        s.screen = Screen::Off;
+    });
+    h.wait_for(|m| matches!(m, Message::Status { code: StatusCode::NoFramebuffer, .. }));
+    source.set(|s| {
+        s.vblank = Some(Duration::from_millis(10));
+        s.screen = Screen::On;
+    });
+    let t = Instant::now();
+    h.wait_for(|m| matches!(m, Message::Frame(_)));
+    assert!(t.elapsed() < Duration::from_millis(500), "picture took {:?} to come back", t.elapsed());
+    h.client.send(&Message::Stop, &[]).unwrap();
+    h.finish();
 }

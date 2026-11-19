@@ -41,6 +41,7 @@ const DRM_IOCTL_MODE_GETPLANERESOURCES: libc::c_ulong = ioc(IOWR, D, 0xB5, std::
 const DRM_IOCTL_MODE_GETPLANE: libc::c_ulong = ioc(IOWR, D, 0xB6, std::mem::size_of::<GetPlane>());
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: libc::c_ulong = ioc(IOWR, D, 0xB9, std::mem::size_of::<ObjGetProps>());
 const DRM_IOCTL_MODE_GETFB2: libc::c_ulong = ioc(IOWR, D, 0xCE, std::mem::size_of::<FbCmd2>());
+const DRM_IOCTL_WAIT_VBLANK: libc::c_ulong = ioc(IOWR, D, 0x3A, std::mem::size_of::<WaitVblank>());
 const DMA_BUF_IOCTL_SYNC: libc::c_ulong = ioc(IOW, b'b' as u32, 0, std::mem::size_of::<DmaBufSync>());
 
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
@@ -52,6 +53,9 @@ const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_MODE_CONNECTOR_WRITEBACK: u32 = 18;
 const DRM_PLANE_TYPE_CURSOR: u64 = 2;
+const DRM_VBLANK_RELATIVE: u32 = 0x1;
+const DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
+const DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x3e;
 const DMA_BUF_SYNC_READ: u64 = 1;
 const DMA_BUF_SYNC_START: u64 = 0;
 const DMA_BUF_SYNC_END: u64 = 4;
@@ -227,6 +231,18 @@ struct FbCmd2 {
     modifier: [u64; 4],
 }
 
+/// `union drm_wait_vblank` (request and reply share the 24 bytes).
+#[repr(C)]
+#[derive(Default)]
+struct WaitVblank {
+    kind: u32,
+    sequence: u32,
+    /// Request: `signal`; reply: `tval_sec`.
+    a: u64,
+    /// Reply: `tval_usec`.
+    b: u64,
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct DmaBufSync {
@@ -327,6 +343,10 @@ pub struct ExportedFb {
     pub planes: Vec<WirePlane>,
     /// Inode of the first DMA-BUF: equal for the same buffer.
     pub buffer_id: u64,
+    /// KMS framebuffer id (0 when not from KMS): the compositor shows new
+    /// content by flipping to another framebuffer, so an unchanged id means
+    /// an unchanged picture.
+    pub fb_id: u32,
 }
 
 /// State of a cursor plane.
@@ -359,6 +379,7 @@ pub struct Card {
     pub atomic: bool,
     prop_names: RefCell<HashMap<u32, String>>,
     cursor_planes: RefCell<Option<Vec<u32>>>,
+    crtcs: RefCell<Option<Vec<u32>>>,
 }
 
 impl Card {
@@ -389,6 +410,7 @@ impl Card {
             atomic,
             prop_names: RefCell::new(HashMap::new()),
             cursor_planes: RefCell::new(None),
+            crtcs: RefCell::new(None),
         })
     }
 
@@ -630,6 +652,30 @@ impl Card {
         }
     }
 
+    /// Index of `crtc_id` among the card's CRTCs (the "pipe" vblank waits use).
+    pub fn crtc_index(&self, crtc_id: u32) -> Option<u32> {
+        if self.crtcs.borrow().is_none() {
+            *self.crtcs.borrow_mut() = Some(self.resources().ok()?.crtcs);
+        }
+        self.crtcs.borrow().as_ref()?.iter().position(|c| *c == crtc_id).map(|i| i as u32)
+    }
+
+    /// Block until the next vertical blank of `crtc_id`: at most one refresh
+    /// period while the display is on. Fails at once when it is off (no
+    /// vblank interrupts) or the driver has none; callers then pace by clock.
+    /// Read-only: needs no DRM master.
+    pub fn wait_vblank(&self, crtc_id: u32) -> io::Result<()> {
+        let pipe = self
+            .crtc_index(crtc_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such CRTC"))?;
+        let high = (pipe << DRM_VBLANK_HIGH_CRTC_SHIFT) & DRM_VBLANK_HIGH_CRTC_MASK;
+        if (high >> DRM_VBLANK_HIGH_CRTC_SHIFT) != pipe {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "CRTC index too large"));
+        }
+        let mut w = WaitVblank { kind: DRM_VBLANK_RELATIVE | high, sequence: 1, ..Default::default() };
+        ioctl(self.raw_fd(), DRM_IOCTL_WAIT_VBLANK, &mut w)
+    }
+
     /// Layout of a framebuffer (works unprivileged; handles are dropped).
     pub fn fb_layout(&self, fb_id: u32) -> io::Result<FbLayout> {
         let fb = self.getfb2(fb_id)?;
@@ -676,14 +722,22 @@ impl Card {
         self.close_handles(&fb);
         result?;
         let buffer_id = fds.first().map(fd_inode).unwrap_or(0);
-        Ok(ExportedFb { layout, fds, planes, buffer_id })
+        Ok(ExportedFb { layout, fds, planes, buffer_id, fb_id })
     }
 
     /// Read a (linear, 32-bit) cursor framebuffer into straight-alpha RGBA,
     /// trimmed of transparent right/bottom margins. `None` when the buffer
     /// cannot be mapped or has an unknown layout.
     pub fn read_cursor(&self, fb_id: u32) -> Option<CursorPicture> {
-        let exported = self.export_fb(fb_id).ok()?;
+        read_cursor_buffer(&self.export_fb(fb_id).ok()?)
+    }
+}
+
+/// [`Card::read_cursor`] on an already exported framebuffer. Needs no card,
+/// so it can run on another thread (the read takes tens of milliseconds when
+/// the buffer sits in VRAM).
+pub fn read_cursor_buffer(exported: &ExportedFb) -> Option<CursorPicture> {
+    {
         let layout = &exported.layout;
         if exported.fds.len() != 1 || layout.planes.len() != 1 {
             return None;
@@ -706,15 +760,19 @@ impl Card {
         }
         let mut sync = DmaBufSync { flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
         let _ = ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut sync);
+        // One bulk copy into ordinary memory first: the buffer usually lives
+        // in uncached VRAM, where the per-byte reads of `convert_cursor`
+        // each cross the bus (measured ~2 s per cursor on an RX 6600, which
+        // stalled the frame loop; a bulk copy uses wide loads).
+        let mut bytes = vec![0u8; len];
         // SAFETY: the mapping is `len` bytes long and stays mapped until the
-        // munmap below.
-        let bytes = unsafe { std::slice::from_raw_parts(map as *const u8, len) };
-        let picture = convert_cursor(&bytes[offset as usize..], w, h, pitch, layout.fourcc);
+        // munmap below; `bytes` is a distinct allocation of the same length.
+        unsafe { std::ptr::copy_nonoverlapping(map as *const u8, bytes.as_mut_ptr(), len) };
         let mut sync = DmaBufSync { flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
         let _ = ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut sync);
         // SAFETY: unmapping the mapping created above.
         unsafe { libc::munmap(map, len) };
-        picture
+        convert_cursor(&bytes[offset as usize..], w, h, pitch, layout.fourcc)
     }
 }
 
@@ -937,6 +995,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<FbCmd2>(), 104);
         assert_eq!(std::mem::size_of::<PrimeHandle>(), 12);
         assert_eq!(std::mem::size_of::<GemClose>(), 8);
+        assert_eq!(std::mem::size_of::<WaitVblank>(), 24);
+        assert_eq!(DRM_IOCTL_WAIT_VBLANK, 0xC018643A);
         // A couple of well-known request numbers (libdrm's values).
         assert_eq!(DRM_IOCTL_MODE_GETRESOURCES, 0xC04064A0);
         assert_eq!(DRM_IOCTL_MODE_GETCRTC, 0xC06864A1);

@@ -31,11 +31,22 @@ pub trait FrameSource {
     fn displays(&mut self) -> Vec<WireDisplay>;
     /// Sample `display` now.
     fn grab(&mut self, display: &WireDisplay) -> io::Result<Grab>;
+    /// Block until the next vertical blank of `display` (at most about one
+    /// refresh period). An error means "no vblank now" (display off, no
+    /// support): the session then paces by clock and asks again later.
+    fn wait_vblank(&mut self, _display: &WireDisplay) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
     /// Hardware cursor on `display`, if one is shown there.
     fn cursor_state(&mut self, display: &WireDisplay) -> Option<CursorPlaneState>;
-    /// Picture of cursor framebuffer `fb_id`.
-    fn cursor_picture(&mut self, display: &WireDisplay, fb_id: u32) -> Option<CursorPicture>;
+    /// Work that reads the picture of cursor framebuffer `fb_id`. Called on
+    /// the session thread, which must stay quick (export the buffer, no
+    /// pixel access); the returned job runs on a helper thread.
+    fn cursor_reader(&mut self, display: &WireDisplay, fb_id: u32) -> CursorJob;
 }
+
+/// Reads one cursor picture (`None`: not readable).
+pub type CursorJob = Box<dyn FnOnce() -> Option<CursorPicture> + Send>;
 
 /// Decides who may connect and keep streaming.
 pub trait Authorizer: Send + Sync {
@@ -175,12 +186,20 @@ impl FrameSource for KmsSource {
         res
     }
 
+    fn wait_vblank(&mut self, display: &WireDisplay) -> io::Result<()> {
+        match self.card_for(display) {
+            Some(card) => card.wait_vblank(display.crtc_id),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
     fn cursor_state(&mut self, display: &WireDisplay) -> Option<CursorPlaneState> {
         self.card_for(display)?.cursor_on(display.crtc_id)
     }
 
-    fn cursor_picture(&mut self, display: &WireDisplay, fb_id: u32) -> Option<CursorPicture> {
-        self.card_for(display)?.read_cursor(fb_id)
+    fn cursor_reader(&mut self, display: &WireDisplay, fb_id: u32) -> CursorJob {
+        let exported = self.card_for(display).and_then(|c| c.export_fb(fb_id).ok());
+        Box::new(move || kms::read_cursor_buffer(&exported?))
     }
 }
 
@@ -218,20 +237,72 @@ fn monotonic_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// Runs cursor reads off the session thread (they take tens of milliseconds
+/// on VRAM and would stall frames). One per stream; the thread ends when the
+/// stream (and so the job sender) goes away.
+struct CursorWorker {
+    jobs: std::sync::mpsc::Sender<(u32, CursorJob)>,
+    results: std::sync::mpsc::Receiver<(u32, Option<CursorPicture>, Duration)>,
+}
+
+impl CursorWorker {
+    fn spawn() -> Option<CursorWorker> {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<(u32, CursorJob)>();
+        let (result_tx, results) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("lunaris-capsvc-cursor".into())
+            .spawn(move || {
+                while let Ok((fb_id, job)) = job_rx.recv() {
+                    let started = Instant::now();
+                    let picture = job();
+                    if result_tx.send((fb_id, picture, started.elapsed())).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| log::warn!("capture service: no cursor thread: {}", e))
+            .ok()?;
+        Some(CursorWorker { jobs, results })
+    }
+}
+
 #[derive(Default)]
 struct CursorTrack {
-    fb_id: u32,
+    worker: Option<CursorWorker>,
+    /// Framebuffer last asked for, and when (`None`: no read running).
+    requested_fb: u32,
+    pending_since: Option<Instant>,
+    /// Framebuffer `picture` was read from.
+    picture_fb: u32,
+    /// Since when the shown framebuffer differs from `picture_fb`.
+    shape_changed_at: Option<Instant>,
     last_read: Option<Instant>,
+    /// How long the last read took: periodic re-reads back off so a slow
+    /// read (uncached VRAM) never costs more than ~5% of the frame loop.
+    read_cost: Duration,
     picture: Option<CursorPicture>,
     generation: u32,
     image_pending: bool,
     last_sent: Option<(bool, i32, i32, i32, i32, u32)>,
 }
 
+/// An unchanged picture is sent again this often (the client repeats the
+/// last picture in between; this only refreshes it).
+const KEEPALIVE: Duration = Duration::from_secs(1);
+/// After a failed vblank wait (display off), pace by clock this long.
+const VBLANK_RETRY: Duration = Duration::from_secs(1);
+
 struct Stream {
     display: WireDisplay,
     interval: Duration,
     next_due: Instant,
+    /// Pace by the display's vblank (else by clock until `vblank_retry`).
+    vblank: bool,
+    vblank_retry: Instant,
+    /// What the last sent frame showed (`fb_id`, or the buffer when 0) and
+    /// when it was sent.
+    last_picture: Option<u64>,
+    last_sent: Option<Instant>,
     max_in_flight: usize,
     in_flight: VecDeque<(u64, Instant)>,
     seq: u64,
@@ -324,7 +395,9 @@ fn session_loop(
         let now = Instant::now();
         let mut wake = next_rescan.min(next_reauth);
         if let Some(s) = &stream {
-            wake = wake.min(s.next_due);
+            // Paced by vblank: the wait below is the sleep, so only look for
+            // messages here.
+            wake = if s.vblank && !paused { now } else { wake.min(s.next_due) };
         }
         // Never sleep long, so `stop` is seen promptly.
         let timeout = wake.saturating_duration_since(now).min(Duration::from_millis(250));
@@ -342,6 +415,10 @@ fn session_loop(
                                 display: d.clone(),
                                 interval: Duration::from_nanos(1_000_000_000 / max_fps as u64),
                                 next_due: Instant::now(),
+                                vblank: true,
+                                vblank_retry: Instant::now(),
+                                last_picture: None,
+                                last_sent: None,
                                 max_in_flight: max_in_flight as usize,
                                 in_flight: VecDeque::new(),
                                 seq: 0,
@@ -401,6 +478,7 @@ fn session_loop(
                     log::info!("capture service: pid {} may stream again", peer.pid);
                     if let Some(s) = &mut stream {
                         s.status = None;
+                        s.last_picture = None;
                         s.cursor.last_sent = None;
                         s.cursor.image_pending = s.cursor.picture.is_some();
                         send(conn, &Message::Status { display_id: s.display.id, code: StatusCode::Active }, &[])?;
@@ -436,23 +514,67 @@ fn session_loop(
         }
 
         let Some(s) = &mut stream else { continue };
-        if now < s.next_due {
-            continue;
+        let mut now = now;
+        if !paused {
+            if !s.vblank && now >= s.vblank_retry {
+                s.vblank = true;
+            }
+            if s.vblank {
+                // Sample right after the display flips: each new picture is
+                // seen once, in step with the screen (no beat between our
+                // clock and the refresh rate).
+                match source.wait_vblank(&s.display) {
+                    Ok(()) => now = Instant::now(),
+                    Err(e) => {
+                        log::debug!("capture service: no vblank on {} ({}); pacing by clock", s.display.name, e);
+                        s.vblank = false;
+                        s.vblank_retry = now + VBLANK_RETRY;
+                    }
+                }
+            }
         }
-        s.next_due += s.interval;
-        if s.next_due < now {
-            // Fell behind: resynchronise instead of bursting.
-            s.next_due = now + s.interval;
+        // The client's frame-rate cap. Vblanks jitter, so allow a little
+        // slack; the average still stays at the cap (`next_due` advances by
+        // one interval per frame sent).
+        let slack = if s.vblank { (s.interval / 4).min(Duration::from_millis(2)) } else { Duration::ZERO };
+        if now + slack < s.next_due {
+            continue;
         }
         if paused {
+            s.next_due = now + s.interval;
             continue;
+        }
+        // By clock, every tick is spent; by vblank, an unchanged picture
+        // keeps the slot for the next flip.
+        let advance = |s: &mut Stream| {
+            s.next_due += s.interval;
+            if s.next_due < now {
+                // Fell behind: resynchronise instead of bursting.
+                s.next_due = now + s.interval;
+            }
+        };
+        if !s.vblank {
+            advance(s);
         }
         // Credits: frames the client has not acknowledged yet.
         s.in_flight.retain(|(_, at)| now.duration_since(*at) < opts.ack_timeout);
         if s.in_flight.len() < s.max_in_flight {
             match source.grab(&s.display) {
+                Ok(Grab::Frame { fb, crop: _ })
+                    if s.last_picture == Some(picture_key(&fb))
+                        && s.last_sent.is_some_and(|t| now.duration_since(t) < KEEPALIVE) =>
+                {
+                    // Same picture as last sent: nothing to encode.
+                    grab_errors = 0;
+                    drop(fb);
+                }
                 Ok(Grab::Frame { fb, crop }) => {
                     grab_errors = 0;
+                    if s.vblank {
+                        advance(s);
+                    }
+                    s.last_picture = Some(picture_key(&fb));
+                    s.last_sent = Some(now);
                     s.seq += 1;
                     let frame = WireFrame {
                         seq: s.seq,
@@ -481,6 +603,8 @@ fn session_loop(
                     s.in_flight.push_back((s.seq, now));
                 }
                 Ok(Grab::NoFramebuffer) => {
+                    // Whatever shows when it comes back is sent at once.
+                    s.last_picture = None;
                     if s.status != Some(StatusCode::NoFramebuffer) {
                         s.status = Some(StatusCode::NoFramebuffer);
                         send(conn, &Message::Status { display_id: s.display.id, code: StatusCode::NoFramebuffer }, &[])?;
@@ -505,6 +629,16 @@ fn session_loop(
     }
 }
 
+/// Identity of the picture in `fb`: the KMS framebuffer id, or the buffer
+/// itself when the source has no framebuffer ids.
+fn picture_key(fb: &kms::ExportedFb) -> u64 {
+    if fb.fb_id != 0 {
+        fb.fb_id as u64
+    } else {
+        fb.buffer_id
+    }
+}
+
 fn update_cursor(
     conn: &Conn,
     source: &mut dyn FrameSource,
@@ -513,17 +647,65 @@ fn update_cursor(
     opts: &SessionOptions,
     now: Instant,
 ) -> Result<(), SessionEnd> {
-    let state = source.cursor_state(display);
-    if let Some(st) = &state {
-        let stale = track.last_read.is_none_or(|t| now.duration_since(t) >= opts.cursor_reread);
-        if st.fb_id != track.fb_id || stale {
-            let picture = source.cursor_picture(display, st.fb_id);
-            track.fb_id = st.fb_id;
-            track.last_read = Some(now);
+    // Finished reads.
+    if let Some(worker) = &track.worker {
+        while let Ok((fb_id, picture, cost)) = worker.results.try_recv() {
+            track.pending_since = None;
+            track.read_cost = cost;
+            track.last_read = Some(Instant::now());
+            if cost > Duration::from_millis(20) {
+                log::debug!("capture service: cursor read took {:?}", cost);
+            }
+            track.picture_fb = fb_id;
             if picture != track.picture {
                 track.picture = picture;
                 track.generation = track.generation.wrapping_add(1);
                 track.image_pending = true;
+            }
+        }
+    }
+    let state = source.cursor_state(display);
+    if let Some(st) = &state {
+        let reread = opts.cursor_reread.max(track.read_cost * 20);
+        let stale = track.last_read.is_none_or(|t| now.duration_since(t) >= reread);
+        if track.pending_since.is_none() && (st.fb_id != track.requested_fb || stale) {
+            if track.worker.is_none() {
+                track.worker = CursorWorker::spawn();
+            }
+            let job = source.cursor_reader(display, st.fb_id);
+            let inline = match &track.worker {
+                Some(worker) => worker.jobs.send((st.fb_id, job)).err().map(|e| e.0 .1),
+                None => Some(job),
+            };
+            match inline {
+                None => {
+                    track.requested_fb = st.fb_id;
+                    track.pending_since = Some(now);
+                }
+                Some(job) => {
+                    // No helper thread: read inline rather than never.
+                    let picture = job();
+                    track.requested_fb = st.fb_id;
+                    track.picture_fb = st.fb_id;
+                    track.last_read = Some(now);
+                    if picture != track.picture {
+                        track.picture = picture;
+                        track.generation = track.generation.wrapping_add(1);
+                        track.image_pending = true;
+                    }
+                }
+            }
+        }
+        // New shape on its way: hold position updates briefly so the old
+        // picture is not drawn at the new position. Bounded from the shape
+        // change, not the read: a cursor that changes faster than it can be
+        // read (animations) still moves, with the latest picture read.
+        if track.picture_fb == st.fb_id {
+            track.shape_changed_at = None;
+        } else {
+            let since = *track.shape_changed_at.get_or_insert(now);
+            if now.duration_since(since) < Duration::from_millis(200) {
+                return Ok(());
             }
         }
     }

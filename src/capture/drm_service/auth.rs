@@ -50,6 +50,9 @@ pub struct PeerFacts {
     pub preload: bool,
     /// `LD_LIBRARY_PATH` set.
     pub library_path: bool,
+    /// `/proc/<pid>/environ` could not be read (refused: the checks above
+    /// cannot be made).
+    pub environ_unreadable: bool,
     /// A debugger is attached.
     pub traced: bool,
 }
@@ -69,6 +72,7 @@ pub enum Deny {
     NotActiveUser { uid: u32, active: u32 },
     Traced,
     Preload,
+    EnvironmentUnreadable,
     UnknownExe,
     ExeNotAllowed,
     ProcessGone,
@@ -83,6 +87,10 @@ impl std::fmt::Display for Deny {
             }
             Deny::Traced => write!(f, "the process is being traced"),
             Deny::Preload => write!(f, "the process runs with LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH"),
+            Deny::EnvironmentUnreadable => write!(
+                f,
+                "the process's environment cannot be read (does the service lack CAP_DAC_READ_SEARCH?)"
+            ),
             Deny::UnknownExe => write!(f, "the process's executable cannot be read"),
             Deny::ExeNotAllowed => write!(f, "the process's executable is not an allowed Lunaris binary"),
             Deny::ProcessGone => write!(f, "the process exited during the check"),
@@ -106,6 +114,9 @@ pub fn authorize(peer: &PeerFacts, active_uid: Option<u32>, policy: &Policy) -> 
     }
     if peer.traced {
         return Err(Deny::Traced);
+    }
+    if peer.environ_unreadable {
+        return Err(Deny::EnvironmentUnreadable);
     }
     if peer.preload {
         return Err(Deny::Preload);
@@ -257,16 +268,18 @@ pub fn gather_peer_facts(pid: i32, uid: u32) -> PeerFacts {
     let exe_path = std::fs::read_link(format!("{}/exe", proc_dir))
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let (appimage, preload, library_path) = match std::fs::read(format!("{}/environ", proc_dir)) {
+    let environ = std::fs::read(format!("{}/environ", proc_dir));
+    let environ_unreadable = environ.is_err();
+    let (appimage, preload, library_path) = match environ {
         Ok(blob) => parse_environ(&blob),
-        // Unreadable environment: assume the worst.
+        // Unreadable environment: assume the worst (and say why).
         Err(_) => (None, true, true),
     };
     let traced = std::fs::read_to_string(format!("{}/status", proc_dir))
         .ok()
         .and_then(|s| parse_tracer_pid(&s))
         .is_none_or(|t| t != 0);
-    PeerFacts { pid, uid, exe, exe_path, appimage, preload, library_path, traced }
+    PeerFacts { pid, uid, exe, exe_path, appimage, preload, library_path, environ_unreadable, traced }
 }
 
 /// Refresh only the facts that can change while connected.
@@ -278,6 +291,10 @@ pub fn refresh_traced(facts: &mut PeerFacts) {
 }
 
 /// `true` while the process behind `pidfd` has not exited.
+///
+/// Signal 0 checks existence only. EPERM ("may not signal it") still means
+/// the process exists: the service runs without CAP_KILL (systemd unit), so
+/// that is the answer for every agent of another user. Only ESRCH means gone.
 pub fn pidfd_alive(pidfd: &OwnedFd) -> bool {
     // SAFETY: pidfd_send_signal with signal 0 only checks for existence.
     let ret = unsafe {
@@ -289,7 +306,7 @@ pub fn pidfd_alive(pidfd: &OwnedFd) -> bool {
             0,
         )
     };
-    ret == 0
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Gather facts for a peer and make sure they describe the process that
@@ -569,6 +586,11 @@ mod tests {
         p.traced = true;
         assert_eq!(authorize(&p, Some(1000), &policy()), Err(Deny::Traced));
         assert_eq!(still_allowed(&p, Some(1000)), Err(Deny::Traced));
+        // An environment the service cannot read is refused, and says so.
+        let mut p = peer(1000, AGENT);
+        (p.environ_unreadable, p.preload, p.library_path) = (true, true, true);
+        assert_eq!(authorize(&p, Some(1000), &policy()), Err(Deny::EnvironmentUnreadable));
+        assert!(Deny::EnvironmentUnreadable.to_string().contains("CAP_DAC_READ_SEARCH"));
     }
 
     #[test]
@@ -648,6 +670,34 @@ mod tests {
         }
         assert!(trusted_file(&dir.join("missing")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pidfd_of(pid: i32) -> Option<OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open with flags 0; the result is checked.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        // SAFETY: a fresh descriptor owned here.
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    #[test]
+    fn a_process_we_may_not_signal_is_still_alive() {
+        // The service runs without CAP_KILL (systemd unit), so probing another
+        // user's process with signal 0 gets EPERM: that process exists.
+        // Reproduced unprivileged with pid 1 (root's), which we may not signal.
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+        let Some(init) = pidfd_of(1) else { return };
+        assert!(pidfd_alive(&init), "EPERM was taken for an exited process");
+        // Our own process: alive. An exited child: not.
+        // SAFETY: getpid has no preconditions.
+        assert!(pidfd_alive(&pidfd_of(unsafe { libc::getpid() }).unwrap()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let fd = pidfd_of(child.id() as i32).unwrap();
+        child.wait().unwrap();
+        assert!(!pidfd_alive(&fd), "a reaped child counts as alive");
     }
 
     #[test]

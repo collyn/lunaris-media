@@ -181,6 +181,115 @@ fn has_cap_sys_admin() -> bool {
         .any(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
 }
 
+/// How screen capture on a Wayland session may be done (a user setting of
+/// the agent, "Wayland screen capture"). Other sessions ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaylandCapturePreference {
+    /// The capture service, then direct KMS (with `CAP_SYS_ADMIN`), then the
+    /// portal, then X11: no prompt when the service is installed.
+    #[default]
+    Auto,
+    /// Always through the XDG portal (PipeWire), then X11: the person at the
+    /// computer approves and the desktop shows that the screen is shared.
+    /// The capture service and KMS are never used.
+    Portal,
+}
+
+impl WaylandCapturePreference {
+    /// `"auto"` or `"portal"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Portal => "portal",
+        }
+    }
+
+    /// `"auto"` / `"portal"` (any case, surrounding spaces ignored); `None`
+    /// for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "portal" => Some(Self::Portal),
+            _ => None,
+        }
+    }
+}
+
+/// 0 = Auto, 1 = Portal.
+static WAYLAND_CAPTURE_PREFERENCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets the [`WaylandCapturePreference`] for this process; capture backends
+/// created afterwards follow it. `LUNARIS_CAPTURE` (a developer override)
+/// still wins over it.
+pub fn set_wayland_capture_preference(preference: WaylandCapturePreference) {
+    let value = match preference {
+        WaylandCapturePreference::Auto => 0,
+        WaylandCapturePreference::Portal => 1,
+    };
+    let old = WAYLAND_CAPTURE_PREFERENCE.swap(value, std::sync::atomic::Ordering::Relaxed);
+    if old != value {
+        log::info!("Wayland screen capture preference: {}", preference.as_str());
+    }
+}
+
+/// The preference last set with [`set_wayland_capture_preference`]
+/// (`Auto` when never set).
+pub fn wayland_capture_preference() -> WaylandCapturePreference {
+    match WAYLAND_CAPTURE_PREFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => WaylandCapturePreference::Portal,
+        _ => WaylandCapturePreference::Auto,
+    }
+}
+
+/// A Wayland capture backend.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaylandBackend {
+    Service,
+    Kms,
+    Portal,
+}
+
+/// The Wayland backends to try, in order, worked out from `LUNARIS_CAPTURE`
+/// and the preference.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct WaylandPlan {
+    order: Vec<WaylandBackend>,
+    /// The backend `LUNARIS_CAPTURE` names: tried first, and even when it
+    /// looks unavailable (no socket, no `CAP_SYS_ADMIN`).
+    forced: Option<WaylandBackend>,
+    /// `LUNARIS_CAPTURE` was set to something it does not know (ignored).
+    unknown_env: Option<String>,
+}
+
+/// `env`: the value of `LUNARIS_CAPTURE` (empty when unset).
+///
+/// A known `LUNARIS_CAPTURE` (`service`, `kms`/`drm`, `portal`/`pipewire`)
+/// wins over the preference, as it always has: that backend first, then the
+/// others in the usual order. Otherwise `Auto` is service, KMS, portal and
+/// `Portal` is the portal alone. X11 comes after any of these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wayland_plan(env: &str, preference: WaylandCapturePreference) -> WaylandPlan {
+    let env = env.trim().to_ascii_lowercase();
+    let forced = match env.as_str() {
+        "service" => Some(WaylandBackend::Service),
+        "kms" | "drm" => Some(WaylandBackend::Kms),
+        "portal" | "pipewire" => Some(WaylandBackend::Portal),
+        _ => None,
+    };
+    let unknown_env = (forced.is_none() && !env.is_empty()).then_some(env);
+    let mut order = match (forced, preference) {
+        (None, WaylandCapturePreference::Portal) => vec![WaylandBackend::Portal],
+        _ => vec![WaylandBackend::Service, WaylandBackend::Kms, WaylandBackend::Portal],
+    };
+    if let Some(f) = forced {
+        order.retain(|b| *b != f);
+        order.insert(0, f);
+    }
+    WaylandPlan { order, forced, unknown_env }
+}
+
 /// Wayland backends in order; `None` falls through to X11.
 ///
 /// 1. The Lunaris capture service (root helper owning DRM): no prompt.
@@ -188,27 +297,30 @@ fn has_cap_sys_admin() -> bool {
 /// 3. PipeWire through the XDG Desktop Portal (asks the person once; the
 ///    restore token remembers the answer).
 ///
+/// With [`WaylandCapturePreference::Portal`] only the portal is tried.
 /// `LUNARIS_CAPTURE=service|kms|portal` tries that one first (falling back
-/// to the others with a warning if it is unavailable).
+/// to the others with a warning if it is unavailable), whatever the
+/// preference (see [`wayland_plan`]).
 #[cfg(target_os = "linux")]
 fn wayland_capture() -> Option<Box<dyn ScreenCapture>> {
-    let forced = std::env::var("LUNARIS_CAPTURE").unwrap_or_default().to_ascii_lowercase();
-    let forced = match forced.as_str() {
-        "drm" => "kms".to_string(),
-        "pipewire" => "portal".to_string(),
-        _ => forced,
-    };
-    let mut order: Vec<&str> = vec!["service", "kms", "portal"];
-    if let Some(pos) = order.iter().position(|b| *b == forced) {
-        let b = order.remove(pos);
-        order.insert(0, b);
-    } else if !forced.is_empty() {
-        log::warn!("LUNARIS_CAPTURE={} is not one of service, kms, portal; ignoring it", forced);
+    let env = std::env::var("LUNARIS_CAPTURE").unwrap_or_default();
+    let preference = wayland_capture_preference();
+    let plan = wayland_plan(&env, preference);
+    if let Some(unknown) = &plan.unknown_env {
+        log::warn!("LUNARIS_CAPTURE={} is not one of service, kms, portal; ignoring it", unknown);
     }
-    for backend in order {
-        let is_forced = backend == forced;
+    match plan.forced {
+        Some(f) => log::info!(
+            "Wayland capture: LUNARIS_CAPTURE={:?} overrides the preference \"{}\"",
+            f,
+            preference.as_str()
+        ),
+        None => log::info!("Wayland capture preference \"{}\": trying {:?}", preference.as_str(), plan.order),
+    }
+    for backend in plan.order {
+        let is_forced = Some(backend) == plan.forced;
         match backend {
-            "service" => {
+            WaylandBackend::Service => {
                 let path = drm_service::socket_path();
                 if !is_forced && !path.exists() {
                     log::info!("Capture service not installed ({} missing)", path.display());
@@ -227,7 +339,7 @@ fn wayland_capture() -> Option<Box<dyn ScreenCapture>> {
                     Err(e) => log::info!("Capture service not usable: {}", e),
                 }
             }
-            "kms" => {
+            WaylandBackend::Kms => {
                 if !is_forced && !has_cap_sys_admin() {
                     continue;
                 }
@@ -239,7 +351,7 @@ fn wayland_capture() -> Option<Box<dyn ScreenCapture>> {
                     Err(e) => log::warn!("KMS capture unavailable: {}", e),
                 }
             }
-            _ => {
+            WaylandBackend::Portal => {
                 log::info!("Using the XDG portal (PipeWire) on Wayland: the first session asks on this screen");
                 match linux_wayland::PipeWireCapture::new() {
                     Ok(pw) => return Some(Box::new(pw)),
@@ -365,4 +477,71 @@ pub async fn list_displays_for_capabilities() -> Result<Vec<DisplayInfo>, MediaE
     let displays = cap.list_displays().await;
     tokio::task::spawn_blocking(move || drop(cap));
     displays
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WaylandBackend::{Kms, Portal, Service};
+    use super::WaylandCapturePreference as Pref;
+    use super::*;
+
+    #[test]
+    fn auto_without_override_is_service_kms_portal() {
+        let plan = wayland_plan("", Pref::Auto);
+        assert_eq!(plan, WaylandPlan { order: vec![Service, Kms, Portal], forced: None, unknown_env: None });
+    }
+
+    #[test]
+    fn portal_preference_never_tries_service_or_kms() {
+        let plan = wayland_plan("", Pref::Portal);
+        assert_eq!(plan.order, vec![Portal]);
+        assert_eq!(plan.forced, None);
+        // An unknown override is ignored and does not widen the order.
+        let plan = wayland_plan("nvfbc", Pref::Portal);
+        assert_eq!(plan.order, vec![Portal]);
+        assert_eq!(plan.unknown_env.as_deref(), Some("nvfbc"));
+    }
+
+    #[test]
+    fn env_override_wins_over_the_preference() {
+        for pref in [Pref::Auto, Pref::Portal] {
+            let plan = wayland_plan("service", pref);
+            assert_eq!(plan.order, vec![Service, Kms, Portal]);
+            assert_eq!(plan.forced, Some(Service));
+            let plan = wayland_plan("KMS", pref);
+            assert_eq!(plan.order, vec![Kms, Service, Portal]);
+            assert_eq!(plan.forced, Some(Kms));
+            let plan = wayland_plan("drm", pref);
+            assert_eq!((plan.order[0], plan.forced), (Kms, Some(Kms)));
+            let plan = wayland_plan(" portal ", pref);
+            assert_eq!(plan.order, vec![Portal, Service, Kms]);
+            let plan = wayland_plan("pipewire", pref);
+            assert_eq!(plan.forced, Some(Portal));
+        }
+    }
+
+    #[test]
+    fn unknown_override_is_reported_and_ignored() {
+        let plan = wayland_plan("Bogus", Pref::Auto);
+        assert_eq!(plan.order, vec![Service, Kms, Portal]);
+        assert_eq!(plan.forced, None);
+        assert_eq!(plan.unknown_env.as_deref(), Some("bogus"));
+    }
+
+    #[test]
+    fn preference_parses_and_is_stored() {
+        assert_eq!(Pref::parse("auto"), Some(Pref::Auto));
+        assert_eq!(Pref::parse(" Portal "), Some(Pref::Portal));
+        assert_eq!(Pref::parse(""), None);
+        assert_eq!(Pref::parse("service"), None);
+        assert_eq!(Pref::default(), Pref::Auto);
+        for p in [Pref::Auto, Pref::Portal] {
+            assert_eq!(Pref::parse(p.as_str()), Some(p));
+        }
+        // The only test that touches the process-wide value.
+        set_wayland_capture_preference(Pref::Portal);
+        assert_eq!(wayland_capture_preference(), Pref::Portal);
+        set_wayland_capture_preference(Pref::Auto);
+        assert_eq!(wayland_capture_preference(), Pref::Auto);
+    }
 }

@@ -17,6 +17,12 @@
 //!     DrmServiceCapture backend for a few frames.
 //! ```
 //!
+//! drm_service_probe soak --socket PATH [--display NAME] [--seconds S] [--fps F]
+//!     The agent's path for S seconds: DrmServiceCapture, then VAAPI H.264
+//!     encoding of every new frame (zero-copy). Every 5 s: frame rate, frame
+//!     gaps, encode time, bitrate, cursor updates, descriptors and memory.
+//!     Survives a service restart (reconnects) and reports the gap.
+//!
 //! Reads the screen; never injects input and never changes display state.
 
 use std::path::{Path, PathBuf};
@@ -324,9 +330,187 @@ fn main() {
         Some("enumerate") => enumerate(),
         Some("serve") => serve(&args),
         Some("client") => client(&args),
+        Some("soak") => soak(&args),
         _ => {
-            eprintln!("usage: drm_service_probe enumerate | serve --socket PATH [--allow-exe P]... | client --socket PATH [--frames N] [--fps F] [--out DIR]");
+            eprintln!("usage: drm_service_probe enumerate | serve --socket PATH [--allow-exe P]... | client --socket PATH [--frames N] [--fps F] [--out DIR] | soak --socket PATH [--display NAME] [--seconds S] [--fps F]");
             std::process::exit(64);
         }
     }
+}
+
+fn vm_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
+        .unwrap_or(0)
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+fn soak(args: &[String]) {
+    use lunaris_media::encode::EncoderConfig;
+    use lunaris_media::types::{HwAccelType, VideoCodec};
+
+    let socket = PathBuf::from(arg_value(args, "--socket").expect("--socket"));
+    let seconds: u64 = arg_value(args, "--seconds").and_then(|v| v.parse().ok()).unwrap_or(30);
+    let fps: u32 = arg_value(args, "--fps").and_then(|v| v.parse().ok()).unwrap_or(60);
+    let want = arg_value(args, "--display");
+    std::env::set_var("LUNARIS_CAPTURE_SOCKET", &socket);
+    let fds_start = open_fd_count();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut cap = match svc::DrmServiceCapture::connect(&socket) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("FAIL connect: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let displays = cap.list_displays().await.unwrap_or_default();
+        let Some(d) = displays
+            .iter()
+            .find(|d| want.as_deref().is_none_or(|w| d.name == w))
+            .or_else(|| displays.iter().find(|d| d.is_primary))
+            .cloned()
+        else {
+            println!("FAIL no display {:?}", want);
+            std::process::exit(1);
+        };
+        let config = lunaris_media::types::StreamConfig { width: d.width, height: d.height, fps, ..Default::default() };
+        if let Err(e) = cap.start(&d.id, &config).await {
+            println!("FAIL start: {}", e);
+            std::process::exit(1);
+        }
+        let mut encoder = lunaris_media::encode::create_encoder().expect("encoder");
+        let enc_config = EncoderConfig {
+            codec: VideoCodec::H264,
+            width: d.width,
+            height: d.height,
+            fps,
+            bitrate_kbps: 20_000,
+            low_latency: true,
+            preferred_hw: Some(HwAccelType::Vaapi),
+            hardware_only: true,
+            ..EncoderConfig::default()
+        };
+        if let Err(e) = encoder.initialize(&enc_config) {
+            println!("FAIL VAAPI encoder: {}", e);
+            std::process::exit(1);
+        }
+        println!(
+            "soak {} {}x{} at {} fps for {} s, encoder {} ({:?})",
+            d.name,
+            d.width,
+            d.height,
+            fps,
+            seconds,
+            encoder.encoder_info().name,
+            encoder.encoder_info().hw_type
+        );
+        let rss_start = vm_rss_kb();
+        let t0 = Instant::now();
+        let mut window_start = Instant::now();
+        let (mut w_new, mut w_repeat, mut w_bytes, mut w_cursor) = (0u32, 0u32, 0usize, 0u32);
+        let (mut w_gaps, mut w_enc): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let (mut all_gaps, mut total_new, mut total_bytes, mut enc_errors) = (Vec::new(), 0u32, 0usize, 0u32);
+        let mut last_new: Option<Instant> = None;
+        let mut last_cursor: Option<(i32, i32, bool, bool)> = None;
+        let mut pts = 0u64;
+        encoder.request_keyframe();
+        while t0.elapsed() < Duration::from_secs(seconds) {
+            let frame = match cap.next_frame().await {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("FAIL next_frame: {}", e);
+                    break;
+                }
+            };
+            if let Some(c) = lunaris_media::capture::linux_wayland::pipewire_cursor() {
+                let key = (c.x, c.y, c.visible, c.image.is_some());
+                if last_cursor != Some(key) {
+                    w_cursor += 1;
+                    last_cursor = Some(key);
+                }
+            }
+            if !frame.is_new_frame {
+                w_repeat += 1;
+            } else {
+                let now = Instant::now();
+                if let Some(prev) = last_new {
+                    let gap = now.duration_since(prev).as_secs_f64() * 1000.0;
+                    w_gaps.push(gap);
+                    all_gaps.push(gap);
+                }
+                last_new = Some(now);
+                pts += 1_000_000 / fps as u64;
+                let e0 = Instant::now();
+                match encoder.encode(&frame.buffer, pts) {
+                    Ok(out) => {
+                        let b: usize = out.iter().map(|f| f.data.len()).sum();
+                        w_bytes += b;
+                        total_bytes += b;
+                    }
+                    Err(e) => {
+                        enc_errors += 1;
+                        if enc_errors <= 3 {
+                            println!("   encode error: {}", e);
+                        }
+                    }
+                }
+                w_enc.push(e0.elapsed().as_secs_f64() * 1000.0);
+                w_new += 1;
+                total_new += 1;
+            }
+            drop(frame);
+            if window_start.elapsed() >= Duration::from_secs(5) {
+                let secs = window_start.elapsed().as_secs_f64();
+                w_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                w_enc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "   t={:>3.0}s  {:>5.1} fps  repeats {:>3}  gap p50 {:>5.1} p99 {:>6.1} max {:>7.1} ms  encode avg {:>5.2} max {:>6.2} ms  {:>6.0} kbit/s  cursor updates {:>3}  fds {}  rss {} MB",
+                    t0.elapsed().as_secs_f64(),
+                    w_new as f64 / secs,
+                    w_repeat,
+                    percentile(&w_gaps, 0.5),
+                    percentile(&w_gaps, 0.99),
+                    w_gaps.last().copied().unwrap_or(0.0),
+                    if w_enc.is_empty() { 0.0 } else { w_enc.iter().sum::<f64>() / w_enc.len() as f64 },
+                    w_enc.last().copied().unwrap_or(0.0),
+                    w_bytes as f64 * 8.0 / 1000.0 / secs,
+                    w_cursor,
+                    open_fd_count(),
+                    vm_rss_kb() / 1024
+                );
+                window_start = Instant::now();
+                (w_new, w_repeat, w_bytes, w_cursor) = (0, 0, 0, 0);
+                w_gaps.clear();
+                w_enc.clear();
+            }
+        }
+        let _ = cap.stop().await;
+        drop(encoder);
+        drop(cap);
+        all_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "SOAK {}: {} new frames in {:.1} s = {:.1} fps; gap p50 {:.1} p99 {:.1} max {:.1} ms; gaps >50 ms: {}, >250 ms: {}; {:.1} Mbit/s; encode errors {}",
+            d.name,
+            total_new,
+            secs,
+            total_new as f64 / secs,
+            percentile(&all_gaps, 0.5),
+            percentile(&all_gaps, 0.99),
+            all_gaps.last().copied().unwrap_or(0.0),
+            all_gaps.iter().filter(|g| **g > 50.0).count(),
+            all_gaps.iter().filter(|g| **g > 250.0).count(),
+            total_bytes as f64 * 8.0 / 1e6 / secs,
+            enc_errors
+        );
+        println!("SOAK memory {} -> {} MB; descriptors {} -> {}", rss_start / 1024, vm_rss_kb() / 1024, fds_start, open_fd_count());
+    });
 }
