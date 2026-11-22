@@ -225,6 +225,40 @@ impl ScreenRegion {
 static CAPTURE_MAPPING: std::sync::Mutex<Option<(ScreenRegion, ScreenRegion)>> =
     std::sync::Mutex::new(None);
 
+/// Where the last absolute move put the pointer, as a fraction of the
+/// streamed region (0..1 each way), and when; cleared by a relative move.
+/// The KMS capture learns the cursor's hotspot from it (the cursor plane
+/// only says where the image's corner is: drm_service/client.rs).
+#[cfg(target_os = "linux")]
+static LAST_ABSOLUTE: std::sync::Mutex<Option<(f64, f64, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn last_absolute_pointer() -> Option<(f64, f64, std::time::Instant)> {
+    LAST_ABSOLUTE.lock().ok().and_then(|p| *p)
+}
+
+#[cfg(target_os = "linux")]
+fn note_absolute_pointer(position: Option<(f64, f64)>) {
+    if let Ok(mut p) = LAST_ABSOLUTE.lock() {
+        *p = position.map(|(fx, fy)| (fx, fy, std::time::Instant::now()));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn note_absolute_pointer_for_tests(position: Option<(f64, f64)>) {
+    note_absolute_pointer(position);
+}
+
+/// The fraction of the streamed region a client position aims at: the
+/// pixel's centre, so the compositor's floor() lands on (x, y).
+#[cfg(target_os = "linux")]
+fn aimed_fraction(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (f64, f64) {
+    (
+        ((x as f64 + 0.5) / ref_w as f64).clamp(0.0, 1.0),
+        ((y as f64 + 0.5) / ref_h as f64).clamp(0.0, 1.0),
+    )
+}
+
 /// Tell the input layer which part of the desktop is being streamed (logical
 /// coordinates, e.g. the portal stream position/size). Absolute pointer
 /// events are then mapped onto that monitor, like Sunshine's touch port.
@@ -372,9 +406,7 @@ fn xrandr_monitors() -> Vec<ScreenRegion> {
 #[cfg(target_os = "linux")]
 fn map_to_abs_axes(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (i32, i32) {
     let mapping = CAPTURE_MAPPING.lock().ok().and_then(|m| *m);
-    // Aim at the pixel centre so the compositor's floor() lands on (x, y).
-    let fx = ((x as f64 + 0.5) / ref_w as f64).clamp(0.0, 1.0);
-    let fy = ((y as f64 + 0.5) / ref_h as f64).clamp(0.0, 1.0);
+    let (fx, fy) = aimed_fraction(x, y, ref_w, ref_h);
     let (nx, ny) = match mapping {
         Some((target, desktop)) if desktop.width > 0 && desktop.height > 0 => (
             (target.x - desktop.x) as f64 / desktop.width as f64
@@ -812,6 +844,7 @@ impl InputInjector {
         match &self.backend {
             Backend::Uinput(u) => {
                 u.last_absolute.store(false, std::sync::atomic::Ordering::Relaxed);
+                note_absolute_pointer(None);
                 let events = [
                     InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, dx),
                     InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, dy),
@@ -897,6 +930,7 @@ impl InputInjector {
                 if reference_width > 0 && reference_height > 0 {
                     let (abs_x, abs_y) = map_to_abs_axes(x, y, reference_width, reference_height);
                     u.move_absolute(abs_x, abs_y);
+                    note_absolute_pointer(Some(aimed_fraction(x, y, reference_width, reference_height)));
                 }
             }
             Backend::X11(x11) => {

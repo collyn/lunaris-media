@@ -213,22 +213,137 @@ pub fn captured_frame(frame: &WireFrame, mut fds: Vec<OwnedFd>) -> Result<Captur
 /// Cursor metadata in the shape the PipeWire backend publishes: position of
 /// the pointer (image origin + hotspot) in encoded-video pixels.
 pub fn cursor_meta(c: &WireCursor, display: (u32, u32), encoded: (u32, u32)) -> FrameCursorMeta {
+    cursor_meta_with(c, (c.hot_x, c.hot_y), c.image.as_ref(), display, encoded)
+}
+
+/// `cursor_meta` with the hotspot `hot`, and with `image` (the cursor's
+/// picture, sent again when its hotspot changed).
+fn cursor_meta_with(
+    c: &WireCursor,
+    hot: (i32, i32),
+    image: Option<&Vec<u8>>,
+    display: (u32, u32),
+    encoded: (u32, u32),
+) -> FrameCursorMeta {
     use crate::capture::linux_wayland::scale_coord;
-    let image = c.image.as_ref().map(|rgba| CursorImage {
+    let image = image.map(|rgba| CursorImage {
         width: c.width,
         height: c.height,
-        hotspot_x: c.hot_x.max(0) as u32,
-        hotspot_y: c.hot_y.max(0) as u32,
+        hotspot_x: hot.0.max(0) as u32,
+        hotspot_y: hot.1.max(0) as u32,
         rgba_data: rgba.clone(),
     });
     FrameCursorMeta {
-        x: scale_coord(c.x + c.hot_x, display.0, encoded.0),
-        y: scale_coord(c.y + c.hot_y, display.1, encoded.1),
-        hotspot_x: c.hot_x,
-        hotspot_y: c.hot_y,
+        x: scale_coord(c.x + hot.0, display.0, encoded.0),
+        y: scale_coord(c.y + hot.1, display.1, encoded.1),
+        hotspot_x: hot.0,
+        hotspot_y: hot.1,
         visible: c.visible,
         image,
     }
+}
+
+/// The cursor's hotspot where KMS has none. A cursor plane says where the
+/// image's corner is; only virtual GPUs have the HOTSPOT_X/Y properties, so
+/// on real ones the hotspot comes as 0,0 and the pointer would be shown (and
+/// said to be) a few pixels up and left of where it is: the arrow's tip
+/// drawn by the viewer lands below and right of where a click goes.
+///
+/// Each new picture gets a guess (its first opaque pixel: near an arrow's
+/// tip), then the real hotspot is learned once the viewer has put the
+/// pointer somewhere (an absolute move, input.rs) and it stays there: the
+/// pointer minus the image's corner as reported after that move. What was
+/// learned is kept by picture.
+#[derive(Default)]
+struct Hotspots {
+    width: u32,
+    height: u32,
+    image: Option<Vec<u8>>,
+    key: u64,
+    hot: (i32, i32),
+    learned: std::collections::HashMap<u64, (i32, i32)>,
+    /// The last report (without its picture) and when it came.
+    last: Option<(WireCursor, std::time::Instant)>,
+    /// The absolute move last looked at (each is looked at once).
+    checked: Option<std::time::Instant>,
+}
+
+impl Hotspots {
+    /// How long the pointer has to stay where the viewer put it.
+    const SETTLED: Duration = Duration::from_millis(40);
+    /// A move older than this says nothing any more.
+    const STALE: Duration = Duration::from_millis(1500);
+
+    /// The meta for `c`: its own hotspot when KMS has one, else this one.
+    fn meta(&mut self, c: &WireCursor, display: (u32, u32), encoded: (u32, u32)) -> FrameCursorMeta {
+        if c.hot_x != 0 || c.hot_y != 0 {
+            self.last = None;
+            return cursor_meta(c, display, encoded);
+        }
+        if let Some(rgba) = &c.image {
+            self.width = c.width;
+            self.height = c.height;
+            self.key = picture_key(c.width, c.height, rgba);
+            self.hot = self.learned.get(&self.key).copied().unwrap_or_else(|| first_opaque(c.width, c.height, rgba));
+            self.image = Some(rgba.clone());
+        }
+        self.last = Some((WireCursor { image: None, ..c.clone() }, std::time::Instant::now()));
+        cursor_meta_with(c, self.hot, c.image.as_ref(), display, encoded)
+    }
+
+    /// Learns the hotspot when the viewer's last absolute move has settled
+    /// and the cursor was reported after it; the meta to publish again
+    /// (with the picture, whose hotspot changed) when it is a new one.
+    fn settle(&mut self, display: (u32, u32), encoded: (u32, u32)) -> Option<FrameCursorMeta> {
+        let (c, seen_at) = self.last.clone()?;
+        self.image.as_ref()?;
+        let (fx, fy, at) = crate::input::last_absolute_pointer()?;
+        if self.checked == Some(at) || at.elapsed() < Self::SETTLED {
+            return None;
+        }
+        self.checked = Some(at);
+        if at.elapsed() > Self::STALE || seen_at < at || !c.visible || display.0 == 0 || display.1 == 0 {
+            return None;
+        }
+        let seen = hotspot_from(fx, fy, display, (c.x, c.y), (self.width, self.height))?;
+        if seen == self.hot {
+            return None;
+        }
+        log::debug!("capture service: cursor hotspot {:?} (was {:?})", seen, self.hot);
+        self.hot = seen;
+        self.learned.insert(self.key, seen);
+        Some(cursor_meta_with(&c, seen, self.image.as_ref(), display, encoded))
+    }
+}
+
+/// Pointer (`fx`, `fy` of the display) minus the image's corner, when that
+/// is inside the image.
+fn hotspot_from(fx: f64, fy: f64, display: (u32, u32), corner: (i32, i32), size: (u32, u32)) -> Option<(i32, i32)> {
+    let px = (fx * display.0 as f64).floor() as i32;
+    let py = (fy * display.1 as f64).floor() as i32;
+    let hot = (px - corner.0, py - corner.1);
+    (hot.0 >= 0 && hot.1 >= 0 && (hot.0 as u32) < size.0 && (hot.1 as u32) < size.1).then_some(hot)
+}
+
+/// The first pixel that is not transparent, row by row: the tip of an arrow.
+fn first_opaque(width: u32, height: u32, rgba: &[u8]) -> (i32, i32) {
+    let w = width as usize;
+    for y in 0..height as usize {
+        for x in 0..w {
+            if rgba.get((y * w + x) * 4 + 3).is_some_and(|a| *a >= 128) {
+                return (x as i32, y as i32);
+            }
+        }
+    }
+    (0, 0)
+}
+
+fn picture_key(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (width, height).hash(&mut h);
+    rgba.hash(&mut h);
+    h.finish()
 }
 
 struct Incoming {
@@ -361,11 +476,17 @@ fn start_msg(display: &WireDisplay, fps: u32) -> Message {
 
 fn reader_loop(mut ctx: ReaderCtx, mut conn: Arc<Conn>) {
     let mut warned_planes = false;
+    let mut hotspots = Hotspots::default();
     'outer: loop {
         if ctx.shared.shutdown.load(Ordering::SeqCst) {
             return;
         }
         let received = conn.recv(Some(Duration::from_millis(250)));
+        // The hotspot, once the pointer the viewer moved has stopped (also
+        // when nothing came: the last report is the pointer at rest).
+        if let Some(meta) = hotspots.settle((ctx.display.width, ctx.display.height), ctx.encoded) {
+            crate::capture::linux_wayland::publish_cursor(&meta);
+        }
         match received {
             Ok(None) => {}
             Ok(Some((Message::Frame(f), fds))) => {
@@ -396,7 +517,7 @@ fn reader_loop(mut ctx: ReaderCtx, mut conn: Arc<Conn>) {
             }
             Ok(Some((Message::Cursor(c), _))) => {
                 if c.display_id == ctx.display.id {
-                    let meta = cursor_meta(&c, (ctx.display.width, ctx.display.height), ctx.encoded);
+                    let meta = hotspots.meta(&c, (ctx.display.width, ctx.display.height), ctx.encoded);
                     crate::capture::linux_wayland::publish_cursor(&meta);
                 }
             }
@@ -613,5 +734,89 @@ impl ScreenCapture for DrmServiceCapture {
 impl Drop for DrmServiceCapture {
     fn drop(&mut self) {
         self.halt();
+    }
+}
+
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+
+    /// The tests that set the last absolute move (one for the process).
+    static POINTER: Mutex<()> = Mutex::new(());
+
+    /// A 32x32 picture with an arrow-like tip at (4, 3).
+    fn arrow() -> Vec<u8> {
+        let mut rgba = vec![0u8; 32 * 32 * 4];
+        for (x, y) in [(4, 3), (4, 4), (5, 4), (4, 5), (5, 5), (6, 5)] {
+            rgba[(y * 32 + x) * 4 + 3] = 255;
+        }
+        rgba
+    }
+
+    fn report(x: i32, y: i32, image: Option<Vec<u8>>) -> WireCursor {
+        WireCursor { display_id: 1, visible: true, x, y, hot_x: 0, hot_y: 0, width: 32, height: 32, generation: 1, image }
+    }
+
+    #[test]
+    fn a_new_picture_is_aimed_at_its_first_opaque_pixel() {
+        assert_eq!(first_opaque(32, 32, &arrow()), (4, 3));
+        assert_eq!(first_opaque(2, 2, &[0; 16]), (0, 0));
+        let mut h = Hotspots::default();
+        let meta = h.meta(&report(100, 200, Some(arrow())), (1920, 1080), (1920, 1080));
+        assert_eq!((meta.x, meta.y, meta.hotspot_x, meta.hotspot_y), (104, 203, 4, 3));
+        assert_eq!(meta.image.unwrap().hotspot_x, 4);
+        // A KMS that knows the hotspot (a virtual GPU) is believed.
+        let known = WireCursor { hot_x: 7, hot_y: 9, ..report(100, 200, Some(arrow())) };
+        let meta = h.meta(&known, (1920, 1080), (1920, 1080));
+        assert_eq!((meta.x, meta.y), (107, 209));
+    }
+
+    #[test]
+    fn the_pointer_inside_the_picture_is_its_hotspot() {
+        // Pointer at pixel (960, 540) of 1920x1080, image corner (952, 532).
+        let f = |p: f64, size: f64| (p + 0.5) / size;
+        assert_eq!(hotspot_from(f(960.0, 1920.0), f(540.0, 1080.0), (1920, 1080), (952, 532), (32, 32)), Some((8, 8)));
+        // Outside the picture: something else moved the pointer.
+        assert_eq!(hotspot_from(f(960.0, 1920.0), f(540.0, 1080.0), (1920, 1080), (900, 532), (32, 32)), None);
+        assert_eq!(hotspot_from(f(960.0, 1920.0), f(540.0, 1080.0), (1920, 1080), (961, 532), (32, 32)), None);
+    }
+
+    #[test]
+    fn the_hotspot_is_learned_from_an_absolute_move() {
+        let _one = POINTER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = Hotspots::default();
+        let display = (1920, 1080);
+        h.meta(&report(480, 480, Some(arrow())), display, display);
+        // The viewer puts the pointer at (512, 510); the plane moves after it
+        // (its corner at (500, 500)).
+        crate::input::note_absolute_pointer_for_tests(Some(((512.0 + 0.5) / 1920.0, (510.0 + 0.5) / 1080.0)));
+        std::thread::sleep(Duration::from_millis(2));
+        let moved = h.meta(&report(500, 500, None), display, display);
+        assert_eq!((moved.hotspot_x, moved.hotspot_y), (4, 3));
+        // Not settled yet: nothing learned.
+        assert!(h.settle(display, display).is_none());
+        std::thread::sleep(Hotspots::SETTLED + Duration::from_millis(10));
+        let learned = h.settle(display, display).expect("learned");
+        assert_eq!((learned.x, learned.y, learned.hotspot_x, learned.hotspot_y), (512, 510, 12, 10));
+        // The picture goes out again, with it.
+        assert_eq!(learned.image.as_ref().map(|i| (i.hotspot_x, i.hotspot_y)), Some((12, 10)));
+        // Each move is looked at once.
+        assert!(h.settle(display, display).is_none());
+        // The same picture later: what was learned.
+        let later = h.meta(&report(10, 10, Some(arrow())), display, display);
+        assert_eq!((later.hotspot_x, later.hotspot_y), (12, 10));
+        crate::input::note_absolute_pointer_for_tests(None);
+    }
+
+    #[test]
+    fn a_report_from_before_the_move_teaches_nothing() {
+        let _one = POINTER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = Hotspots::default();
+        h.meta(&report(100, 100, Some(arrow())), (1920, 1080), (1920, 1080));
+        std::thread::sleep(Duration::from_millis(2));
+        crate::input::note_absolute_pointer_for_tests(Some(((105.0 + 0.5) / 1920.0, (105.0 + 0.5) / 1080.0)));
+        std::thread::sleep(Hotspots::SETTLED + Duration::from_millis(10));
+        assert!(h.settle((1920, 1080), (1920, 1080)).is_none());
+        crate::input::note_absolute_pointer_for_tests(None);
     }
 }

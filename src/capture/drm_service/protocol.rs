@@ -207,7 +207,8 @@ pub struct WireCursor {
     /// Top-left of the cursor image relative to the display.
     pub x: i32,
     pub y: i32,
-    /// Hotspot inside the image (KMS does not know it: 0,0).
+    /// Hotspot inside the image (KMS knows it only on virtual GPUs, else
+    /// 0,0: the client then works it out, drm_service/client.rs).
     pub hot_x: i32,
     pub hot_y: i32,
     pub width: u32,
