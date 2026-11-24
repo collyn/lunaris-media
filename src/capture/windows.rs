@@ -1450,9 +1450,11 @@ const BLACK_BEFORE_GDI: Duration = Duration::from_secs(5);
 
 /// Whether `frames` black frames in a row, over `black_for`, mean DXGI cannot
 /// see this screen (an RDP session, a VM, a hybrid GPU) rather than a screen
-/// waking up.
-fn gives_up_on_dxgi(frames: u32, black_for: Duration) -> bool {
-    frames >= 3 && black_for >= BLACK_BEFORE_GDI
+/// waking up. A DXGI that showed a picture earlier in the session sees this
+/// screen: a game switching modes or loading is black for seconds (League of
+/// Legends, 2026-11-24 on home: GDI then gave 22 frames a second).
+fn gives_up_on_dxgi(frames: u32, black_for: Duration, dxgi_showed_picture: bool) -> bool {
+    !dxgi_showed_picture && frames >= 3 && black_for >= BLACK_BEFORE_GDI
 }
 
 fn is_buffer_black(data: &[u8]) -> bool {
@@ -1477,6 +1479,9 @@ pub struct WindowsScreenCapture {
     black_frame_count: u32,
     /// When the black frames counted in `black_frame_count` began.
     black_since: Option<Instant>,
+    /// DXGI gave a picture that is not black at some point of this session
+    /// (kept across the restarts of a re-initialisation).
+    dxgi_showed_picture: bool,
     /// `paces_frames()` has returned `true` to the pipeline, which then runs
     /// without its own ticker. If capture falls back to GDI mid-stream (which
     /// does not pace), the wrapper has to keep that promise.
@@ -1499,6 +1504,7 @@ impl WindowsScreenCapture {
             config: None,
             black_frame_count: 0,
             black_since: None,
+            dxgi_showed_picture: false,
             promised_pacing: std::sync::atomic::AtomicBool::new(false),
             gdi_next_due: None,
         })
@@ -1585,30 +1591,41 @@ impl ScreenCapture for WindowsScreenCapture {
                 if is_buffer_black(data) {
                     self.black_frame_count += 1;
                     let black_for = self.black_since.get_or_insert_with(Instant::now).elapsed();
-                    // Only black for long: a screen waking up (the duplication
-                    // is re-created then) gives black frames for a moment, and
-                    // GDI, kept for the rest of the session, is slow and draws
-                    // the pointer into the picture (a second one at the viewer).
-                    if gives_up_on_dxgi(self.black_frame_count, black_for) {
-                        log::warn!(
-                            "DXGI capture returned only black frames ({} in {:.1} s). \
-                             Possibly in an RDP session, VM, or hybrid GPU environment. \
-                             Switching capture backend to GDI.",
-                            self.black_frame_count,
-                            black_for.as_secs_f32()
-                        );
-                        let _ = dxgi.stop().await;
-
-                        if let Some(gdi) = &mut self.gdi {
-                            if let Some(config) = &self.config {
-                                match gdi.start(&self.display_id, config).await {
-                                    Ok(()) => {
+                    // Only black for long, from a DXGI that never showed a
+                    // picture, and not black for GDI too: a screen waking up or
+                    // a game loading is black for a while, and GDI, kept for
+                    // the rest of the session, is slow and draws the pointer
+                    // into the picture (a second one at the viewer).
+                    if gives_up_on_dxgi(self.black_frame_count, black_for, self.dxgi_showed_picture) {
+                        let frames = self.black_frame_count;
+                        self.black_frame_count = 0;
+                        self.black_since = None;
+                        if let (Some(gdi), Some(config)) = (&mut self.gdi, &self.config) {
+                            match gdi.start(&self.display_id, config).await {
+                                Ok(()) => {
+                                    let gdi_sees_picture =
+                                        capture_gdi(gdi.x_offset, gdi.y_offset, gdi.width, gdi.height)
+                                            .map_or(false, |(data, _)| !is_buffer_black(&data));
+                                    if gdi_sees_picture {
+                                        log::warn!(
+                                            "DXGI capture returned only black frames ({} in {:.1} s) \
+                                             while GDI sees a picture. Possibly in an RDP session, VM, \
+                                             or hybrid GPU environment. Switching capture backend to GDI.",
+                                            frames,
+                                            black_for.as_secs_f32()
+                                        );
+                                        let _ = dxgi.stop().await;
                                         self.active_is_gdi = true;
                                         return gdi.next_frame().await;
                                     }
-                                    Err(e) => {
-                                        log::error!("Failed to start GDI capture fallback: {:?}", e);
-                                    }
+                                    log::info!(
+                                        "The screen has been black for {:.1} s for GDI too: staying on DXGI",
+                                        black_for.as_secs_f32()
+                                    );
+                                    let _ = gdi.stop().await;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to start GDI capture fallback: {:?}", e);
                                 }
                             }
                         }
@@ -1616,7 +1633,12 @@ impl ScreenCapture for WindowsScreenCapture {
                 } else {
                     self.black_frame_count = 0;
                     self.black_since = None;
+                    self.dxgi_showed_picture = true;
                 }
+            } else {
+                // A GPU texture: the zero-copy path stops looking on the CPU
+                // once it has seen a picture.
+                self.dxgi_showed_picture = true;
             }
         }
 
@@ -1885,14 +1907,22 @@ mod black_frame_tests {
     fn a_screen_waking_up_keeps_dxgi() {
         // 2026-11-24, home: three black frames 70 ms after the duplication
         // was re-created sent the whole session to GDI.
-        assert!(!gives_up_on_dxgi(3, Duration::from_millis(70)));
-        assert!(!gives_up_on_dxgi(250, Duration::from_millis(4900)));
+        assert!(!gives_up_on_dxgi(3, Duration::from_millis(70), false));
+        assert!(!gives_up_on_dxgi(250, Duration::from_millis(4900), false));
     }
 
     #[test]
     fn a_screen_dxgi_cannot_see_goes_to_gdi() {
-        assert!(gives_up_on_dxgi(300, Duration::from_secs(5)));
-        assert!(!gives_up_on_dxgi(2, Duration::from_secs(10)));
+        assert!(gives_up_on_dxgi(300, Duration::from_secs(5), false));
+        assert!(!gives_up_on_dxgi(2, Duration::from_secs(10), false));
+    }
+
+    #[test]
+    fn a_game_loading_keeps_dxgi() {
+        // 2026-11-24, home: League of Legends switched modes, then the screen
+        // was black for 5 s (102 frames); DXGI had shown the desktop before.
+        assert!(!gives_up_on_dxgi(102, Duration::from_secs(5), true));
+        assert!(!gives_up_on_dxgi(10_000, Duration::from_secs(120), true));
     }
 
     #[test]
