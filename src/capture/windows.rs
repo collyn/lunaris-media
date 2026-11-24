@@ -212,6 +212,12 @@ pub struct DxgiCapture {
     last_frame_data: Option<(Vec<u8>, u32)>, // (data, stride) — cached for timeout reuse
     last_returned_time: Option<Instant>,
     use_zero_copy: bool,
+    /// A frame that is not black came since `start`. Until then the
+    /// zero-copy path also looks at each frame on the CPU (black frames go
+    /// out black, for `WindowsScreenCapture` to count): a screen that wakes
+    /// up, or a duplication just re-created, gives black frames for a while,
+    /// longer than the first three.
+    picture_seen: bool,
 }
 
 impl DxgiCapture {
@@ -244,6 +250,7 @@ impl DxgiCapture {
             last_frame_data: None,
             last_returned_time: None,
             use_zero_copy: false,
+            picture_seen: false,
         })
     }
 
@@ -724,7 +731,7 @@ impl DxgiCapture {
                 context.Flush();
             }
 
-            let is_black = if self.frame_count <= 3 {
+            let is_black = if !self.picture_seen {
                 unsafe {
                     context.CopyResource(&staging, &texture);
                     context.Flush();
@@ -743,6 +750,7 @@ impl DxgiCapture {
             } else {
                 false
             };
+            self.picture_seen |= !is_black;
 
             // display_base.cpp:~350 release_snapshot(): the frame is delivered,
             // then ACCESS_LOST from ReleaseFrame means reinit. The frame is dropped
@@ -963,6 +971,7 @@ impl ScreenCapture for DxgiCapture {
         self.capturing = true;
         self.start_time = Some(Instant::now());
         self.frame_count = 0;
+        self.picture_seen = false;
         self.last_returned_time = None;
 
         log::info!("DXGI Desktop Duplication capture started");
@@ -1436,6 +1445,16 @@ impl ScreenCapture for GdiCapture {
     }
 }
 
+/// DXGI is left for GDI once it gave only black frames for this long.
+const BLACK_BEFORE_GDI: Duration = Duration::from_secs(5);
+
+/// Whether `frames` black frames in a row, over `black_for`, mean DXGI cannot
+/// see this screen (an RDP session, a VM, a hybrid GPU) rather than a screen
+/// waking up.
+fn gives_up_on_dxgi(frames: u32, black_for: Duration) -> bool {
+    frames >= 3 && black_for >= BLACK_BEFORE_GDI
+}
+
 fn is_buffer_black(data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
@@ -1456,6 +1475,8 @@ pub struct WindowsScreenCapture {
     display_id: String,
     config: Option<StreamConfig>,
     black_frame_count: u32,
+    /// When the black frames counted in `black_frame_count` began.
+    black_since: Option<Instant>,
     /// `paces_frames()` has returned `true` to the pipeline, which then runs
     /// without its own ticker. If capture falls back to GDI mid-stream (which
     /// does not pace), the wrapper has to keep that promise.
@@ -1477,6 +1498,7 @@ impl WindowsScreenCapture {
             display_id: String::new(),
             config: None,
             black_frame_count: 0,
+            black_since: None,
             promised_pacing: std::sync::atomic::AtomicBool::new(false),
             gdi_next_due: None,
         })
@@ -1498,6 +1520,7 @@ impl ScreenCapture for WindowsScreenCapture {
         self.display_id = display_id.to_string();
         self.config = Some(config.clone());
         self.black_frame_count = 0;
+        self.black_since = None;
 
         if self.use_gdi_only {
             log::info!("LUNARIS_USE_GDI is set. Starting directly with GDI capture.");
@@ -1561,11 +1584,18 @@ impl ScreenCapture for WindowsScreenCapture {
             if let GpuBuffer::CpuBuffer { data, .. } = &frame.buffer {
                 if is_buffer_black(data) {
                     self.black_frame_count += 1;
-                    if self.black_frame_count >= 3 {
+                    let black_for = self.black_since.get_or_insert_with(Instant::now).elapsed();
+                    // Only black for long: a screen waking up (the duplication
+                    // is re-created then) gives black frames for a moment, and
+                    // GDI, kept for the rest of the session, is slow and draws
+                    // the pointer into the picture (a second one at the viewer).
+                    if gives_up_on_dxgi(self.black_frame_count, black_for) {
                         log::warn!(
-                            "DXGI capture returned black frames for 3 consecutive frames. \
+                            "DXGI capture returned only black frames ({} in {:.1} s). \
                              Possibly in an RDP session, VM, or hybrid GPU environment. \
-                             Switching capture backend to GDI."
+                             Switching capture backend to GDI.",
+                            self.black_frame_count,
+                            black_for.as_secs_f32()
                         );
                         let _ = dxgi.stop().await;
 
@@ -1585,6 +1615,7 @@ impl ScreenCapture for WindowsScreenCapture {
                     }
                 } else {
                     self.black_frame_count = 0;
+                    self.black_since = None;
                 }
             }
         }
@@ -1843,5 +1874,32 @@ unsafe fn draw_cursor_onto_buffer(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod black_frame_tests {
+    use super::*;
+
+    #[test]
+    fn a_screen_waking_up_keeps_dxgi() {
+        // 2026-11-24, home: three black frames 70 ms after the duplication
+        // was re-created sent the whole session to GDI.
+        assert!(!gives_up_on_dxgi(3, Duration::from_millis(70)));
+        assert!(!gives_up_on_dxgi(250, Duration::from_millis(4900)));
+    }
+
+    #[test]
+    fn a_screen_dxgi_cannot_see_goes_to_gdi() {
+        assert!(gives_up_on_dxgi(300, Duration::from_secs(5)));
+        assert!(!gives_up_on_dxgi(2, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn black_is_all_zero() {
+        assert!(is_buffer_black(&[0u8; 4096]));
+        let mut picture = vec![0u8; 4096];
+        picture[512] = 30;
+        assert!(!is_buffer_black(&picture));
     }
 }
