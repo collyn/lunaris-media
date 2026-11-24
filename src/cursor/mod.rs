@@ -27,6 +27,11 @@ pub trait CursorCapture: Send {
 
     /// Stop tracking cursor state and release resources.
     fn stop(&mut self) -> Result<(), MediaError>;
+
+    /// How often the pipeline asks for the state (it sends it on a change).
+    fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(16)
+    }
 }
 
 /// Create a [`CursorCapture`] backend appropriate for the current platform.

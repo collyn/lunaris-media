@@ -26,6 +26,25 @@ pub struct WindowsCursorCapture {
     active: bool,
     last_image_hash: Option<u64>,
     logged_image_failure: bool,
+    /// The cursor handle whose image was read last, and when.
+    last_image_read: Option<(isize, std::time::Instant)>,
+}
+
+/// The position is read 250 times a second: a viewer with the game mouse
+/// draws the cursor only where the host says (no local guess), and at 60 a
+/// second it moved in visible steps (2026-11-24).
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
+/// The image of an unchanged cursor handle is read again this often (an
+/// application can redraw the cursor behind the same handle).
+const SAME_HANDLE_IMAGE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether the cursor's image is read on this poll: a new handle, or the
+/// same one for a while.
+fn reads_image(last: Option<(isize, std::time::Instant)>, handle: isize, now: std::time::Instant) -> bool {
+    match last {
+        Some((h, at)) => h != handle || now.duration_since(at) >= SAME_HANDLE_IMAGE_EVERY,
+        None => true,
+    }
 }
 
 impl WindowsCursorCapture {
@@ -34,6 +53,7 @@ impl WindowsCursorCapture {
             active: false,
             last_image_hash: None,
             logged_image_failure: false,
+            last_image_read: None,
         })
     }
 }
@@ -469,7 +489,10 @@ impl CursorCapture for WindowsCursorCapture {
         let visible = (cursor_info.flags.0 & CURSOR_SHOWING.0) != 0;
         let kind = cursor_kind_from_handle(cursor_info.hCursor);
         let mut image = None;
-        if visible {
+        let now = std::time::Instant::now();
+        let handle = cursor_info.hCursor.0 as isize;
+        if visible && reads_image(self.last_image_read, handle, now) {
+            self.last_image_read = Some((handle, now));
             match cursor_image_from_handle(cursor_info.hCursor) {
                 Some(cursor_image) => {
                     let hash = cursor_image_hash(&cursor_image);
@@ -516,7 +539,28 @@ impl CursorCapture for WindowsCursorCapture {
 
     fn stop(&mut self) -> Result<(), MediaError> {
         self.active = false;
+        self.last_image_read = None;
         log::info!("Windows cursor capture stopped");
         Ok(())
+    }
+
+    fn poll_interval(&self) -> std::time::Duration {
+        POLL_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod image_read_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_image_is_read_for_a_new_handle_or_after_a_while() {
+        let t = Instant::now();
+        assert!(reads_image(None, 7, t));
+        assert!(reads_image(Some((7, t)), 8, t + Duration::from_millis(4)));
+        assert!(!reads_image(Some((7, t)), 7, t + Duration::from_millis(4)));
+        assert!(!reads_image(Some((7, t)), 7, t + Duration::from_millis(249)));
+        assert!(reads_image(Some((7, t)), 7, t + Duration::from_millis(250)));
     }
 }

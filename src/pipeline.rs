@@ -293,11 +293,13 @@ impl MediaPipeline {
             }
         });
 
-        // 5. Start cursor tracking (~60 Hz polling)
+        // 5. Start cursor tracking (each backend says how often)
         cursor_capture.start().ok(); // Non-fatal if cursor capture fails
         let cursor_event_tx = self.event_tx.clone();
         let cursor_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60Hz
+            let mut interval = tokio::time::interval(cursor_capture.poll_interval());
+            // A late tick is not made up with a burst of polls.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_state: Option<CursorState> = None;
             loop {
                 interval.tick().await;
