@@ -536,6 +536,16 @@ async fn drm_service_capture_end_to_end_with_reconnect() {
     assert!(!cap.next_frame().await.unwrap().is_new_frame);
     assert!(t.elapsed() < Duration::from_millis(500));
 
+    // Nothing new: the last picture is repeated at the requested rate (60 fps
+    // here), not at 2/3 of it.
+    let t = Instant::now();
+    let mut repeats = 0;
+    while t.elapsed() < Duration::from_millis(600) {
+        assert!(!cap.next_frame().await.unwrap().is_new_frame);
+        repeats += 1;
+    }
+    assert!((32..=38).contains(&repeats), "{} repeats in 600 ms at 60 fps", repeats);
+
     cap.stop().await.unwrap();
     assert!(!cap.is_capturing());
     drop(cap);

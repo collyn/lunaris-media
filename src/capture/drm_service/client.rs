@@ -378,6 +378,10 @@ pub struct DrmServiceCapture {
     fps: u32,
     streaming: Option<WireDisplay>,
     first_frame: bool,
+    /// When `next_frame` last returned (a new picture or a repeat). An
+    /// unchanged screen is repeated one frame interval after it, so the
+    /// stream keeps the requested rate.
+    last_out: std::time::Instant,
 }
 
 impl DrmServiceCapture {
@@ -405,6 +409,7 @@ impl DrmServiceCapture {
             fps: 60,
             streaming: None,
             first_frame: true,
+            last_out: std::time::Instant::now(),
         }
     }
 
@@ -672,14 +677,24 @@ impl ScreenCapture for DrmServiceCapture {
             return Err(MediaError::CaptureNotStarted);
         }
         let interval = Duration::from_nanos(1_000_000_000 / self.fps.max(1) as u64);
-        let wait = if self.first_frame { Duration::from_secs(2) } else { interval + interval / 2 };
+        // A still screen sends nothing, so the pipeline repeats the last
+        // picture when the next one is due: one interval after the previous
+        // frame went out. (Waiting 1.5 intervals from each call capped a
+        // still or slowly changing screen at 2/3 of the rate: 40 of 60 fps.)
+        let wait = if self.first_frame {
+            Duration::from_secs(2)
+        } else {
+            (self.last_out + interval).saturating_duration_since(std::time::Instant::now())
+        };
         let rx = self.frame_rx.as_mut().ok_or(MediaError::CaptureNotStarted)?;
         let received = tokio::time::timeout(wait, rx.recv()).await;
         let mut incoming = match received {
             Ok(Some(i)) => i,
             Ok(None) => return Err(MediaError::CaptureError("capture service connection ended".into())),
             Err(_) => {
-                // Screen off / paused: let the pipeline repeat the last picture.
+                // Unchanged, off or paused: let the pipeline repeat the last
+                // picture.
+                self.last_out = std::time::Instant::now();
                 return Ok(CapturedFrame {
                     buffer: GpuBuffer::CpuBuffer { data: Vec::new(), stride: 0, format: PixelFormat::BGRA, width: 0, height: 0 },
                     timestamp_us: 0,
@@ -698,6 +713,7 @@ impl ScreenCapture for DrmServiceCapture {
         }
         self.shared.ack(incoming.seq);
         self.first_frame = false;
+        self.last_out = std::time::Instant::now();
         Ok(incoming.frame)
     }
 
