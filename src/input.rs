@@ -225,6 +225,14 @@ impl ScreenRegion {
 static CAPTURE_MAPPING: std::sync::Mutex<Option<(ScreenRegion, ScreenRegion)>> =
     std::sync::Mutex::new(None);
 
+/// The same, per display id the capture was started with (`"default"`,
+/// `"kms:card2:HDMI-A-2"`...), for injectors told which display their
+/// viewer watches ([`InputInjector::set_display`]): two viewers of two
+/// monitors each move the pointer on their own one.
+#[cfg(target_os = "linux")]
+static CAPTURE_MAPPINGS: std::sync::Mutex<Vec<(String, (ScreenRegion, ScreenRegion))>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Where the last absolute move put the pointer, as a fraction of the
 /// streamed region (0..1 each way), and when; cleared by a relative move.
 /// The KMS capture learns the cursor's hotspot from it (the cursor plane
@@ -264,13 +272,41 @@ fn aimed_fraction(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (f64, f64) {
 /// events are then mapped onto that monitor, like Sunshine's touch port.
 #[cfg(target_os = "linux")]
 pub fn set_capture_region(target: ScreenRegion) {
-    let desktop = desktop_layout()
-        .into_iter()
-        .fold(target, |acc, r| acc.union(r));
-    log::info!("Input mapping: streamed region {:?} within desktop {:?}", target, desktop);
+    set_mapping(None, target, desktop_layout());
+}
+
+/// [`set_capture_region`] for the capture of display `display_id` (the id
+/// it was started with): also what injectors set to that display use.
+#[cfg(target_os = "linux")]
+pub fn set_capture_region_for(display_id: &str, target: ScreenRegion) {
+    set_mapping(Some(display_id), target, desktop_layout());
+}
+
+#[cfg(target_os = "linux")]
+fn set_mapping(display_id: Option<&str>, target: ScreenRegion, outputs: Vec<ScreenRegion>) {
+    let desktop = outputs.into_iter().fold(target, |acc, r| acc.union(r));
+    log::info!(
+        "Input mapping{}: streamed region {:?} within desktop {:?}",
+        display_id.map(|d| format!(" of {}", d)).unwrap_or_default(),
+        target,
+        desktop
+    );
     if let Ok(mut m) = CAPTURE_MAPPING.lock() {
         *m = Some((target, desktop));
     }
+    if let (Some(id), Ok(mut all)) = (display_id, CAPTURE_MAPPINGS.lock()) {
+        all.retain(|(d, _)| d != id);
+        all.push((id.to_string(), (target, desktop)));
+    }
+}
+
+/// The mapping for an injector set to `display` (else the last capture's).
+#[cfg(target_os = "linux")]
+fn mapping_for(display: Option<&str>) -> Option<(ScreenRegion, ScreenRegion)> {
+    let own = display.and_then(|id| {
+        CAPTURE_MAPPINGS.lock().ok().and_then(|all| all.iter().find(|(d, _)| d == id).map(|(_, m)| *m))
+    });
+    own.or_else(|| CAPTURE_MAPPING.lock().ok().and_then(|m| *m))
 }
 
 /// Logical geometry of all enabled outputs. KDE's `kscreen-doctor` reports the
@@ -404,9 +440,15 @@ fn xrandr_monitors() -> Vec<ScreenRegion> {
 /// Map client coordinates (`x`/`y` within `ref_w`×`ref_h`) to the absolute
 /// mouse axis range, honouring the streamed region inside the desktop.
 #[cfg(target_os = "linux")]
-fn map_to_abs_axes(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (i32, i32) {
-    let mapping = CAPTURE_MAPPING.lock().ok().and_then(|m| *m);
-    let (fx, fy) = aimed_fraction(x, y, ref_w, ref_h);
+fn map_to_abs_axes(display: Option<&str>, x: i32, y: i32, ref_w: i32, ref_h: i32) -> (i32, i32) {
+    let mapping = mapping_for(display);
+    // Not held to the streamed monitor: a viewer dragging past the edge of
+    // the picture (a window to another monitor) carries the pointer on into
+    // the next one. Held to the desktop below.
+    let (fx, fy) = (
+        (x as f64 + 0.5) / ref_w as f64,
+        (y as f64 + 0.5) / ref_h as f64,
+    );
     let (nx, ny) = match mapping {
         Some((target, desktop)) if desktop.width > 0 && desktop.height > 0 => (
             (target.x - desktop.x) as f64 / desktop.width as f64
@@ -417,8 +459,8 @@ fn map_to_abs_axes(x: i32, y: i32, ref_w: i32, ref_h: i32) -> (i32, i32) {
         _ => (fx, fy),
     };
     (
-        (nx * ABS_MAX_WIDTH as f64).round() as i32,
-        (ny * ABS_MAX_HEIGHT as f64).round() as i32,
+        (nx.clamp(0.0, 1.0) * ABS_MAX_WIDTH as f64).round() as i32,
+        (ny.clamp(0.0, 1.0) * ABS_MAX_HEIGHT as f64).round() as i32,
     )
 }
 
@@ -661,6 +703,9 @@ fn xrandr_monitor_named(text: &str, name: &str) -> Option<ScreenRegion> {
 pub struct InputInjector {
     #[cfg(target_os = "linux")]
     backend: Backend,
+    /// The display the viewer watches ([`InputInjector::set_display`]).
+    #[cfg(target_os = "linux")]
+    display: std::sync::Mutex<Option<String>>,
     #[cfg(target_os = "windows")]
     _private: (), // SendInput is stateless, no per-instance state needed
 }
@@ -737,6 +782,19 @@ unsafe impl Send for InputInjector {}
 unsafe impl Sync for InputInjector {}
 
 impl InputInjector {
+    /// Absolute moves go to display `display_id` (the id its capture was
+    /// started with) rather than to whichever display was captured last:
+    /// each viewer of a different monitor points on its own. Linux only
+    /// (elsewhere absolute positions already cover the whole desktop).
+    pub fn set_display(&self, display_id: &str) {
+        #[cfg(target_os = "linux")]
+        if let Ok(mut d) = self.display.lock() {
+            *d = Some(display_id.to_string());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = display_id;
+    }
+
     /// Creates a new InputInjector.
     pub fn new() -> Option<Self> {
         #[cfg(target_os = "linux")]
@@ -755,6 +813,7 @@ impl InputInjector {
                     log::info!("InputInjector: initialized uinput backend (Wayland)");
                     return Some(Self {
                         backend: Backend::Uinput(uinput),
+                        display: std::sync::Mutex::new(None),
                     });
                 }
                 log::warn!("InputInjector: uinput unavailable on Wayland, falling back to X11 XTest (may not reach native Wayland windows)");
@@ -794,6 +853,7 @@ impl InputInjector {
                             monitor_height,
                             spare_keys: std::sync::Mutex::new(SpareKeys::default()),
                         }),
+                        display: std::sync::Mutex::new(None),
                     });
                 }
             }
@@ -804,6 +864,7 @@ impl InputInjector {
                     log::info!("InputInjector: initialized uinput backend");
                     return Some(Self {
                         backend: Backend::Uinput(uinput),
+                        display: std::sync::Mutex::new(None),
                     });
                 }
             }
@@ -928,7 +989,8 @@ impl InputInjector {
         match &self.backend {
             Backend::Uinput(u) => {
                 if reference_width > 0 && reference_height > 0 {
-                    let (abs_x, abs_y) = map_to_abs_axes(x, y, reference_width, reference_height);
+                    let display = self.display.lock().ok().and_then(|d| d.clone());
+                    let (abs_x, abs_y) = map_to_abs_axes(display.as_deref(), x, y, reference_width, reference_height);
                     u.move_absolute(abs_x, abs_y);
                     note_absolute_pointer(Some(aimed_fraction(x, y, reference_width, reference_height)));
                 }
@@ -1841,5 +1903,39 @@ mod layout_tests {
         );
         let disabled = r#"{"enabled": false, "pos": {"x": 0, "y": 0}, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
         assert_eq!(parse_kscreen_output(disabled), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod display_mapping_tests {
+    use super::*;
+
+    fn r(x: i32, w: i32) -> ScreenRegion {
+        ScreenRegion { x, y: 0, width: w, height: 1080 }
+    }
+
+    #[test]
+    fn each_display_keeps_its_own_mapping() {
+        let outputs = vec![r(0, 1920), r(1920, 1920)];
+        set_mapping(Some("test:DP-2"), r(0, 1920), outputs.clone());
+        set_mapping(Some("test:HDMI-A-2"), r(1920, 1920), outputs);
+        // The left edge of each picture lands on its own monitor.
+        let (dp, _) = map_to_abs_axes(Some("test:DP-2"), 0, 540, 1920, 1080);
+        let (hdmi, _) = map_to_abs_axes(Some("test:HDMI-A-2"), 0, 540, 1920, 1080);
+        assert!(dp < ABS_MAX_WIDTH / 100, "{}", dp);
+        assert!((hdmi - ABS_MAX_WIDTH / 2).abs() < ABS_MAX_WIDTH / 100, "{}", hdmi);
+        // Not told a display (or an unknown one): the last capture's.
+        let (last, _) = map_to_abs_axes(None, 0, 540, 1920, 1080);
+        assert_eq!(last, hdmi);
+        let (unknown, _) = map_to_abs_axes(Some("test:nope"), 0, 540, 1920, 1080);
+        assert_eq!(unknown, hdmi);
+        // Past the right edge of the left monitor's picture: on into the
+        // right one; past the desktop's edge: held there.
+        let (past, _) = map_to_abs_axes(Some("test:DP-2"), 1920 + 960, 540, 1920, 1080);
+        assert!((past - ABS_MAX_WIDTH * 3 / 4).abs() < ABS_MAX_WIDTH / 100, "{}", past);
+        let (beyond, _) = map_to_abs_axes(Some("test:HDMI-A-2"), 5000, 540, 1920, 1080);
+        assert_eq!(beyond, ABS_MAX_WIDTH);
+        let (left, _) = map_to_abs_axes(Some("test:DP-2"), -500, 540, 1920, 1080);
+        assert_eq!(left, 0);
     }
 }

@@ -164,7 +164,7 @@ impl ScreenCapture for PipeWireCapture {
         );
         // Map absolute pointer input onto the monitor the user picked.
         if let (Some((x, y)), Some((w, h))) = (position, size) {
-            crate::input::set_capture_region(crate::input::ScreenRegion {
+            crate::input::set_capture_region_for(display_id, crate::input::ScreenRegion {
                 x,
                 y,
                 width: w,

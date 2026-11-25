@@ -643,7 +643,7 @@ impl ScreenCapture for DrmServiceCapture {
             None => log::warn!("capture service: no render node for {}", display.card),
         }
         let region = self.desktop_region(&display);
-        crate::input::set_capture_region(region);
+        crate::input::set_capture_region_for(display_id, region);
 
         client
             .conn
