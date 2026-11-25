@@ -378,13 +378,22 @@ pub struct DrmServiceCapture {
     fps: u32,
     streaming: Option<WireDisplay>,
     first_frame: bool,
-    /// When `next_frame` last returned (a new picture or a repeat). An
-    /// unchanged screen is repeated one frame interval after it, so the
-    /// stream keeps the requested rate.
-    last_out: std::time::Instant,
+    /// When the next frame is due, on a grid of one frame interval: every
+    /// frame returned (new or repeated) moves it one interval on. The last
+    /// picture is repeated only when nothing came by then, so a still or
+    /// partly changing screen keeps the requested rate without going over it.
+    next_due: std::time::Instant,
 }
 
 impl DrmServiceCapture {
+    /// One frame went out: the next is due one interval later on the grid.
+    /// A grid that fell behind (a still screen ended, a stall) restarts from
+    /// now; one far ahead (a burst) is held to two intervals, so repeats
+    /// resume promptly when the pictures stop.
+    fn advance_due(&mut self, interval: Duration) {
+        self.next_due = next_due_after(self.next_due, std::time::Instant::now(), interval);
+    }
+
     /// Connect to the service at the default (or `LUNARIS_CAPTURE_SOCKET`)
     /// path. Fails when there is none or it refuses this process.
     pub fn new() -> Result<Self, MediaError> {
@@ -409,7 +418,7 @@ impl DrmServiceCapture {
             fps: 60,
             streaming: None,
             first_frame: true,
-            last_out: std::time::Instant::now(),
+            next_due: std::time::Instant::now(),
         }
     }
 
@@ -678,13 +687,16 @@ impl ScreenCapture for DrmServiceCapture {
         }
         let interval = Duration::from_nanos(1_000_000_000 / self.fps.max(1) as u64);
         // A still screen sends nothing, so the pipeline repeats the last
-        // picture when the next one is due: one interval after the previous
-        // frame went out. (Waiting 1.5 intervals from each call capped a
-        // still or slowly changing screen at 2/3 of the rate: 40 of 60 fps.)
+        // picture when a frame is due and none came (a little late, so a
+        // picture on its way wins). Waiting 1.5 intervals from each call
+        // instead capped a still or partly changing screen at ~33 of 60 fps;
+        // repeating one interval after the last frame went over the rate
+        // (75 of 60) when pictures came 13 and 27 ms apart (60 fps content
+        // on a 75 Hz display).
         let wait = if self.first_frame {
             Duration::from_secs(2)
         } else {
-            (self.last_out + interval).saturating_duration_since(std::time::Instant::now())
+            (self.next_due + interval / 8).saturating_duration_since(std::time::Instant::now())
         };
         let rx = self.frame_rx.as_mut().ok_or(MediaError::CaptureNotStarted)?;
         let received = tokio::time::timeout(wait, rx.recv()).await;
@@ -694,7 +706,7 @@ impl ScreenCapture for DrmServiceCapture {
             Err(_) => {
                 // Unchanged, off or paused: let the pipeline repeat the last
                 // picture.
-                self.last_out = std::time::Instant::now();
+                self.advance_due(interval);
                 return Ok(CapturedFrame {
                     buffer: GpuBuffer::CpuBuffer { data: Vec::new(), stride: 0, format: PixelFormat::BGRA, width: 0, height: 0 },
                     timestamp_us: 0,
@@ -713,7 +725,7 @@ impl ScreenCapture for DrmServiceCapture {
         }
         self.shared.ack(incoming.seq);
         self.first_frame = false;
-        self.last_out = std::time::Instant::now();
+        self.advance_due(interval);
         Ok(incoming.frame)
     }
 
@@ -750,6 +762,66 @@ impl ScreenCapture for DrmServiceCapture {
 impl Drop for DrmServiceCapture {
     fn drop(&mut self) {
         self.halt();
+    }
+}
+
+/// [`DrmServiceCapture::advance_due`]: when the frame after one returned at
+/// `now` is due, given that this one was due at `due`.
+fn next_due_after(due: std::time::Instant, now: std::time::Instant, interval: Duration) -> std::time::Instant {
+    let base = if due + interval < now { now } else { due };
+    (base + interval).min(now + 2 * interval)
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Frames out per second when pictures come at `arrivals` (ms): a
+    /// picture is taken when it comes by the deadline, else the last one is
+    /// repeated at the deadline (as `next_frame` does), 4 ms encode each.
+    fn rate(arrivals: &[f64], secs: f64) -> f64 {
+        let t0 = Instant::now();
+        let at = |ms: f64| t0 + Duration::from_secs_f64(ms / 1000.0);
+        let iv = Duration::from_nanos(1_000_000_000 / 60);
+        let (mut t, mut i, mut out) = (0.0f64, 0usize, 0u32);
+        let mut due = at(0.0) + iv;
+        while t < secs * 1000.0 {
+            let deadline = (due + iv / 8).duration_since(t0).as_secs_f64() * 1000.0;
+            if i < arrivals.len() && arrivals[i] <= deadline.max(t) {
+                t = t.max(arrivals[i]);
+                i += 1;
+            } else {
+                t = t.max(deadline);
+            }
+            out += 1;
+            due = next_due_after(due, at(t), iv);
+            t += 4.0;
+        }
+        out as f64 / secs
+    }
+
+    #[test]
+    fn a_still_screen_is_repeated_at_the_requested_rate() {
+        let r = rate(&[], 5.0);
+        assert!((58.0..=61.0).contains(&r), "{}", r);
+    }
+
+    #[test]
+    fn uneven_pictures_do_not_push_the_rate_over_the_cap() {
+        // 60 fps content on a 75 Hz display: 4 of every 5 vblanks.
+        let vb = 1000.0 / 74.972;
+        let arrivals: Vec<f64> = (0..400).filter(|n| n % 5 != 4).map(|n| n as f64 * vb).collect();
+        let r = rate(&arrivals, 5.0);
+        assert!((58.0..=61.5).contains(&r), "{}", r);
+    }
+
+    #[test]
+    fn half_moving_screen_is_filled_up_to_the_rate() {
+        // Moving for 0.5 s, still for 0.5 s.
+        let arrivals: Vec<f64> = (0..300).map(|n| n as f64 * 1000.0 / 60.0).filter(|ms| (ms / 500.0) as u32 % 2 == 0).collect();
+        let r = rate(&arrivals, 5.0);
+        assert!((58.0..=61.5).contains(&r), "{}", r);
     }
 }
 
