@@ -10,6 +10,7 @@
 //! encoders.
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub mod d3d11_rgb_to_nv12;
 pub mod ffmpeg;
 pub mod sunshine_tables;
 #[cfg(target_os = "linux")]

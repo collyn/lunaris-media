@@ -353,6 +353,12 @@ pub struct FfmpegEncoder {
     /// Cached Output View for the video processor.
     #[cfg(target_os = "windows")]
     video_output_view: Option<ID3D11VideoProcessorOutputView>,
+    /// BGRA to NV12 by our shaders (d3d11_rgb_to_nv12.rs), once set up.
+    #[cfg(target_os = "windows")]
+    rgb_to_nv12: Option<super::d3d11_rgb_to_nv12::RgbToNv12>,
+    /// The shaders are not used (they failed, or the video processor was asked for).
+    #[cfg(target_os = "windows")]
+    rgb_to_nv12_off: bool,
     /// The source texture pointer used to create the cached input view.
     #[cfg(target_os = "windows")]
     cached_src_tex: usize,
@@ -415,6 +421,10 @@ impl FfmpegEncoder {
             video_input_view: None,
             #[cfg(target_os = "windows")]
             video_output_view: None,
+            #[cfg(target_os = "windows")]
+            rgb_to_nv12: None,
+            #[cfg(target_os = "windows")]
+            rgb_to_nv12_off: false,
             #[cfg(target_os = "windows")]
             cached_src_tex: 0,
             #[cfg(target_os = "windows")]
@@ -2676,6 +2686,60 @@ impl VideoEncoder for FfmpegEncoder {
                                 MediaError::EncodeError("D3D11 device not available in config".into())
                             })? as *mut std::ffi::c_void;
 
+                            // Our shaders first (d3d11_rgb_to_nv12.rs): the video
+                            // processor below picks one pixel's colour per 2x2
+                            // block, which smears thin coloured text. It stays as
+                            // the way for what the shaders do not do (10-bit,
+                            // BT.2020) and when they cannot be set up.
+                            // LUNARIS_D3D11_VIDEO_PROCESSOR=1 asks for it.
+                            let mut converted = false;
+                            let shader_colorspace = match config.colorspace.colorspace {
+                                crate::colorspace::Colorspace::Rec601 => Some(false),
+                                crate::colorspace::Colorspace::Rec709 => Some(true),
+                                _ => None,
+                            }
+                            .filter(|_| config.colorspace.bit_depth == 8);
+                            if let (false, Some(bt709)) = (self.rgb_to_nv12_off, shader_colorspace) {
+                                if self.rgb_to_nv12.is_none() {
+                                    if std::env::var_os("LUNARIS_D3D11_VIDEO_PROCESSOR").is_some_and(|v| v == "1") {
+                                        log::info!("BGRA to NV12 by the D3D11 video processor (LUNARIS_D3D11_VIDEO_PROCESSOR=1)");
+                                        self.rgb_to_nv12_off = true;
+                                    } else {
+                                        let d3d_device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
+                                        match super::d3d11_rgb_to_nv12::RgbToNv12::new(&d3d_device, bt709, config.colorspace.full_range) {
+                                            Ok(converter) => {
+                                                log::info!(
+                                                    "BGRA to NV12 by shaders with filtered colour ({}, {} range)",
+                                                    if bt709 { "BT.709" } else { "BT.601" },
+                                                    if config.colorspace.full_range { "full" } else { "limited" }
+                                                );
+                                                self.rgb_to_nv12 = Some(converter);
+                                            }
+                                            Err(e) => {
+                                                log::warn!("BGRA to NV12 shaders not set up ({e}); using the D3D11 video processor");
+                                                self.rgb_to_nv12_off = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(converter) = self.rgb_to_nv12.as_mut() {
+                                    match converter.convert(&context, &src_tex, &dst_tex, dst_idx) {
+                                        Ok(()) => {
+                                            (*context).Flush();
+                                            converted = true;
+                                        }
+                                        Err(e) => {
+                                            log::warn!("BGRA to NV12 shaders cannot convert this frame ({e}); using the D3D11 video processor");
+                                            self.rgb_to_nv12 = None;
+                                            self.rgb_to_nv12_off = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if converted {
+                                return Ok(());
+                            }
+
                             if self.video_device.is_none() {
                                 let d3d_device = std::mem::ManuallyDrop::new(ID3D11Device::from_raw(device_ptr));
                                 let v_device = (*d3d_device).cast::<ID3D11VideoDevice>().map_err(|e| {
@@ -3492,6 +3556,8 @@ impl VideoEncoder for FfmpegEncoder {
             self.video_enumerator = None;
             self.video_input_view = None;
             self.video_output_view = None;
+            self.rgb_to_nv12 = None;
+            self.rgb_to_nv12_off = false;
             self.cached_src_tex = 0;
             self.cached_dst_tex = 0;
             self.cached_dst_idx = 0;
