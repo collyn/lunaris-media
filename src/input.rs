@@ -17,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, MOUSEEVENTF_VIRTUALDESK,
     VIRTUAL_KEY, MapVirtualKeyW, MAPVK_VK_TO_VSC, KEYEVENTF_UNICODE, GetKeyState,
 };
 #[cfg(target_os = "windows")]
@@ -706,8 +706,48 @@ pub struct InputInjector {
     /// The display the viewer watches ([`InputInjector::set_display`]).
     #[cfg(target_os = "linux")]
     display: std::sync::Mutex<Option<String>>,
+    /// The display the viewer watches ([`InputInjector::set_display`]).
     #[cfg(target_os = "windows")]
-    _private: (), // SendInput is stateless, no per-instance state needed
+    display: std::sync::Mutex<Option<String>>,
+}
+
+/// Where each captured display lies on the Windows desktop (`rcMonitor`,
+/// the same coordinates as `SM_XVIRTUALSCREEN`), per display id the capture
+/// was started with. Absolute moves without `MOUSEEVENTF_VIRTUALDESK` span
+/// only the primary monitor, so a viewer of a second one pointed on the
+/// first.
+#[cfg(target_os = "windows")]
+static WINDOWS_DISPLAY_RECTS: std::sync::Mutex<Vec<(String, (i32, i32, i32, i32))>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records display `id`'s rectangle (left, top, right, bottom) on the desktop.
+#[cfg(target_os = "windows")]
+pub(crate) fn note_windows_display_rect(id: &str, rect: (i32, i32, i32, i32)) {
+    if let Ok(mut rects) = WINDOWS_DISPLAY_RECTS.lock() {
+        rects.retain(|(known, _)| known != id);
+        rects.push((id.to_string(), rect));
+    }
+}
+
+/// `MOUSEEVENTF_VIRTUALDESK` coordinates (0..=65535 over the virtual
+/// desktop) of client position (x, y) in a `reference` sized picture of the
+/// monitor at `rect`. Positions past the picture's edge go on past the
+/// monitor's (a drag onto the next monitor), held to the desktop.
+#[cfg(any(target_os = "windows", test))]
+fn virtual_desk_coords(
+    x: i32, y: i32, reference: (i32, i32),
+    rect: (i32, i32, i32, i32), desk: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (left, top, right, bottom) = rect;
+    let (vx, vy, vw, vh) = desk;
+    let px = left as i64 + (x as i64 * (right - left) as i64) / reference.0 as i64;
+    let py = top as i64 + (y as i64 * (bottom - top) as i64) / reference.1 as i64;
+    let scale = |p: i64, origin: i32, size: i32| -> i32 {
+        let span = (size as i64 - 1).max(1);
+        let rel = (p - origin as i64).clamp(0, span);
+        ((rel * 65535 + span / 2) / span) as i32
+    };
+    (scale(px, vx, vw), scale(py, vy, vh))
 }
 
 #[cfg(target_os = "windows")]
@@ -784,14 +824,13 @@ unsafe impl Sync for InputInjector {}
 impl InputInjector {
     /// Absolute moves go to display `display_id` (the id its capture was
     /// started with) rather than to whichever display was captured last:
-    /// each viewer of a different monitor points on its own. Linux only
-    /// (elsewhere absolute positions already cover the whole desktop).
+    /// each viewer of a different monitor points on its own one.
     pub fn set_display(&self, display_id: &str) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if let Ok(mut d) = self.display.lock() {
             *d = Some(display_id.to_string());
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let _ = display_id;
     }
 
@@ -890,7 +929,7 @@ impl InputInjector {
                 }
             }
             log::info!("InputInjector: initialized Windows SendInput backend");
-            Some(Self { _private: () })
+            Some(Self { display: std::sync::Mutex::new(None) })
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
@@ -1009,8 +1048,35 @@ impl InputInjector {
         #[cfg(target_os = "windows")]
         {
             if reference_width > 0 && reference_height > 0 {
-                let abs_x = (x as i64 * 65535) / reference_width as i64;
-                let abs_y = (y as i64 * 65535) / reference_height as i64;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                };
+                // The watched monitor's place on the desktop, as its capture
+                // recorded it ("default" = the primary one).
+                let display = self.display.lock().ok().and_then(|d| d.clone()).unwrap_or_else(|| "default".into());
+                let rect = WINDOWS_DISPLAY_RECTS.lock().ok().and_then(|rects| {
+                    rects.iter().find(|(id, _)| *id == display).map(|(_, r)| *r)
+                });
+                let desk = unsafe {
+                    (
+                        GetSystemMetrics(SM_XVIRTUALSCREEN),
+                        GetSystemMetrics(SM_YVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                    )
+                };
+                let (abs_x, abs_y, flags) = match rect {
+                    Some(rect) if desk.2 > 0 && desk.3 > 0 => {
+                        let (ax, ay) = virtual_desk_coords(x, y, (reference_width, reference_height), rect, desk);
+                        (ax as i64, ay as i64, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK)
+                    }
+                    // Not known (yet): the primary monitor, as before.
+                    _ => (
+                        (x as i64 * 65535) / reference_width as i64,
+                        (y as i64 * 65535) / reference_height as i64,
+                        MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                    ),
+                };
                 unsafe {
                     let input = INPUT {
                         r#type: INPUT_TYPE(0), // INPUT_MOUSE
@@ -1019,7 +1085,7 @@ impl InputInjector {
                                 dx: abs_x as i32,
                                 dy: abs_y as i32,
                                 mouseData: 0,
-                                dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                                dwFlags: flags,
                                 time: 0,
                                 dwExtraInfo: 0,
                             },
@@ -1903,6 +1969,37 @@ mod layout_tests {
         );
         let disabled = r#"{"enabled": false, "pos": {"x": 0, "y": 0}, "scale": 1, "size": {"height": 1080, "width": 1920}}"#;
         assert_eq!(parse_kscreen_output(disabled), None);
+    }
+}
+
+#[cfg(test)]
+mod virtual_desk_tests {
+    use super::virtual_desk_coords;
+
+    // Primary 1920x1080 at (0,0), second 2560x1440 to its left at (-2560,0):
+    // virtual desktop (-2560, 0) 4480x1440.
+    const DESK: (i32, i32, i32, i32) = (-2560, 0, 4480, 1440);
+
+    #[test]
+    fn a_second_monitor_maps_onto_itself() {
+        let second = (-2560, 0, 0, 1440);
+        assert_eq!(virtual_desk_coords(0, 0, (1280, 720), second, DESK), (0, 0));
+        let (cx, cy) = virtual_desk_coords(640, 360, (1280, 720), second, DESK);
+        // Its centre: x = -1280 → 1280 of 4479.
+        assert!((cx - 1280 * 65535 / 4479).abs() <= 1, "{cx}");
+        assert!((cy - 720 * 65535 / 1439).abs() <= 1, "{cy}");
+    }
+
+    #[test]
+    fn the_primary_monitor_and_past_its_edge() {
+        let primary = (0, 0, 1920, 1080);
+        let (x0, _) = virtual_desk_coords(0, 0, (1920, 1080), primary, DESK);
+        assert!((x0 - 2560 * 65535 / 4479).abs() <= 1, "{x0}");
+        // Left past the picture's edge: onto the second monitor.
+        let (xl, _) = virtual_desk_coords(-100, 10, (1920, 1080), primary, DESK);
+        assert!(xl < x0);
+        // Far past the desktop: held to its edge.
+        assert_eq!(virtual_desk_coords(99999, 99999, (1920, 1080), primary, DESK), (65535, 65535));
     }
 }
 

@@ -481,6 +481,16 @@ impl DxgiCapture {
         }
 
         let rect = desc.DesktopCoordinates;
+        // Where absolute moves of this display's viewers go (input.rs):
+        // the monitor's rectangle in the same (DPI-) coordinates as the
+        // virtual desktop metrics SendInput's VIRTUALDESK is scaled to.
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let r = if GetMonitorInfoW(desc.Monitor, &mut info).as_bool() { info.rcMonitor } else { rect };
+            let key = if id.is_empty() { "default" } else { id };
+            crate::input::note_windows_display_rect(key, (r.left, r.top, r.right, r.bottom));
+        }
         Some((output, rect, index))
     }
 
